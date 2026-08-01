@@ -1,0 +1,64 @@
+services:
+  ingestion:
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    container_name: mft-ingestion
+    environment:
+      MFT_CONFIG: /app/configs/config.yaml
+    volumes:
+      - mft_data:/app/data
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  execution:
+    build:
+      context: .
+      dockerfile: services/execution/Dockerfile
+    container_name: mft-execution
+    environment:
+      MFT_CONFIG: /app/configs/config.yaml
+    volumes:
+      - mft_data:/app/data
+    ports:
+      - "8080:8080"
+      - "9091:9090"
+    restart: unless-stopped
+    depends_on:
+      - ingestion
+
+  jobs:
+    build:
+      context: .
+      dockerfile: services/jobs/Dockerfile
+    container_name: mft-jobs
+    environment:
+      MFT_CONFIG: /app/configs/config.yaml
+    volumes:
+      - mft_data:/app/data
+    ports:
+      - "9092:9090"
+    restart: unless-stopped
+    depends_on:
+      - ingestion
+
+  inference:
+    build:
+      context: .
+      dockerfile: services/inference/Dockerfile
+    container_name: mft-inference
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # For GPU inference, uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  mft_data:

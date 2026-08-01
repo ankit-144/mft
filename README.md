@@ -49,6 +49,59 @@ make run-jobs
 Each service exposes a metrics endpoint on `:9090` by default
 (override `metrics.addr` in config).
 
+## Testing
+
+```sh
+# Run unit tests across all Go modules (core + services)
+make test
+
+# Vet all modules
+make vet
+```
+
+Test helpers live in `core/testutil` (mock broker streamer/client, isolated
+Prometheus registry, metric value assertions). Coverage spans:
+
+- `core/fluxkv` — TTL get/set/delete, minute-candle aggregation & rollover
+- `core/config` — YAML load, defaults, error paths
+- `core/storage` — Parquet flush + read-back
+- `services/ingestion` — tick processing updates candles + queues storage
+- `services/execution` — order placement, debounce rejection/expiry, broker errors
+- `services/jobs` — backfill worker runs and bumps its metric
+
+## Docker
+
+The repo ships Dockerfiles per service plus a `docker-compose.yml` for the
+full stack. Build context is the repo root, so the Go workspace and shared
+`core` module are available to each image.
+
+```sh
+# Build all images
+make docker-build
+
+# Start the stack in the background
+make docker-up
+
+# Tail logs
+make docker-logs
+
+# Stop and remove containers (data volume persists)
+make docker-down
+```
+
+Endpoints after `docker-up`:
+
+| Service    | HTTP            | Metrics         |
+| :--------- | :-------------- | :-------------- |
+| ingestion  | —               | `:9090`         |
+| execution  | `:8080` (POST /v1/orders) | `:9091` |
+| jobs       | —               | `:9092`         |
+| inference  | `:8000` (healthz, /v1/predict) | —        |
+
+Images use the example config (empty credentials) by default — mount a
+real config or set `MFT_CONFIG` via env to connect the broker. Parquet data
+persists in the `mft_data` volume.
+
 ## Configuration
 
 Copy `configs/config.example.yaml` to `configs/config.yaml` and fill in

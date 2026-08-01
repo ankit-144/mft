@@ -1,0 +1,23 @@
+# Go
+core/**/*_test.go
+services/**/*_test.go
+services/**/Dockerfile
+data/
+bin/
+*.log
+
+# VCS / IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Local config (never bake secrets into images)
+configs/config.yaml
+.env
+.env.example
+
+# Python
+**/__pycache__/
+**/*.pyc
+.venv/
