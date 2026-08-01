@@ -1,0 +1,30 @@
+app:
+  name: mft
+  env: dev
+  log_level: info
+
+metrics:
+  addr: ":9090"
+
+broker:
+  api_key: ""
+  api_secret: ""
+  access_token: ""
+  instruments:
+    - RELIANCE
+    - TCS
+    - INFY
+
+storage:
+  data_dir: data
+
+execution:
+  addr: ":8080"
+  debounce_ttl_seconds: 300
+  max_drawdown_pct: 5.0
+  capital: 1000000
+
+jobs:
+  schedule: "0 2 * * 6"
+  rate_limit_per_second: 3
+  historical_dir: data/historical

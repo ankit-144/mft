@@ -1,0 +1,26 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# Environment / secrets
+.env
+
+# Generated data (parquet files, keep dirs via .gitkeep)
+data/ticks/*.parquet
+data/candles/*.parquet
+data/historical/*.parquet
+!data/**/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+.commandcode/

@@ -1,0 +1,17 @@
+# MFT Inference Engine (Python)
+#
+# Service 2 of the MFT platform. Bridges Go and Python, loads TabFM once at
+# startup, and exposes a gRPC/HTTP endpoint for minute-close inference.
+#
+# Getting started:
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#   uvicorn app.main:app --reload
+
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pandas>=2.2
+pyarrow>=16
+duckdb>=1.0
+torch>=2.3
