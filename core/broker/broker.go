@@ -9,10 +9,10 @@ import (
 
 // Tick is a raw market data tick delivered by the broker stream.
 type Tick struct {
-	Symbol      string
-	Price       float64
-	Volume      int64
-	Timestamp   time.Time
+	Symbol    string
+	Price     float64
+	Volume    int64
+	Timestamp time.Time
 }
 
 // Streamer connects to the broker WebSocket and delivers ticks.

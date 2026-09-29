@@ -19,6 +19,17 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+*.egg-info/
+
+# DuckDB analytics database
+data/*.duckdb
+data/*.duckdb.wal
+
+# Local dev runtime (logs, pids written by `make dev`)
+.dev/
+
+# Agent worktrees — one per component, created by scripts/worktree.sh
+.worktrees/
 
 # IDE
 .idea/
