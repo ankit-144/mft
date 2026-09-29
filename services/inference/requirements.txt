@@ -1,17 +1,40 @@
 # MFT Inference Engine (Python)
 #
 # Service 2 of the MFT platform. Bridges Go and Python, loads TabFM once at
-# startup, and exposes a gRPC/HTTP endpoint for minute-close inference.
+# startup, and exposes an HTTP endpoint for minute-close inference.
+#
+# This file is FROZEN. Every dependency the inference components need is
+# declared here so that parallel branches do not each edit it and conflict.
 #
 # Getting started:
-#   python -m venv .venv
-#   source .venv/bin/activate
-#   pip install -r requirements.txt
-#   uvicorn app.main:app --reload
+#   make venv
+#   make inference-deps
+#   make run-inference
+#
+# See Plan.md §5 for TabFM licensing. The pretrained weights are released
+# under `tabfm-non-commercial-v1.0` — non-commercial, non-production only.
+# The source is Apache-2.0.
 
+# --- web ---
 fastapi>=0.111
 uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
+
+# --- data ---
 pandas>=2.2
+numpy>=1.26
 pyarrow>=16
 duckdb>=1.0
-torch>=2.3
+
+# --- model ---
+# TabFM is a zero-shot tabular foundation model: in-context learning over a
+# row/column table. No training loop. CPU inference is supported and is
+# sufficient for our table sizes, so torch is the CPU build.
+torch>=2.12.1
+scikit-learn>=1.5
+huggingface-hub>=0.23
+
+# Tabular foundation model backend. The JAX backend is an alternative for
+# machines where the torch wheel is unavailable; see Plan.md §5.
+tabfm>=0.1.0
