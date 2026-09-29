@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/mft/core/config"
 )
 
 // Parquet layout of docs/contracts.md §3 for the historical tree:
@@ -61,6 +63,13 @@ type ParquetStore struct {
 // NewParquetStore returns a store that writes under the data/historical root.
 func NewParquetStore(dir string) *ParquetStore {
 	return &ParquetStore{dir: strings.TrimRight(dir, "/"), interval: defaultInterval}
+}
+
+// NewParquetStoreFromConfig builds the store from the frozen config. It exists
+// so the fx graph does not have to provide a bare string, which DI cannot
+// synthesise, and so the root is read from config in exactly one place.
+func NewParquetStoreFromConfig(cfg *config.Config) *ParquetStore {
+	return NewParquetStore(cfg.Jobs.HistoricalDir)
 }
 
 // newParquetStore is NewParquetStore with an explicit interval recorded on

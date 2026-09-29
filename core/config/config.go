@@ -111,6 +111,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	// Every service shares one config file, so they would all try to bind the
+	// same metrics port. MFT_METRICS_ADDR lets a launcher separate them
+	// without a second config file, which keeps the schema frozen.
+	if addr := os.Getenv("MFT_METRICS_ADDR"); addr != "" {
+		cfg.Metrics.Addr = addr
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}

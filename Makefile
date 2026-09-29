@@ -102,20 +102,34 @@ setup: build inference-deps
 
 # dev starts every service in the background with logs under .dev/.
 # It is deliberately not Docker-based: the north star is local-first.
+# Each service needs its own metrics port; they all read the same config file,
+# so MFT_METRICS_ADDR separates them.
 dev: build
 	@mkdir -p .dev
 	@echo "starting services... (logs in .dev/, stop with 'make stop')"
 	@$(MAKE) --no-print-directory stop
-	@MFT_CONFIG=configs/config.yaml $(MAKE) --no-print-directory run-ingestion > .dev/ingestion.log 2>&1 &
-	@MFT_CONFIG=configs/config.yaml $(MAKE) --no-print-directory run-execution > .dev/execution.log 2>&1 &
-	@MFT_CONFIG=configs/config.yaml $(MAKE) --no-print-directory run-jobs      > .dev/jobs.log 2>&1 &
-	@sleep 3
+	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9090 $(MAKE) --no-print-directory run-ingestion > .dev/ingestion.log 2>&1 &
+	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9091 $(MAKE) --no-print-directory run-execution > .dev/execution.log 2>&1 &
+	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9092 $(MAKE) --no-print-directory run-jobs      > .dev/jobs.log 2>&1 &
+	@if [ -x $(PY) ]; then \
+		MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9090 $(MAKE) --no-print-directory run-inference > .dev/inference.log 2>&1 & \
+	else \
+		echo "note: no inference venv, skipping service 2 (run 'make inference-deps')"; \
+	fi
+	@sleep 4
 	@$(MAKE) --no-print-directory status
+	@echo
+	@echo "  execution api : http://localhost:8080/v1/health"
+	@echo "  inference api : http://localhost:8000/healthz"
 
+# The Go binaries land in the build cache as .../go-build/<hash>/server, not
+# under an exe/ directory, so matching on the service name alone misses them.
+# Match the full run path and let make's own pattern do the work.
 stop:
-	@-pkill -f 'exe/(server|ingestion|execution|jobs)' 2>/dev/null || true
 	@-pkill -f 'go run ./services' 2>/dev/null || true
+	@-pkill -f 'go-build/[0-9a-f]*/server' 2>/dev/null || true
 	@-pkill -f 'uvicorn app.main:app' 2>/dev/null || true
+	@sleep 1
 
 down: stop
 

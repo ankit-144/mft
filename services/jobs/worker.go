@@ -19,13 +19,31 @@ import (
 )
 
 // Module is the FX module for the jobs service.
+//
+// The interface bindings below are what make the narrow seams from
+// interfaces.go usable from a graph. fx resolves concrete types, so a
+// constructor asking for the InstrumentResolver interface cannot be satisfied
+// without one of these: NewKiteHistory and NewBackfillWorker would otherwise
+// report "missing types" and the service would not start, which is exactly
+// what happened before this binding existed. The -run-now path builds the
+// graph by hand and was unaffected, so the bug only showed up under
+// `make dev`.
 var Module = fx.Module("jobs",
 	fx.Provide(
-		NewKiteHistory,
 		NewLimiterFromConfig,
-		NewParquetStore,
-		NewBackfillWorker,
+		NewParquetStoreFromConfig,
 		NewScheduler,
+		NewBackfillWorker,
+		// *broker.Kite satisfies InstrumentResolver directly, so the binding
+		// is free and keeps C1's connector the single source of truth for
+		// symbol resolution.
+		func(k *broker.Kite) InstrumentResolver { return k },
+		// The concrete implementations satisfy the interfaces backfill
+		// depends on. Backfill takes interfaces so a test can substitute a
+		// fake; the graph supplies the concrete types.
+		func(h *KiteHistory) HistoricalClient { return h },
+		func(s *ParquetStore) SegmentStore { return s },
+		NewKiteHistory,
 	),
 	fx.Invoke(StartScheduler),
 )
