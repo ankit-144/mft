@@ -13,6 +13,8 @@ The pieces, in the order a minute close runs through them:
 | `loop`      | The minute scheduler that ties the above together.               |
 | `runtime`   | Assembling a service from configuration.                         |
 | `main`      | FastAPI: `/healthz`, `/v1/context`, `/v1/predict`.               |
+| `backtest`  | Walk-forward replay of the same chain, with no broker at all.    |
+| `synth`     | Deterministic synthetic candles, so a backtest can run offline.  |
 
 The production path is `loop`, not `main`. See `Plan.md` §4 for why inference
 pulls at each minute close instead of being pushed to, and `docs/contracts.md`
@@ -28,6 +30,7 @@ module named `model` inside this package used to shadow it and had to go.
 from __future__ import annotations
 
 __all__ = [
+    "backtest",
     "candles",
     "config",
     "execution",
@@ -36,4 +39,5 @@ __all__ = [
     "predictor",
     "runtime",
     "signals",
+    "synth",
 ]

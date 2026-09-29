@@ -143,9 +143,14 @@ status:
 	done
 
 # backtest replays historical candles through the model without placing orders.
+# Walk-forward replay of the feature -> model -> decision chain, with no
+# broker, no credentials and no network. data/candles/ is empty on a fresh
+# checkout, so --synthetic is the default argument here; drop it once real
+# candles exist. Pass ARGS= to override.
 backtest:
 	@test -d $(VENV) || { echo "run 'make setup' first"; exit 1; }
-	@cd $(ROOT)/services/inference && ../inference/.venv/bin/python -m app.backtest $(ARGS)
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(VENV)/bin/python -m app.backtest \
+		$(if $(ARGS),$(ARGS),--synthetic --bars 2000 --feature-mode incremental)
 
 # --- worktrees -------------------------------------------------------------
 # Each component is developed in an isolated worktree under .worktrees/.
