@@ -3,6 +3,24 @@
 > This is the document `README.md` has referenced since the initial commit.
 > It is the contract between the plan and the parallel component work.
 
+## 0. Hard environment constraints — read before running anything
+
+**This machine has 14GB RAM with the OOM killer active. TabFM weights are
+~6.6GB and must never be loaded by an agent or a test.**
+
+- Never run a full `pytest model/tests`. Run only `test_base.py` and
+  `test_heuristic_model.py`.
+- Never run the `test_tabfm_model.py` weight tests, never run
+  `make tabfm-weights`, never trigger a HuggingFace download.
+- `~/.cache/huggingface/hub/models--google--tabfm-1.0.0-pytorch` is
+  off-limits even though it is already on disk.
+
+`TabFMModel` is written and unit-tested against a **fake** checkpoint.
+Confirming real inference is a deliberate manual step for a human, on a
+machine with free memory, with every other service stopped. It is never an
+automated test. This is a deliberate trade: we accept that CI cannot prove the
+weights load, in exchange for CI never risking the OOM killer.
+
 ## 1. North Star
 
 > Given a local machine and a Zerodha Kite Connect account, run a complete

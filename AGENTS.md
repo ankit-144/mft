@@ -2,6 +2,24 @@
 
 Rules for any agent or human working on this repository.
 
+## ⚠️ Memory limit — read this before running anything
+
+**14GB RAM machine, OOM killer is active. NEVER load TabFM weights (~6.6GB).**
+
+- **NEVER** run full `pytest model/tests`. Only run `test_base.py` and
+  `test_heuristic_model.py`.
+- **NEVER** run `test_tabfm_model.py` weights tests, **NEVER** run
+  `make tabfm-weights` or any HuggingFace download. Cached weights are
+  off-limits.
+
+`~/.cache/huggingface/hub/models--google--tabfm-1.0.0-pytorch` is off-limits
+even though it is already on disk. Do not read, copy, or load from it. If a
+test would load real weights, skip it with an explicit reason instead.
+
+The `TabFMModel` code path is written and unit-tested against a fake
+checkpoint. Verifying real inference is a deliberate, manual, human-run step on
+a machine with free memory — never an automated test.
+
 ## Read these first
 
 | Document | What it gives you |
