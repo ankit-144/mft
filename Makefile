@@ -1,6 +1,6 @@
 .PHONY: \
 	build test vet fmt lint tidy \
-	setup dev stop down status \
+	setup dev stop down status test-python \
 	run-ingestion run-execution run-jobs run-inference \
 	venv inference-deps tabfm-weights \
 	backtest \
@@ -24,11 +24,23 @@ build:
 		( cd $$m && go build ./... ) || exit 1; \
 	done
 
+# -race is not optional here. Ingestion's exactly-once bar completion and the
+# risk engine's idempotency claim are only meaningful if they hold under
+# concurrency, and a plain `go test` will not notice a data race.
 test:
 	@for m in $(MODULES); do \
 		echo "== test $$m =="; \
-		( cd $$m && go test ./... ) || exit 1; \
+		( cd $$m && go test -race ./... ) || exit 1; \
 	done
+
+# pytest targets run only the test files that do not load model weights.
+# See AGENTS.md: this machine has 14GB and the OOM killer is active, and the
+# TabFM weights are ~6.6GB.
+PYTEST_PERMITTED := model/tests/test_base.py model/tests/test_heuristic_model.py
+
+test-python:
+	@test -x $(PY) || { echo "run 'make setup' first"; exit 1; }
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(PY) -m pytest app/tests $(PYTEST_PERMITTED) -q
 
 vet:
 	@for m in $(MODULES); do \
