@@ -94,7 +94,8 @@ func FromConfig(cfg config.ExecutionConfig) Policy {
 			MaxOrderQuantity: cfg.MaxOrderQuantity,
 			DebounceTTL:      time.Duration(cfg.DebounceTTLSeconds) * time.Second,
 		},
-		Clock: SystemClock,
+		Clock:    SystemClock,
+		Calendar: NewStaticCalendar(cfg.MarketHolidays...),
 	}
 }
 

@@ -27,17 +27,24 @@ var Module = fx.Module("execution",
 	fx.Invoke(StartHTTPServer, RegisterEngine, StartCacheSweeper),
 )
 
-// IdempotencyTTL is how long a processed idempotency key is remembered.
+// IdempotencyTTL is the fallback for how long a processed idempotency key is
+// remembered, used when the config does not set execution.idempotency_ttl_seconds.
 //
 // Inference retries a signal, so the key has to outlive the retry loop rather
 // than the debounce window: debounce is 5 minutes by default, which is the
 // minimum gap between two *different* decisions about the same symbol, not a
 // bound on how long the same request may be retried. A trading day is 375
 // minutes, so a day-long key cannot expire inside a session.
-//
-// The frozen config schema (docs/contracts.md §8) has no key for this, so it
-// is a constant rather than a setting.
 const IdempotencyTTL = 24 * time.Hour
+
+// idempotencyTTL resolves the key lifetime from config, falling back to
+// IdempotencyTTL when the key is absent or non-positive.
+func idempotencyTTL(cfg *config.Config) time.Duration {
+	if secs := cfg.Execution.IdempotencyTTLSeconds; secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return IdempotencyTTL
+}
 
 // SweepInterval is how often the fluxKV TTL store is swept of expired
 // entries. Reads already ignore expired entries, so this is memory
@@ -72,12 +79,10 @@ type Engine struct {
 
 // NewEngine builds the execution engine with Prometheus metrics.
 //
-// The risk policy comes from the frozen execution config. Two policy inputs
-// have no config key and are therefore left at their documented defaults:
-// per-symbol lot sizes (absent => lot size 1, correct for NSE cash equity
-// delivery) and the holiday calendar (nil => every weekday is assumed to
-// trade). Wiring a real holiday list needs a key in core/config, which is
-// frozen.
+// The risk policy comes from the frozen execution config. One policy input
+// has no config key and is therefore left at its documented default: per-symbol
+// lot sizes (absent => lot size 1, correct for NSE cash equity delivery).
+// The holiday calendar is built from execution.market_holidays.
 func NewEngine(client broker.Client, cache *fluxkv.KV, cfg *config.Config, reg *prometheus.Registry, log *zap.Logger) *Engine {
 	return newEngine(client, cache, cfg, reg, log, risk.FromConfig(cfg.Execution), risk.SystemClock)
 }
@@ -102,18 +107,18 @@ func newEngine(
 		checks:      policy.New(cache),
 		book:        risk.NewBook(cfg.Execution.Capital),
 		debounceTTL: policy.DebounceTTL,
-		idemTTL:     IdempotencyTTL,
+		idemTTL:     idempotencyTTL(cfg),
 		clock:       clock,
 		ordersPlaced: factory.NewCounter(prometheus.CounterOpts{
-			Name: "execution_orders_placed_total",
+			Name: "mft_execution_orders_placed_total",
 			Help: "Total number of orders placed.",
 		}),
 		rejected: factory.NewCounter(prometheus.CounterOpts{
-			Name: "execution_orders_rejected_total",
+			Name: "mft_execution_orders_rejected_total",
 			Help: "Total number of order requests that produced no fill, whether rejected by risk or by the broker.",
 		}),
 		rejections: factory.NewCounterVec(prometheus.CounterOpts{
-			Name: "execution_rejections_total",
+			Name: "mft_execution_rejections_total",
 			Help: "Total number of signals rejected by the risk gate, by reason code.",
 		}, []string{"reason"}),
 	}

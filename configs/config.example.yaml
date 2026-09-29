@@ -20,6 +20,7 @@ broker:
   api_key: ""              # KITE_API_KEY
   api_secret: ""           # KITE_API_SECRET
   access_token: ""         # KITE_ACCESS_TOKEN
+  product: MIS             # MIS (intraday) | NRML | CNC
   instruments:
     - RELIANCE
     - TCS
@@ -41,11 +42,14 @@ execution:
   addr: ":8080"
   capital: 1000000
   debounce_ttl_seconds: 300
+  idempotency_ttl_seconds: 86400
   max_position_pct: 10.0
   max_open_positions: 10
   max_drawdown_pct: 5.0
   daily_loss_limit: 25000
   max_order_quantity: 500
+  # NSE trading holidays as YYYY-MM-DD. Empty means every weekday trades.
+  market_holidays: []
 
 inference:
   addr: ":8000"

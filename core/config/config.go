@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -43,6 +44,7 @@ type BrokerConfig struct {
 	APIKey                  string   `yaml:"api_key"`
 	APISecret               string   `yaml:"api_secret"`
 	AccessToken             string   `yaml:"access_token"`
+	Product                 string   `yaml:"product"`
 	Instruments             []string `yaml:"instruments"`
 	ReconnectMaxBackoffSecs int      `yaml:"reconnect_max_backoff_seconds"`
 	RequestTimeoutSeconds   int      `yaml:"request_timeout_seconds"`
@@ -64,14 +66,16 @@ type AnalyticsConfig struct {
 
 // ExecutionConfig configures the execution & risk engine.
 type ExecutionConfig struct {
-	Addr               string  `yaml:"addr"`
-	Capital            float64 `yaml:"capital"`
-	DebounceTTLSeconds int     `yaml:"debounce_ttl_seconds"`
-	MaxPositionPct     float64 `yaml:"max_position_pct"`
-	MaxOpenPositions   int     `yaml:"max_open_positions"`
-	MaxDrawdownPct     float64 `yaml:"max_drawdown_pct"`
-	DailyLossLimit     float64 `yaml:"daily_loss_limit"`
-	MaxOrderQuantity   int     `yaml:"max_order_quantity"`
+	Addr                  string   `yaml:"addr"`
+	Capital               float64  `yaml:"capital"`
+	DebounceTTLSeconds    int      `yaml:"debounce_ttl_seconds"`
+	IdempotencyTTLSeconds int      `yaml:"idempotency_ttl_seconds"`
+	MaxPositionPct        float64  `yaml:"max_position_pct"`
+	MaxOpenPositions      int      `yaml:"max_open_positions"`
+	MaxDrawdownPct        float64  `yaml:"max_drawdown_pct"`
+	DailyLossLimit        float64  `yaml:"daily_loss_limit"`
+	MaxOrderQuantity      int      `yaml:"max_order_quantity"`
+	MarketHolidays        []string `yaml:"market_holidays"`
 }
 
 // InferenceConfig configures the TabFM inference loop.
@@ -135,6 +139,9 @@ func (c *Config) Validate() error {
 	if c.Broker.RequestTimeoutSeconds == 0 {
 		c.Broker.RequestTimeoutSeconds = 10
 	}
+	if c.Broker.Product == "" {
+		c.Broker.Product = "MIS"
+	}
 	if c.Storage.DataDir == "" {
 		c.Storage.DataDir = "data"
 	}
@@ -155,6 +162,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Execution.DebounceTTLSeconds == 0 {
 		c.Execution.DebounceTTLSeconds = 300
+	}
+	if c.Execution.IdempotencyTTLSeconds == 0 {
+		c.Execution.IdempotencyTTLSeconds = 86400
 	}
 	if c.Execution.MaxPositionPct == 0 {
 		c.Execution.MaxPositionPct = 10.0
@@ -215,6 +225,14 @@ func (c *Config) crossValidate() error {
 	}
 	if c.Execution.Capital < 0 {
 		return fmt.Errorf("execution.capital: %v must not be negative", c.Execution.Capital)
+	}
+	if c.Broker.Product != "MIS" && c.Broker.Product != "NRML" && c.Broker.Product != "CNC" {
+		return fmt.Errorf("broker.product: %q must be one of MIS, NRML, CNC", c.Broker.Product)
+	}
+	for _, day := range c.Execution.MarketHolidays {
+		if _, err := time.Parse("2006-01-02", day); err != nil {
+			return fmt.Errorf("execution.market_holidays: %q is not a YYYY-MM-DD date", day)
+		}
 	}
 	return nil
 }

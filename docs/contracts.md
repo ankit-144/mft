@@ -332,6 +332,7 @@ broker:
   api_key: ""
   api_secret: ""
   access_token: ""
+  product: MIS            # MIS | NRML | CNC
   instruments: [RELIANCE, TCS, INFY]
   reconnect_max_backoff_seconds: 60
   request_timeout_seconds: 10
@@ -350,11 +351,13 @@ execution:
   addr: ":8080"
   capital: 1000000
   debounce_ttl_seconds: 300
+  idempotency_ttl_seconds: 86400
   max_position_pct: 10.0
   max_open_positions: 10
   max_drawdown_pct: 5.0
   daily_loss_limit: 25000
   max_order_quantity: 500
+  market_holidays: []      # NSE holidays, YYYY-MM-DD. Empty = every weekday trades.
 
 inference:
   addr: ":8000"

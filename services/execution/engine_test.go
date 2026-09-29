@@ -51,7 +51,7 @@ func rejectionCount(t *testing.T, reg *prometheus.Registry, reason string) int {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, f := range families {
-		if f.GetName() != "execution_rejections_total" {
+		if f.GetName() != "mft_execution_rejections_total" {
 			continue
 		}
 		for _, m := range f.GetMetric() {
@@ -402,7 +402,7 @@ func TestExecuteSignalBrokerErrorLeavesNoClaim(t *testing.T) {
 	if client.count() != 1 {
 		t.Fatalf("broker called %d times, want 1", client.count())
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg, nil); got != 1 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg, nil); got != 1 {
 		t.Fatalf("orders_placed_total = %d, want 1", got)
 	}
 }
@@ -424,10 +424,10 @@ func TestExecuteSignalRejectionMetrics(t *testing.T) {
 	if got := rejectionCount(t, reg, contracts.ReasonDuplicate); got != 1 {
 		t.Fatalf("%s = %d, want 1", contracts.ReasonDuplicate, got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_rejected_total", reg, nil); got != 1 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_rejected_total", reg, nil); got != 1 {
 		t.Fatalf("orders_rejected_total = %d, want 1", got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg, nil); got != 1 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg, nil); got != 1 {
 		t.Fatalf("orders_placed_total = %d, want 1", got)
 	}
 
@@ -439,7 +439,7 @@ func TestExecuteSignalRejectionMetrics(t *testing.T) {
 	if got := rejectionCount(t, reg2, contracts.ReasonMarketClosed); got != 1 {
 		t.Fatalf("%s = %d, want 1", contracts.ReasonMarketClosed, got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg2, nil); got != 0 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg2, nil); got != 0 {
 		t.Fatalf("orders_placed_total = %d, want 0", got)
 	}
 }
@@ -554,7 +554,7 @@ func TestExecuteSignalMalformed(t *testing.T) {
 			if client.count() != 0 {
 				t.Fatalf("broker was called %d times, want 0", client.count())
 			}
-			if got := testutil.MetricValue(t, "execution_orders_rejected_total", reg, nil); got != 1 {
+			if got := testutil.MetricValue(t, "mft_execution_orders_rejected_total", reg, nil); got != 1 {
 				t.Fatalf("orders_rejected_total = %d, want 1", got)
 			}
 		})

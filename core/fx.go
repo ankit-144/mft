@@ -28,12 +28,21 @@ var Module = fx.Module("core",
 		metrics.Handler,
 		fluxkv.New,
 		NewStorageWriter,
-		broker.NewKite,
+		NewKite,
 		func(k *broker.Kite) broker.Streamer { return k },
 		func(k *broker.Kite) broker.Client { return k },
+		broker.NewOrderClient,
 	),
 	fx.Invoke(metrics.Server),
 )
+
+// NewKite builds the broker connector from config. Binding NewKite here
+// instead of the bare broker.NewKite matters: the zero-config constructor
+// leaves the connector without credentials or a watchlist, so a service
+// started through fx would fail to authenticate on every call.
+func NewKite(cfg *config.Config) (*broker.Kite, error) {
+	return broker.NewKiteFromConfig(cfg.Broker)
+}
 
 // ConfigPath resolves the config file path, honoring the MFT_CONFIG
 // environment variable and defaulting to configs/config.yaml.
