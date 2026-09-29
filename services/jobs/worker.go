@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	cron "github.com/netresearch/go-cron"
 	"github.com/mft/core/config"
+	cron "github.com/netresearch/go-cron"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/fx"
@@ -28,16 +28,16 @@ var Module = fx.Module("jobs",
 // BackfillWorker fetches historical candles from the broker, respecting a
 // token-bucket rate limit and applying exponential backoff on throttling.
 type BackfillWorker struct {
-	log      *zap.Logger
+	log                *zap.Logger
 	rateLimitPerSecond int
-	backfillsRun prometheus.Counter
+	backfillsRun       prometheus.Counter
 }
 
 // NewBackfillWorker constructs the backfill worker with Prometheus metrics.
 func NewBackfillWorker(cfg *config.Config, log *zap.Logger, reg *prometheus.Registry) *BackfillWorker {
 	factory := promauto.With(reg)
 	return &BackfillWorker{
-		log:               log,
+		log:                log,
 		rateLimitPerSecond: cfg.Jobs.RateLimitPerSecond,
 		backfillsRun: factory.NewCounter(prometheus.CounterOpts{
 			Name: "jobs_backfills_run_total",
@@ -60,8 +60,8 @@ func (w *BackfillWorker) RunBackfill(ctx context.Context) error {
 
 // Scheduler wraps the go-cron instance.
 type Scheduler struct {
-	cron  *cron.Cron
-	log   *zap.Logger
+	cron *cron.Cron
+	log  *zap.Logger
 }
 
 // NewScheduler creates a go-cron scheduler with a recover chain.

@@ -9,8 +9,8 @@ import (
 )
 
 type entry struct {
-	value      any
-	expiresAt  time.Time
+	value     any
+	expiresAt time.Time
 }
 
 // Candle is an aggregated one-minute OHLCV candle.
@@ -26,8 +26,8 @@ type Candle struct {
 
 // KV is a concurrency-safe in-memory key-value store with TTL support.
 type KV struct {
-	mu     sync.RWMutex
-	items  map[string]entry
+	mu      sync.RWMutex
+	items   map[string]entry
 	candles map[string]*Candle
 }
 

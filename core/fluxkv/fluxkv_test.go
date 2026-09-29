@@ -41,7 +41,7 @@ func TestUpdateCandleAggregatesWithinMinute(t *testing.T) {
 	kv := New()
 	base := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 
-	kv.UpdateCandle("RELIANCE", base, 100, 1)          // open
+	kv.UpdateCandle("RELIANCE", base, 100, 1)                     // open
 	kv.UpdateCandle("RELIANCE", base.Add(10*time.Second), 110, 1) // high
 	kv.UpdateCandle("RELIANCE", base.Add(20*time.Second), 90, 1)  // low
 	kv.UpdateCandle("RELIANCE", base.Add(30*time.Second), 105, 1) // close
