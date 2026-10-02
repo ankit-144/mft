@@ -1,0 +1,229 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  py: {
+    style.fill: "#ede7f6"
+    style.stroke: "#5e35b1"
+  }
+  lib: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  go: {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  ctl: {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  ext: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+  }
+  mem: {
+    style.fill: "#fff8e1"
+    style.stroke: "#f9a825"
+  }
+  bad: {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+}
+
+licence: "The reason this layer exists. TabFM's SOURCE is Apache-2.0.\nIts PRETRAINED WEIGHTS are tabfm-non-commercial-v1.0: non-commercial and\nexplicitly excludes production trading use. A live trading platform is neither,\nso the model is research-only and the decision has to be reversible at runtime." {
+  class: bad
+}
+
+seam: "the seam — docs/contracts.md §5, frozen" {
+  proto: "InferenceModel — @runtime_checkable Protocol\nname (property) · async load() · predict(context, horizon) · is_loaded()\nFour members and no more. The service holds this type and nothing else,\nwhich is what lets a commercially licensed tabular model drop in later\nwithout the service noticing — Plan.md §5 option 2, the hard requirement." {
+    class: lib
+  }
+
+  retc: "predict(context: pd.DataFrame, horizon: int) -> float\nReturns the expected return for the bar `horizon` ahead, scaled to [-1, 1].\ncontext is rows x the 18 frozen FEATURE_COLUMNS, oldest first, newest last;\nhorizon is 1 for minute-close inference. The [-1, 1] range is not advisory —\nexecution compares the score against inference.score_threshold." {
+    class: lib
+  }
+
+  proto -> retc: "the return contract"
+}
+
+base: "BaseInferenceModel — the invariants a subclass cannot skip" {
+  inv: "predict() and load() are CONCRETE; only the hooks are abstract\npredict: not _loaded -> ModelNotLoadedError, then validate_context,\nthen _predict_raw, then scale_to_unit. A subclass overrides no part of that\nsequence, so the loaded-state guard and the range clamp cannot be dropped.\nload(): if self._loaded it logs and returns — second-call-safe, loads at most once." {
+    class: py
+  }
+
+  hooks: "_name (property) · async _load() · _predict_raw(context, horizon)\nABC, so a subclass missing one cannot be constructed.\n_load must raise ModelUnavailableError rather than panicking.\n_predict_raw returns natural return units and never does the [-1, 1] mapping\nitself — the base class owns that, which is why two implementations agree." {
+    class: py
+  }
+
+  shared: "validate_context, shared by every backend so a malformed prompt fails\nthe same way whichever model is loaded: horizon >= 1; is a DataFrame; all 18\nFEATURE_COLUMNS present; len(context) - horizon >= MIN_CONTEXT_ROWS 60;\nno NaN in the frozen columns (rejected, not repaired); reset_index.\nscale_to_unit uses tanh, not a clip, so a clip's flat tail cannot flatten the\nranking the threshold depends on; a non-finite raw value returns 0.0 BEFORE\nthe transform, because tanh(inf) is 1.0 and a diverged model would otherwise\nbe reported as maximum conviction and traded." {
+    class: py
+  }
+
+  inv -> hooks: "the only extension point"
+  inv -> shared: "uses"
+}
+
+registry: "the registry — how a model gets picked" {
+  sel: "inference.model — core/config/config.go\nConfig.Validate defaults it to 'tabfm'; crossValidate rejects anything that is\nnot 'tabfm' or 'heuristic': 'inference.model: %q must be one of tabfm, heuristic'.\napp/runtime.py re-checks it against available_models() and raises at startup if\nnothing is registered under that name — the honest failure for a venv built\n--skip-model that was never told to use the heuristic." {
+    class: go
+  }
+
+  reg: "register(name) -> decorator over _REGISTRY: dict[str, ModelFactory]\nempty name -> ValueError; a duplicate name -> ValueError (no silent overwrite).\nunregister(name) pops it again, for tests that register throwaway models.\ncreate_model(name) returns a fresh UNLOADED model; an unknown name -> ValueError\nlisting available_models(), never a silent default.\navailable_models() is the sorted tuple of names." {
+    class: ctl
+  }
+
+  builtin: "_register_builtin_models() runs at import of base\nheuristic is registered unconditionally; tabfm inside try/except ImportError,\nwhich only logs \"tabfm backend not importable; 'tabfm' is not selectable\".\nBoth imports are deferred into the function so that importing base never\ndrags in torch — a model whose backend failed to install must still be\nselectable BY NAME so the service can fall back to it." {
+    class: py
+  }
+
+  svc: "Predictor.from_name(name) -> create_model(name), never loads weights here\nPredictor.load() catches ModelUnavailableError and swaps in\ncreate_model('heuristic') — unless the selector already WAS heuristic, which\nre-raises. A research-grade backend going missing must not take the process\ndown: the service keeps scoring, and inference.dry_run keeps it from trading." {
+    class: ctl
+  }
+
+  sel -> reg: "a name, validated twice"
+  builtin -> reg: "populates"
+  reg -> svc: "create_model(name)"
+}
+
+heuristic: "HeuristicModel — the dependency-free implementation, not a stub" {
+  hmodel: "_name = 'heuristic-v1'. _load fetches nothing; it logs the target,\nthe three weights, and 'no pretrained checkpoint and no licence restriction'.\nnumpy + pandas only and no RNG, so the same context scores identically every\ntime. This is the model every service test builds." {
+    class: py
+  }
+
+  hblend: "blended = 0.45*trend + 0.35*reversion + 0.20*participation, * sqrt(horizon)\nEvery term is z-scored against the context and clipped at SATURATION_Z 3.0, so a\nsingle blown-out bar cannot dominate and the weights summing to 1 keep the\npre-gate score in the same range as score_threshold.\ntrend: sign agreement across ret_1/ret_5/ret_15 x clip(ret_1 / vol_20, ±3)\nreversion: -(z(ret_1) + 0.5 * z(sma_gap_10))\nparticipation: sign(rsi) x |rsi| x clip(volume_ratio)/VOLUME_GATE 3.0\n              x min(vol_ratio)/VOL_RATIO_GATE 2.5, and 0.0 below\n              MIN_DISPATCH_Z 0.15 — thin tape means no dispatch." {
+    class: py
+  }
+
+  hrole: "drawn as a real implementation because that is the point of the seam.\nIt is the fallback every refusal message names, and it is what validates the\npipeline end to end: a broken feature table, a mis-scaled score, or a stuck\nservice all show up here first. Minute-close index futures do mean-revert after\nvolume-confirmed dislocations, so the blend is a claim, not filler." {
+    class: py
+  }
+
+  hmodel -> hblend: "in _predict_raw"
+  hmodel -> hrole
+}
+
+tabfm: "TabFMModel — zero-shot, in-context, no training loop" {
+  tmodel: "@register('tabfm') class TabFMModel(BaseInferenceModel)\ndevice 'cpu' (no GPU on the target machine), n_estimators 8, random_state 42,\nmax_num_rows 100 = MAX_CONTEXT_ROWS, max_num_features 500, use_amp False.\n_regressor() imports TabFMRegressor lazily and builds it per predict;\nfloat32 is kept over TabFM's bfloat16 default because torch's CPU bfloat16\nmatmuls are emulated and slower." {
+    class: py
+  }
+
+  tprompt: "in-context regression — the historical rows ARE the prompt\nprompt = features rows[0 : N-h] (ret_1 dropped)\ntarget = rows[h : N]['ret_1'] — what each of those bars went on to make\nquery  = rows[N-1] — the newest bar, whose future is wanted\nregressor.fit(prompt, targets) is the FORWARD PASS, not training, which is why\nit runs per request and why there is no dataset to persist. take_recent keeps\nonly the newest 100 rows: attention is ~linear in prompt size and a stale\nregime at the head costs signal, not just time. The result is divided by\nreturns_volatility so it is comparable across instruments." {
+    class: py
+  }
+
+  tlic: "the licence is a runtime fact, not a comment\nWEIGHTS_LICENCE = 'tabfm-non-commercial-v1.0', NON_COMMERCIAL = True, and\n_load logs LICENCE_WARNING at WARNING on EVERY acquisition of the weights, so a\ndeployment cannot pick the model up silently. is_commercially_licensed()\nreturns not NON_COMMERCIAL — False under every configuration, and there is no\nflag that should be read as making it otherwise.\nMFT_ACK_NON_COMMERCIAL_TABFM=1 only records that a human read it in the logs;\nit changes nothing about the licence." {
+    class: ctl
+  }
+
+  tmodel -> tprompt: "predict()"
+  tmodel -> tlic: "on every _load"
+}
+
+guard: "_make_backend(device, dtype) — the refusal ladder, in source order" {
+  gpath: "1. CHECKPOINT_ENV_VAR (TABFM_CHECKPOINT_DIR) is set and not a directory\n-> ModelUnavailableError naming the var, HF_REPO_ID, and 'heuristic'.\nAn operator who points at a directory means it. Falling through to a 6.6 GB\ndownload because the path was mistyped is the failure this exists to stop." {
+    class: bad
+  }
+
+  gmem: "2. _free_memory_bytes() reads MemAvailable from /proc/meminfo, not free RAM\nrequired = WEIGHTS_FOOTPRINT_BYTES 7 GiB + WEIGHTS_HEADROOM_BYTES 1 GiB\navailable < required -> ModelUnavailableError: 'loading TabFM needs about 8.0 GB\nof free memory and this machine reports N GB available. The OOM killer would\ntake the process rather than raise. Free memory, lower inference.n_estimators,\nor set inference.model to heuristic.'\nNone from a non-Linux host means 'cannot check' and does NOT refuse." {
+    class: bad
+  }
+
+  gtorch: "3. import torch — the ONLY torch import in the whole component,\nand it is the third statement of the ladder, not the first.\nImportError -> ModelUnavailableError naming venv.sh and 'heuristic'.\nThis is the ordering the 14GB build machine exists to protect: the preflight\nabove has to run BEFORE torch is loaded, or 'the weights are on disk and the\nbox is short of memory' stops being the failure the operator is told about." {
+    class: py
+  }
+
+  gbackend: "4. from tabfm.src.pytorch import tabfm_v1_0_0\nThis is the first line that can pull torch in at all, via the backend's own\nmodule-scope import. ImportError -> ModelUnavailableError: the package is\ninstalled but the backend needs a torch build matching the interpreter." {
+    class: py
+  }
+
+  grepo: "5. backend_repo = getattr(tabfm_v1_0_0, 'HF_REPO_ID', HF_REPO_ID)\nMismatch -> ModelUnavailableError. The module is written against\ngoogle/tabfm-1.0.0-pytorch, so a silent backend bump needs the prompt layout in\n_predict_raw reviewed before it is trusted. Caught at load, not at signal time." {
+    class: ctl
+  }
+
+  gload: "6. tabfm_v1_0_0.load(model_type='regression', checkpoint_path=..., device,\ndtype, use_cache=True) — the first step that reads or downloads the checkpoint\nAny backend exception -> ModelUnavailableError naming WEIGHTS_VERSION,\nWEIGHTS_LICENCE, ~6.6 GB of cache and network access needed once, and\n\"set inference.model to 'heuristic'\". _make_backend is the only function in the\ncomponent that touches the Hugging Face cache or downloads from it." {
+    class: py
+  }
+
+  gpath -> gmem: "then"
+  gmem -> gtorch: "only after the preflight passes"
+  gtorch -> gbackend
+  gbackend -> grepo: "imported"
+  grepo -> gload: "repo id reconciled"
+}
+
+quarantine: "why the heavy import is quarantined at all" {
+  hfcache: "google/tabfm-1.0.0-pytorch — regression/model.safetensors\n~6.6 GB of float32 weights in the local Hugging Face cache. Already on disk\non the build machine, and still off-limits: Plan.md §0 forbids reading it." {
+    class: ext
+  }
+
+  consts: "name, weights_available() and _weights_version() read MODULE CONSTANTS\nname -> 'tabfm-' + _weights_version() -> WEIGHTS_VERSION '1.0.0'\nweights_available() -> HF_REPO_ID, WEIGHTS_FILE, duplicated from the backend\non purpose. The backend's own copy would be the honest source and would cost\na full torch import to read; name is read by every signal, by every log line,\nand by test collection on a venv where torch may not be installed at all.\n_load reconciles the two once, at step 5 of the ladder, when torch is already\nin the process anyway." {
+    class: lib
+  }
+
+  findspec: "weights_available() uses find_spec('tabfm') and\nfind_spec('huggingface_hub') — TOP-LEVEL names only — then\ntry_to_load_from_cache(...), which is a stat.\nfind_spec on a DOTTED name imports every parent package on the way, and\ntabfm.src.pytorch imports torch at module scope, so probing the submodule\nwould cost a full torch import. Probing presence is not a licence to load: the\nfree-memory preflight in _make_backend is the gate that actually matters." {
+    class: lib
+  }
+
+  testwall: "the suite's wall: the autouse no_accidental_weights fixture in\nmodel/tests/conftest.py replaces tabfm_model._make_backend with a raising stub\nfor the whole directory, unless MFT_TABFM_WEIGHTS_TESTS=1. Autouse rather\nthan per-file because test_base.py also constructs TabFMModel and calls\ncreate_model('tabfm'). The @refusal marker lifts it for the tests that drive\nthe REAL loader to prove it refuses before it imports torch. The default\nassumption is that the checkpoint is unreachable." {
+    class: mem
+  }
+
+  consts -> findspec: "same rule, same reason"
+  findspec -> hfcache: "stats, never opens"
+  testwall -> consts: "reading .name must not import the backend"
+}
+
+errors: "the error taxonomy — every backend failure has one name" {
+  ebase: "InferenceModelError(RuntimeError) — the root. Catching it catches\nevery failure this layer can produce, whatever the backend underneath." {
+    class: ctl
+  }
+
+  enotloaded: "ModelNotLoadedError — predict() before load() completed.\nThe service repeats the guard in Predictor.is_loaded rather than trusting\neach implementation to have it." {
+    class: ctl
+  }
+
+  eunavail: "ModelUnavailableError — a model that cannot be loaded: bad\ncheckpoint path, not enough memory, no torch, no backend, repo mismatch, a\nfailed load, or a prompt/target misalignment after truncation.\nABSORBED, not fatal: Predictor.load() swaps in the heuristic and logs, so the\nfailure names the alternative rather than killing the process." {
+    class: bad
+  }
+
+  einvalid: "InvalidContextError — not a usable prompt table: horizon < 1, not a\nDataFrame, a missing frozen feature column, fewer than MIN_CONTEXT_ROWS + horizon\nrows, NaN in the frozen columns, take_recent(limit <= 0), or a non-positive\nscale_to_unit softness. Rejected, never repaired: a raw features.Builder table\ndoes carry NaN across its warm-up window, and silently dropping rows would\nchange what the model sees in a way nothing downstream could observe." {
+    class: ctl
+  }
+
+  ebase -> enotloaded
+  ebase -> eunavail
+  ebase -> einvalid
+}
+
+licence -> seam: "the constraint that forces the seam"
+seam -> base: "implemented by"
+registry -> heuristic: "create_model('heuristic')"
+registry -> tabfm: "create_model('tabfm')"
+base -> heuristic: "_load / _predict_raw"
+base -> tabfm: "_load / _predict_raw"
+heuristic -> base: "score in natural return units"
+tabfm -> base: "prediction / returns_volatility"
+tabfm -> guard: "_load calls"
+guard -> hfcache: "step 6 is the first byte read"
+eunavail -> heuristic: "the fallback it names"
+ebase -> einvalid: "a prompt both models must accept"
+notax: "the one gap: create_model(name) on an unregistered name raises a bare\nValueError, and HeuristicModel(n_estimators-like) bad args raise ValueError too.\nNeither descends from InferenceModelError, so a caller catching the taxonomy\nalone does not catch a typo in inference.model. app/runtime.py pre-checks the\nname against available_models() at startup, which is what keeps the typo from\nreaching create_model at all." {
+  class: ctl
+  style.stroke-dash: 4
+}
+reg -> notax: "ValueError, outside the taxonomy"
+
+footer: "Derived from:\nservices/inference/model/base.py (InferenceModel, BaseInferenceModel, validate_context, take_recent,\nreturns_volatility, scale_to_unit, _REGISTRY, register, unregister, create_model,\navailable_models, _register_builtin_models, FEATURE_COLUMNS, MIN_CONTEXT_ROWS,\nMAX_CONTEXT_ROWS, MAX_NUM_FEATURES, the four error types)\nservices/inference/model/heuristic_model.py (HeuristicModel, _trend_term, _reversion_term,\n_participation_term, TREND_WEIGHT, REVERSION_WEIGHT, PARTICIPATION_WEIGHT, SATURATION_Z,\nVOLUME_GATE, VOL_RATIO_GATE, MIN_DISPATCH_Z, HORIZON_REFERENCE)\nservices/inference/model/tabfm_model.py (TabFMModel, _make_backend, _regressor, _predict_raw,\nweights_available, _free_memory_bytes, _weights_version, WEIGHTS_LICENCE, NON_COMMERCIAL,\nACK_ENV_VAR, CHECKPOINT_ENV_VAR, HF_REPO_ID, WEIGHTS_VERSION, WEIGHTS_FILE,\nWEIGHTS_FOOTPRINT_BYTES, WEIGHTS_HEADROOM_BYTES, DEFAULT_N_ESTIMATORS, LICENCE_WARNING)\nservices/inference/model/__init__.py (the re-exported public surface — note it does not re-export\nWEIGHTS_LICENCE, so the licence is read from the module, not the package)\nservices/inference/model/tests/conftest.py (no_accidental_weights, MFT_TABFM_WEIGHTS_TESTS)\nservices/inference/model/tests/test_tabfm_model.py (test_name_reports_the_weights_version,\ntest_a_short_memory_machine_is_refused_before_the_weights_are_mapped)\ncore/config/config.go (InferenceConfig, Validate, crossValidate) · services/inference/app/predictor.py\n(from_name, load) · services/inference/app/runtime.py (available_models check)\ndocs/contracts.md §5 · Plan.md §0 and §5" {
+  class: ctl
+  style.fill: "#ffffff"
+  style.stroke-dash: 4
+}
