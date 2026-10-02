@@ -205,7 +205,8 @@ diagrams:
 		fi; \
 	done; \
 	echo "rendered $$ok, failed $$fail -> $(DIAGRAM_SVG)/"; \
-	test $$fail -eq 0
+	test $$fail -eq 0; \
+	python3 docs/diagrams/mkindex.py $(DIAGRAM_SVG)
 
 diagrams-check:
 	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
