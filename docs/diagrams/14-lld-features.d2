@@ -1,0 +1,112 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  go:    { style.fill: "#e3f2fd"; style.stroke: "#1976d2" }
+  py:    { style.fill: "#ede7f6"; style.stroke: "#5e35b1" }
+  lib:   { style.fill: "#e0f2f1"; style.stroke: "#00897b" }
+  store: { style.fill: "#e8f5e9"; style.stroke: "#2e7d32" }
+  mem:   { style.fill: "#fff8e1"; style.stroke: "#f9a825" }
+  ctl:   { style.fill: "#e5e7eb"; style.stroke: "#37474f" }
+  bad:   { style.fill: "#ffebee"; style.stroke: "#c62828" }
+}
+
+# ------------------------------------------------------------------ input ----
+candles: "INPUT   []contracts.Candle\nthe caller's window, oldest first, newest last.\n\nSymbol, Timestamp (stored UTC), Open, High,\nLow, Close, Volume. Build copies the window\ninto a series and never mutates the caller's\nslice." { class: store }
+
+tz: "app.timezone = \"Asia/Kolkata\"\ncore/config/config.go\n\nThe CALLER does time.LoadLocation(app.timezone)\nand hands the result to NewBuilder.\ncore/features imports no config package.\n\nnil loc => time.UTC - the honest reading of an\nunset value, not a safe default: it silently\nmakes both calendar features UTC-derived." { class: ctl }
+
+newb: "NewBuilder(loc *time.Location) Builder\ninterface Builder has exactly one method, Build.\nbuilder{loc} is the only field; the table itself\nis derived per Build from the candles.\n\n(*builder).location() tolerates a nil receiver\nand a builder that was never constructed." { class: go }
+
+# ------------------------------------------------------------------ build ----
+build: "(*builder).Build(candles) (FeatureTable, error)\nAllocates only - reads no clock, no file,\nno config, no RNG." { class: lib }
+
+gate: "REJECT 1 - length\nlen(candles) < WarmupRows\n\n\"features: %d candles is under the %d-bar\nwarm-up, refusing to build a table with no\npredictable row\"\n\nChecked before validate(), so a short window is\nnever inspected cell by cell." { class: bad }
+
+valid: "REJECT 2 - validate(candles) error, per candle\nnon-finite price\nnon-positive price\nhigh < low\nhigh < open or high < close\nlow > open or low > close\nnegative volume\nSymbol != candles[0].Symbol\nTimestamp not strictly after candles[i-1]\n\nWHY AN ERROR RATHER THAN A SUBSTITUTION:\neach of these still produces FINITE numbers. A\nmixed-symbol window averages two unrelated price\nseries; a rewound bar double-counts one. A NaN\nwould at least have been visible.\n\nGAPS ARE NOT A FAILURE: a missing minute\nshortens a trailing window, which is exactly\nwhat a fixed window should do." { class: bad }
+
+err: "return FeatureTable{}, error\nNo partial table, no zero-filled stand-in,\nno repair." { class: bad }
+
+ser: "newSeries(candles) *series\nopens, highs, lows, closes, volumes\n+ logRet, change\n\nComputed once per Build, then read by offset\nrather than by value.\n\nlogRet[0] and change[0] are meaningless and stay\n0 - no return exists without a previous bar,\nand every read is guarded to start at index 1." { class: lib }
+
+# ------------------------------------------------------------------- loop ----
+loop: "for i := range candles {\n  row := make([]float64, numColumns)\n  ...guarded writes, one per column...\n  rows[i] = row    <-- index i, verbatim\n}\nrows := make([][]float64, len(candles))" { class: lib }
+
+grule: "THE GUARD IS NOT ONE FORMULA\n\nwindowRet60 = 60, RETURNS -> i >= 60\nwindowVol20 = 20, RETURNS -> i >= 20\nwindowRSI  = 14, CHANGES -> i >= 14\nwindowVolZ = 20, VALUES  -> i >= 19\nwindowSMA  = 10, VALUES  -> i >=  9\nwindowRet1 =  1, RETURNS -> i >=  1\nbar geometry reads bar i alone -> i >= 0\n\na window of w returns needs i >= w; a window\nof w values needs i >= w-1, because the\nreturn series starts at index 1." { class: lib }
+
+# --------------------------------------------- the 18 columns, by subject ----
+# Grouped by WHAT THEY COMPUTE, not by position. The positional order lives
+# in defaultColumns; the index prefix on each line restates it.
+g_ret: "RETURNS   cols 0-3\ncolRet1  ret_1    s.ret1(i) = logRet[i]  i >= 1\ncolRet5  ret_5    s.ret(5, i)             i >= 5\ncolRet15 ret_15   s.ret(15, i)            i >= 15\ncolRet60 ret_60   s.ret(60, i)            i >= 60\n\nlog, not a ratio: symmetric, and composes -\nlog(close[i]/close[i-60]) is the sum of the\n60 one-bar logs between them." { class: lib }
+
+g_vol: "VOLATILITY   cols 4-6\ncolVol5     vol_5      stdev(logRet[i-4..i])   i >= 5\ncolVol20    vol_20     stdev(logRet[i-19..i])  i >= 20\ncolVolRatio vol_ratio  div(vol_5, vol_20)      i >= 20\n\nThe window counts RETURNS, not bars: 5 returns\nspan 6 closes. vol_ratio inherits the stricter\n20-bar guard; vol_5 is already populated there." { class: lib }
+
+g_geom: "BAR GEOMETRY   cols 7-10 and 17\ncolRange1      range_1      (high-low)/close\ncolBody1       body_1       (close-open)/open\ncolUpperWick1  upper_wick_1\n  (high - max(open, close)) / (high - low)\ncolLowerWick1  lower_wick_1\n  (min(open, close) - low) / (high - low)\ncolSpreadProxy spread_proxy  abs(close-open)/vol\n\nAll five read bar i alone, so they are defined\nfrom i = 0. upper + body + lower sum to 1 for a\nwell-formed bar; a doji is 0/0/0, the honest\nanswer." { class: lib }
+
+g_volz: "VOLUME   cols 11-12   windowVolZ = 20\ncolVolumeZ20   volume_z_20\n  zscore(volume[i], volume[i-19..i])     i >= 19\ncolVolumeRatio volume_ratio\n  volume[i] / mean(volume[i-19..i])     i >= 19\n\nJUDGEMENT: both 20-bar windows INCLUDE the\ncurrent bar - \"how unusual is this bar for its\nown recent history\". No dispersion means a\nz-score of 0, never an infinity." { class: lib }
+
+g_mom: "MOMENTUM AND TREND   cols 13-14\ncolMomentumRSI14 momentum_rsi_14\n  s.rsi14(i), scaled to [-1, 1]         i >= 14\ncolSMAGap10       sma_gap_10\n  (close - sma10) / sma10               i >= 9\n\nsma10 = mean(closes[i-9..i]) includes the\ncurrent close, so a gap of 1% reads 0.01 at\na price of 20 or of 2000." { class: lib }
+
+g_sess: "SESSION, IST not UTC   cols 15-16\ncolMinuteOfSession minute_of_session\n  minuteOfSession(Timestamp, loc)       i >= 0\ncolHourOfDay       hour_of_day\n  hourOfDay(Timestamp, loc), 0-23       i >= 0\n\nBoth take the INJECTED *time.Location. The\nplatform stores UTC; these are IST calendar\nvalues, equal only in the 05:30-06:00 UTC\nwindow: 00:30 UTC is 06:00 IST and must be\nlabelled 6, not 0. Both defined from i = 0." { class: lib }
+
+sessfn: "session.go\nSessionOpenMinute = 9*60 + 15 = 555\nminuteOfSession(t, loc)\n  = t.In(loc).Hour()*60 + t.Minute() - 555\n\nA CLOCK OFFSET from 09:15, not a count of bars\nseen: a stored candle cannot shift it, so a\ndropped bar cannot move the newest row.\n\nDeliberately UNCLAMPED - the 09:00-09:15\nauction reads negative, the post-close block\ntrade reads over 375. The 09:15 IST open stored\nas 03:45 UTC reads 3*60+45-555 = -330." { class: lib }
+
+jc: "TWO DOCUMENTED JUDGEMENT CALLS\n\nmomentum_rsi_14 uses SIMPLE MEANS over the\nlast 14 changes, not Wilder smoothing.\nRow i depends on a fixed trailing window\nand nothing earlier.\n\nWilder's smoothing seeds a running average\nat bar 14 and carries it forward, so RSI at\nbar i would depend on where the caller's\nquery began: a 100-candle live pull and a\n100000-candle backfill would disagree\nabout the same market state. That is the\ndrift the pull architecture in Plan.md §4\ncannot tolerate.\n\nThe mapping to [-1, 1] puts a flat window\nat 0, an unbroken run of up bars at +1 and\nof down bars at -1, matching the score range\ninference reports.\n\nstdev is the SAMPLE (n-1) form, not the\npopulation one, and it is shared with\nzscore, hence with volume_z_20." { class: lib }
+
+san: "numeric.go\nsanitize(v): non-finite -> 0\ndiv(num, den): den == 0 -> 0, else sanitize(num/den)\n\nLAST LINE OF DEFENCE, NOT THE FIRST - every\nfeature already goes through div, so a non-finite\nvalue here means an intermediate overflowed.\n\nA zero denominator is an ORDINARY state here:\na flat window, an untraded bar, a doji. \"No\ninformation\" is what a zero column says, and one\nNaN poisons a whole TabFM context table.\n\nBuild never returns NaN or an infinity." { class: lib }
+
+# ------------------------------------------------------- the alignment rule --
+align: "THE ALIGNMENT GUARANTEE\nlen(Rows) == len(candles)\n\nRows[i] belongs to candles[i]\none for one, NO OFFSET\n\nAsOf = candles[n-1].Timestamp, verbatim\n\nRows[0] .. Rows[59]   IsWarmup(i) is true\n  context only. A window that is not yet\n  full is 0 - ONE uniform rule rather\n  than a per-feature exception.\n\nRows[60]   the first row at which EVERY\n  column is fully informed, because\n  WarmupRows == windowRet60, the longest\n  window in the schema.\n\nA table shifted by 59 is well-formed, passes\nevery check, and is perfectly wrong. Nothing\ndownstream would report it." { class: mem; style.stroke-width: 4 }
+
+cols: "DefaultColumns() []string\nThe frozen 18 names of docs/contracts.md §4,\nin the order TabFM was given them.\n\ndefaultColumns is a [...]string array, so\nnothing can append to it, and every call hands\nback a fresh copy - a caller that reorders or\ntruncates cannot corrupt the schema.\n\nnumColumns = len(defaultColumns) = len(Rows[i]) = 18" { class: lib }
+
+table: "FeatureTable{Columns, Rows, AsOf}\n\nColumns []string\n  always DefaultColumns() for a table this\n  package builds\nRows [][]float64\n  one row of len(Columns) per input candle,\n  in input order\nAsOf time.Time\n  timestamp of the last row, caller's zone" { class: lib }
+
+iswarm: "IsWarmup(i int) bool  ->  i < WarmupRows\n\nWarmupRows = windowRet60 = 60, the LONGEST\nwindow in the schema, so it needs no\nper-feature bookkeeping.\n\nThe constant exists so callers do not have to\nknow the arithmetic." { class: go }
+
+pure: "PURITY - why any of this is checkable\n\nno clock:  time.Now() is never called; every\n           timestamp is read off the candles\nno I/O:     no file, no network\nno config:  core/config is not imported;\n           the zone is injected\nno RNG:     no rand, no map iteration\n           in a value path\n\nThe newest row of a 100-candle build and of a\n100000-candle build are bit-identical - which\nis what makes a Parquet backfill and a live\nminute comparable row for row." { class: lib }
+
+consumer: "CONSUMER - what an offset would cost\n\nservices/inference/app/features.py\n  frame is \"row-for-row aligned with the input\"\n  .context(rows) DROPS the warm-up:\n  frame.iloc[WARMUP_ROWS:]\n  WARMUP_ROWS = 60, mirrors features.WarmupRows\n\nservices/inference/app/loop.py\n  tail(symbol, wanted + WARMUP_ROWS)\n  too few survivors -> FeatureError ->\n  Outcome.BAD_CONTEXT: a skip, never a\n  shorter prompt\n\nservices/inference/model/tabfm_model.py\n  train target = rows[h : N][ret_1]  (h = horizon)\n  query row    = rows[N-1]\n\nRow i is zipped with row i+h to form the label.\nShift the Go table by 59 and the model trains on\nan hour-away label - confident, wrong, silent." { class: py }
+
+src: "Derived from\ncore/features/features.go\n  Builder, FeatureTable, NewBuilder, DefaultColumns,\n  defaultColumns, numColumns, windowRet*, WarmupRows,\n  IsWarmup, Build, validate\ncore/features/columns.go\n  series, newSeries, ret1, ret, vol, range1, body1,\n  upperWick1, lowerWick1, volumeZ20, volumeRatio,\n  rsi14, smaGap10, spreadProxy\ncore/features/numeric.go\n  finite, sanitize, div, mean, stdev, zscore\ncore/features/session.go\n  SessionOpenMinute, minuteOfSession, hourOfDay\ndocs/contracts.md §4 - the frozen 18-column schema\nCross-referenced, not owned by C3:\n  services/inference/app/features.py, loop.py,\n  services/inference/model/tabfm_model.py,\n  core/config/config.go (AppConfig.Timezone)" { class: lib }
+
+# ------------------------------------------------------------------ edges ----
+candles -> build: "the window"
+tz -> newb: "time.LoadLocation(app.timezone)"
+newb -> build: "Builder"
+
+build -> gate: "1. length first"
+build -> valid: "2. then per candle"
+gate -> err: "len < 60"
+valid -> err: "first bad candle ends the build"
+build -> ser: "validate() passed"
+build -> pure: "deterministic; allocates and returns"
+
+ser -> loop: "read by offset"
+loop -> grule: "each guard written next to its feature"
+loop -> g_ret: "cols 0-3"
+loop -> g_vol: "cols 4-6"
+loop -> g_geom: "cols 7-10, 17"
+loop -> g_volz: "cols 11-12"
+loop -> g_mom: "cols 13-14"
+loop -> g_sess: "cols 15-16"
+loop -> san: "every cell, on the way out"
+loop -> align: "rows[i] = row"
+
+newb -> sessfn: "(*builder).location()"
+sessfn -> g_sess: "loc reaches BOTH calendar columns"
+g_mom -> jc: "why simple means, not Wilder"
+g_volz -> jc: "sample (n-1) stdev"
+
+align -> table: "Rows, AsOf"
+cols -> table: "Columns"
+table -> iswarm: "WarmupRows = 60"
+table -> consumer: "Rows[WarmupRows:] onward"
+align -> consumer: "zip(Row[i], Candle[i])" { style.stroke: "#5e35b1"; style.stroke-width: 3 }
