@@ -36,3 +36,5 @@ data/*.duckdb.wal
 .vscode/
 .commandcode/
 docs/diagrams/svg/
+docs/diagrams/explorer.html
+docs/diagrams/explorer.py
