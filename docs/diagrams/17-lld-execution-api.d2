@@ -1,0 +1,234 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ctl: {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  go: {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  lib: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  mem: {
+    style.fill: "#fff8e1"
+    style.stroke: "#f9a825"
+  }
+  ext: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+  }
+  bad: {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+}
+
+lifecycle: "fx lifecycle — a port clash must fail the application, not the server" {
+  start: "StartHTTPServer(lc, engine, orders, cfg, reg, logger)\nsrv.Handler = NewHandler(...), srv.Addr = cfg.Execution.Addr\nwired by fx.Invoke(StartHTTPServer, RegisterEngine, StartCacheSweeper)" {
+    class: ctl
+  }
+
+  listener: "OnStart binds net.Listen(\"tcp\", cfg.Execution.Addr) inside the hook,\nbefore the goroutine. A busy port returns an error and fx aborts the app;\nbinding inside the goroutine would log a failure beside a process that is\nup and cannot be reached." {
+    class: go
+  }
+
+  timeouts: "ReadHeaderTimeout 5s · ReadTimeout 15s · WriteTimeout 15s · IdleTimeout 60s\nReadHeaderTimeout alone bounds only the request line and headers, so a\ntrickled body held a goroutine and a file descriptor open indefinitely.\nWriteTimeout 15s is deliberately above broker.request_timeout_seconds (10s)\nso a merely slow placement is not cut off mid-flight in an unknown state." {
+    class: go
+  }
+
+  errlog: "ErrorLog: zap.NewStdLog(logger) — oversized headers and handshake\nfailures land in the same zap stream as the request lines" {
+    class: go
+  }
+
+  serve: "go srv.Serve(ln) — http.ErrServerClosed is the normal exit, not an error" {
+    class: go
+  }
+
+  shutdown: "OnStop re-bounds fx's ctx to shutdownTimeout 10s and calls\nsrv.Shutdown: stop accepting → drain in flight → close idle" {
+    class: go
+  }
+
+  start -> listener: "hook"
+  listener -> timeouts: "already set on srv"
+  listener -> errlog
+  listener -> serve: "bound first, then served"
+  serve -> shutdown: "in flight at stop"
+}
+
+assemble: "NewHandler — the route table docs/contracts.md §7 fixes" {
+  newhandler: "NewHandler(engine Executor, orders broker.OrderClient, reg, logger) http.Handler\nExecutor is a three-method interface satisfied by *Engine, which keeps the\ntransport honest about what it uses and the status mapping testable without\na risk chain" {
+    class: go
+  }
+
+  mux: "http.NewServeMux — Go 1.22 method-and-path patterns" {
+    class: go
+  }
+
+  routes: "POST /v1/signals    → handleSignal\nPOST /v1/orders     → handleOrder\nGET  /v1/portfolio  → handlePortfolio\nGET  /v1/health     → handleHealth\n/                  → handleUnknown, the catch-all that loses to all four" {
+    class: go
+  }
+
+  unknown: "handleUnknown — the mux answers 405 on its own only when nothing\nelse matches, and this catch-all always does, so the distinction is made\nhere against knownRoutes. Known path + wrong verb → 405 plus an Allow header;\nany other path → 404." {
+    class: go
+  }
+
+  metrics: "metrics.CounterVec / HistogramVec registered on the supplied registry\nmft_execution_http_requests_total — by route, method, status\nmft_execution_http_request_duration_seconds — by route\nmft_execution_http_faults_total — by transport code, and its Help states that\nrisk rejections are counted by mft_execution_rejections_total instead" {
+    class: ctl
+  }
+
+  portfolio: "handlePortfolio → engine.Portfolio() = risk.Book.Snapshot(), a copy,\nso a caller cannot mutate engine state through the response.\nA flat book sends OpenPositions as {} rather than null." {
+    class: go
+  }
+
+  health: "handleHealth → metrics.NewHealth(\"execution\", brokerChecks(orders)).Readyz\nprobeBroker calls orders.GetPositions rather than pinging: the cheapest\nauthenticated read Kite offers, and it fails on a missing or expired access\ntoken before it can fail on an order. Bounded to 3s so a liveness probe\ncannot hang until the process is killed. Unusable session → 503, because a\nprocess that cannot reach the broker is not trading." {
+    class: go
+  }
+
+  newhandler -> mux
+  mux -> routes
+  newhandler -> metrics
+  routes -> unknown: "no match"
+  routes -> portfolio
+  routes -> health
+}
+
+pipeline: "one POST /v1/signals, in the order the request is served" {
+  logmw: "log.Middleware(logger)(mux) — the outermost wrapper\nX-Request-Id is read from the request when present, else NewCorrelationID,\na 128-bit crypto/rand value so an id cannot be forged into a log line. It\nis echoed on the response, put on the context for every log line the request\ncauses, and exactly one line is written: error on 5xx, warn on 4xx, debug\notherwise. The URI is redacted." {
+    class: lib
+  }
+
+  route: "a.route(\"signals\", a.handleSignal) — per route\nstatusRecorder wraps w and starts at 200 the way net/http does. Two\ndeferred closures are registered, so the metrics Inc() runs last and sees\nthe status the panic barrier already wrote." {
+    class: go
+  }
+
+  barrier: "a.recoverPanic(rec, r) — the per-request panic barrier, registered\nsecond so LIFO runs it first, wrapping the handler body. net/http drops the\nconnection when a handler panics, so without this one bug in one route tears\ndown every request in flight; with it the caller gets a 500 in the standard\nerror shape and the process keeps trading. Already committed → truncated\nbody and dropped connection, the honest outcome. The panic value is logged\nwith debug.Stack, never returned: this body is read by inference." {
+    class: bad
+  }
+
+  decode: "decodeJSON — strict, and strict is load-bearing\nhttp.MaxBytesReader(w, r.Body, maxRequestBody = 64 KiB) bounds the body\nbefore a byte reaches the risk gate; DisallowUnknownFields plus a second\nDecode that must return io.EOF\nA mistyped idempotency_key is the case this buys. It decodes to \"\", so the\nrequest has silently lost its exactly-once guarantee and no decoder reports\nanything. validateSignal then answers BAD_REQUEST — and a caller that retries\nthe same typo is refused for as long as it keeps sending a request the\nserver did not understand." {
+    class: go
+  }
+
+  wire: "normaliseSignal: ToUpper + TrimSpace on symbol, side, idempotency_key —\nthe one layer that bridges Kite's case-insensitive matching and the risk\ngate's exact comparison, without either knowing about the other.\nvalidateSignal: symbol, side ∈ BUY/SELL, price > 0, idempotency_key non-empty\nvalidateOrder: + type ∈ MARKET/LIMIT, quantity ≥ 1, price > 0, MARKET unpriced\nThe same rules risk.ValidateSignal enforces, repeated at the edge on purpose.\nNot one of them is a budget, a limit or a session check." {
+    class: go
+  }
+
+  engine: "Engine.ExecuteSignal(r.Context(), sig) → (orderID string, err)\nEvery risk decision is below this line; the transport decides nothing" {
+    class: go
+  }
+
+  write: "writeJSON — marshal before WriteHeader, so an encoding failure is a\nclean 500 rather than a 200 with a truncated body\nwriteError — an error that is not already a transportError degrades to 500\nrather than leaking a code that was never declared" {
+    class: go
+  }
+
+  logmw -> route: "X-Request-Id echoed"
+  route -> barrier
+  barrier -> decode: "request body"
+  decode -> wire: "contracts.Signal"
+  wire -> engine: "a decision, not a typo"
+  engine -> write: "order_id, error"
+}
+
+faults: "Two disjoint error vocabularies. Shape validation is hoisted to the\nedge precisely so a client bug can never be counted as a risk decision." {
+  class: ctl
+}
+
+transport: "transport codes — the caller's bug or the wire's fault\nBAD_REQUEST 400 · PAYLOAD_TOO_LARGE 413 · METHOD_NOT_ALLOWED 405\nNOT_FOUND 404 · BROKER_UNAVAILABLE 502 · INTERNAL_ERROR 500\n→ mft_execution_http_faults_total, by code\nA typo, a truncated body or a broker outage must not inflate a risk\ndashboard: a client bug must not look like a risk rejection." {
+  class: bad
+}
+
+riskband: "risk codes — contracts.Rejection, surfaced verbatim by classify()\nRISK_MAX_POSITION · RISK_MAX_POSITIONS · RISK_MAX_DRAWDOWN\nRISK_DAILY_LOSS · RISK_DEBOUNCED · RISK_BAD_QUANTITY\nRISK_MARKET_CLOSED → 400 · RISK_DUPLICATE → 409\n→ mft_execution_rejections_total, by reason\nVerbatim because an inference loop branching on RISK_DEBOUNCED must see the\nsame string the metric was labelled with." {
+  class: bad
+}
+
+statusmap: "statusForCode(code)\nRISK_DUPLICATE 409 · NOT_FOUND 404 · METHOD_NOT_ALLOWED 405\nPAYLOAD_TOO_LARGE 413 · BROKER_UNAVAILABLE 502 · INTERNAL_ERROR 500\ndefault — BAD_REQUEST and every RISK_* reason — 400\nAnything the engine returns that is not a Rejection is BROKER_UNAVAILABLE\n502, not 400: by then the request has passed every shape check, so the only\nwork left is the chain and the broker call. Answering 400 would tell\ninference to retry something that is not its fault." {
+  class: ctl
+}
+
+decode -> transport: "unknown field, trailing content, > 64 KiB,\nmalformed JSON, no idempotency_key, MARKET at price 0"
+wire -> transport: "every wire-shape rule"
+barrier -> transport: "panic, before commit"
+unknown -> transport: "wrong verb, no route"
+engine -> riskband: "*contracts.Rejection"
+engine -> transport: "any other error"
+faults -> transport: "one band"
+faults -> riskband: "never the same counter"
+transport -> statusmap
+riskband -> statusmap
+
+critical: "the exactly-once claim — Engine.execute, one critical section" {
+  claim: "execute(ctx, sig, idemTTL) holds e.mu for the whole body:\nthe claim, the chain, the broker call and the portfolio update. Without\nthe lock a concurrent replay of one key can pass the idempotency check\nand place a second order. At one signal per minute per symbol the\nthroughput cost is nil." {
+    class: go
+  }
+
+  get: "fluxKV.Get(\"IDEM:\" + sig.IdempotencyKey) → (v, ok)\nThe prefix namespaces it away from the debounce key space.\nGet reports ok=false for a missing or expired entry, so the branch is\nexactly 'was a previous attempt of this key completed'." {
+    class: mem
+  }
+
+  dup: "ok == true — a replay. Return the stored order_id and\nRISK_DUPLICATE, before any check and before the broker.\nclassify attaches that order_id, so the response is 409 carrying\norder_id — the one failure where inference needs it, because it is how\nthe retry loop learns the order already exists and stops.\n409 and not 400: the key was honoured, not refused." {
+    class: bad
+  }
+
+  chain: "ok == false — a first-time key. e.checks.Check(ctx, sig,\nbook.Snapshot()) runs the seven checks inside the same lock.\nThe first failure returns; the rest never run." {
+    class: go
+  }
+
+  place: "broker.Client.PlaceOrder(ctx, symbol, side, quantity, price)\nthe only way an order leaves the process" {
+    class: go
+  }
+
+  set: "fluxKV.Set(\"IDEM:\" + key, orderID, idemTTL) — only after PlaceOrder\nreturned nil, then EXEC:<symbol>:<side> for the debounce window.\nA failed placement therefore claims nothing and debounces nothing: the\nsame key still places on retry. That is why the claim is written on the\nway out of the happy path rather than read up front." {
+    class: mem
+  }
+
+  book: "risk.Book.Apply(sig) — a failed portfolio update is logged loudly and\nthe fill is kept, not dropped: the broker already filled it" {
+    class: go
+  }
+
+  claim -> get: "claim first"
+  get -> dup: "ok == true"
+  get -> chain: "ok == false"
+  chain -> place: "all seven passed"
+  place -> transport: "error → 502, nothing claimed,\nthe same key still places on retry"
+  place -> set: "nil error"
+  set -> book: "order_id"
+  claim -> set: "idemTTL = execution.idempotency_ttl_seconds,\n24h fallback, chosen to outlive inference's\nretry loop rather than the 5-minute debounce window"
+}
+
+statusband: "status mapping — what was asked for, not what happened" {
+  ordertype: "orderTypeFor(declared, price)\nAn explicit MARKET or LIMIT wins; otherwise price > 0 ⇒ LIMIT, else\nMARKET. That is broker.Kite.placeOrder's own rule, so the API reports the\norder type the exchange will see instead of a second, disagreeing opinion.\nThe declared type is validated before it is resolved, because resolving an\nunrecognised one to the price would silently place an order the caller did\nnot ask for." {
+    class: go
+  }
+
+  outcome: "outcomeFor(orderType)\nLIMIT → 200 OK {\"order_id\", \"status\": \"OPEN\", \"score\"}\nMARKET → 202 Accepted {\"status\": \"FILLED\"}\nA limit order rests at the exchange until something fills or cancels it; a\nmarket order is filled as submitted or refused. This is a statement about\nwhat was asked for, not a report of what happened: ExecuteSignal returns\nan order id and no fill state, so the transport cannot observe a fill even\nin principle, and claiming more would be a lie an inference loop could act on." {
+    class: ctl
+  }
+
+  unreachable: "202 Accepted / FILLED is unreachable end to end today, and that is\na gap rather than a design.\nThe risk chain sizes a position as quantity * price, so a zero-price market\norder is not a small order, it is an unmeasurable one. validateOrder refuses\nit at the edge naming the reason — 'the risk gate sizes an order on\nquantity*price, so this service places limit orders only' — and\nrisk.ValidateSignal refuses it too.\nThe mapping is implemented and specified anyway, so the day the engine can\nsize and place a market order the API answers 202 without another change\nhere. TestHandlerOrdersMarketOrderRefused records the gap as a test, not a\ncomment, and fails when it closes." {
+    class: ctl
+    style.stroke-dash: 4
+  }
+
+  ordertype -> outcome: "LIMIT in practice"
+  outcome -> unreachable: "no request\nreaches this" {
+    style.stroke-dash: 4
+  }
+}
+
+footer: "Derived from:\nservices/execution/http.go (NewHandler, StartHTTPServer, route, recoverPanic, handleSignal,\nhandleOrder, handlePortfolio, handleHealth, handleUnknown, decodeJSON, validateSignal,\nvalidateOrder, orderTypeFor, outcomeFor, classify, statusForCode, writeJSON, statusRecorder)\nservices/execution/engine.go (ExecuteSignal, Execute, execute, idempotencyKey, IdempotencyTTL)\nservices/execution/http_test.go (TestOutcomeFor, TestHandlerSignalAccepted, TestHandlerOrdersAccepted,\nTestHandlerOrdersMarketOrderRefused)\ncore/log/middleware.go (Middleware, RequestIDHeader, NewCorrelationID) · core/metrics/health.go (Readyz)\ncore/fluxkv/fluxkv.go (Get) · core/contracts/contracts.go (Reason*, Reject) · docs/contracts.md §7" {
+  class: ctl
+  style.fill: "#ffffff"
+  style.stroke-dash: 4
+}

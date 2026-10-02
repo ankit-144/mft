@@ -1,0 +1,189 @@
+# 09 · Runtime topology — the ports, the files and the wiring `make dev` does.
+#
+# One question: when a port is busy or a service will not start, what is
+# actually running and who bound what. Diagram 02 is the static container view;
+# this one is the process view — entrypoints, the real net.Listen call in each,
+# the env vars the launcher exports, and the two failures that are only
+# reproducible by actually running the stack.
+#
+# Derived from: Makefile (dev, stop, status, run-*), core/fx.go,
+# core/config/config.go, core/metrics/metrics.go, core/metrics/server_test.go,
+# services/ingestion/cmd/server/main.go, services/ingestion/{pipeline,candles}.go,
+# services/execution/cmd/server/main.go, services/execution/{engine,http}.go,
+# services/jobs/cmd/server/main.go, services/jobs/{worker,store,interfaces}.go,
+# services/inference/app/{main,runtime,config,loop,predictor}.py,
+# services/inference/Dockerfile, configs/config.example.yaml, docker-compose.yml,
+# .gitignore, commit 7b8c268
+#
+# The four `bad` nodes are findings, not decoration. Three of them are real
+# failures that happened; the fourth is a gap that only works by accident.
+
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ext: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+  }
+  go: {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  py: {
+    style.fill: "#ede7f6"
+    style.stroke: "#5e35b1"
+  }
+  lib: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  store: {
+    style.fill: "#e8f5e9"
+    style.stroke: "#2e7d32"
+  }
+  ctl: {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  bad: {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+  note: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+    style.font-size: 14
+  }
+}
+
+# --- the launcher ------------------------------------------------------------
+
+mkdev: "make dev" {
+  class: ctl
+  direction: down
+
+  mkstop: "make stop — runs FIRST\npkill -f 'go run ./services'\npkill -f 'go-build/[0-9a-f]*/server'\npkill -f 'uvicorn app.main:app'\nthe binary lives in the build cache,\nnot exe/server — matching the short\nname killed nothing and left a stale\nprocess holding :8080 (7b8c268)"
+  mkstatus: "make status — after sleep 4\nss -ltn, then grep -q ':9090 ' and so on\nfor 9090 8080 9091 9092 8000\necho UP or down.\nIt reports sockets, not PIDs: a\ncrashed process leaves its port\nfree and reads as clean"
+  devlogs: ".dev/ingestion.log\n.dev/execution.log\n.dev/jobs.log\n.dev/inference.log\nstdout and stderr of the four\nbackground children, gitignored.\nThis is where the fx PROVIDE table\nand 'address already in use' live"
+}
+
+mkdev.class: ctl
+
+# --- one config file, one metrics port ---------------------------------------
+
+cfgfile: "configs/config.yaml — ONE file, four readers\nmetrics.addr: ':9090'\nexecution.addr: ':8080'\ninference.addr: ':8000'\nmake setup copies configs/config.example.yaml\nwith cp -n, so an edited config is never\noverwritten. configs/config.yaml is gitignored."
+cfgfile.class: lib
+
+metricsenv: "MFT_METRICS_ADDR\nexported per child, not in the file\nconfig.Load() overwrites cfg.Metrics.Addr\nafter yaml.Unmarshal and before Validate()\n(core/config/config.go:117). This is what\nkeeps core/config/config.go frozen: a\nper-service port key would have meant an\nedit to a file ten branches share."
+metricsenv.class: ctl
+
+collide: "What it prevents. All three Go services read the same\nmetrics.addr, so the second to start fails:\n\nlisten on metrics addr :9090: bind:\naddress already in use\n\nand metrics.Server returns that from OnStart, so fx\naborts the app and the process exits. This happened on\nthe first `make dev`. It is a real collision, not a nicety."
+collide.class: bad
+
+pygap: "make dev line 116 gives the Python child\nMFT_METRICS_ADDR=:9090 as well.\n\nInert only by accident: app/config.py reads\nMFT_CONFIG and nothing else, and the only socket\nuvicorn opens is :8000. The day app/ grows a\nPrometheus exporter on metrics.addr, ingestion\nand inference collide for real."
+pygap.class: bad
+
+# --- the five processes and their real binds ----------------------------------
+
+ing: "Service 1 · ingestion — :9090\nmake run-ingestion → go run ./services/ingestion/cmd/server\nfx.New(core.Module, ingestion.Module).Run()\nbind: metrics.Server OnStart →\nnet.Listen('tcp', srv.Addr) with\nsrv.Addr = cfg.Metrics.Addr\nserves Mux: /metrics, /healthz, /readyz\nno application HTTP surface.\nOnStart p.Start, OnStop p.Stop — writers\nstarted and drained here, not in the ctor"
+ing.class: go
+
+exe: "Service 3 · execution — :8080 and :9091\nmake run-execution → go run ./services/execution/cmd/server\nfx.New(core.Module, execution.Module).Run()\n:8080 bind: StartHTTPServer OnStart →\nnet.Listen('tcp', cfg.Execution.Addr)\nPOST /v1/signals, POST /v1/orders,\nGET /v1/portfolio, GET /v1/health\n:9091 bind: metrics.Server, same call as ingestion\nexecution.addr is read from config; there is no env\noverride for it, so :8080 cannot be moved without\na second config file"
+exe.class: go
+
+job: "Service 4 · jobs — :9092\nmake run-jobs → go run ./services/jobs/cmd/server\nfx.New(core.Module, jobs.Module).Run()\nbind: metrics.Server OnStart only.\nNo application port, nothing to curl.\n-run-now takes a different branch entirely:\nrunOnce() builds the graph by hand and never\nbinds a port, so a second copy backfills on a\nlaptop without fighting the running service."
+job.class: go
+
+inf: "Service 2 · inference — :8000\nmake run-inference → cd services/inference\n&& .venv/bin/uvicorn app.main:app\n   --host 0.0.0.0 --port 8000\nbind: uvicorn's own socket, from a literal on\nthe Makefile line. inference.addr in the config\nis declared at app/config.py:94 and read by\nnothing — change it and nothing moves.\nstartup: lifespan() → runtime.startup() →\npredictor.load() → MinuteScheduler"
+inf.class: py
+
+# --- the FX graph -------------------------------------------------------------
+
+coremod: "core.Module — core/fx.go, the only shared wiring\nfx.Provide:  ConfigPath → string\n              config.Load → *config.Config\n              log.New → *zap.Logger\n              metrics.Registry → *prometheus.Registry\n              metrics.Handler → http.Handler\n              fluxkv.New → *fluxkv.KV\n              NewStorageWriter → *storage.Writer\n              NewKite → *broker.Kite\n              *broker.Kite → broker.Streamer, → broker.Client\n              broker.NewOrderClient → broker.OrderClient\nfx.Invoke:   metrics.Server"
+coremod.class: lib
+
+lazynote: "fx is lazy, and that is load-bearing here.\nA provider is only built if something in the\ngraph consumes it.\n\njobs consumes *broker.Kite — bound to\nInstrumentResolver — and nothing else, so no\n*fluxkv.KV and no *storage.Writer are ever\nconstructed there, even though core.Module\nprovides both to all three graphs.\nexecution consumes *fluxkv.KV (debounce and\nidempotency keys) but not *storage.Writer."
+lazynote.class: note
+
+hooks: "fx.Lifecycle, per service\n\ningestion   (*Pipeline).Run\n            OnStart p.Start, OnStop p.Stop\nexecution   StartHTTPServer + StartCacheSweeper\n            OnStart net.Listen, OnStop Shutdown\njobs        StartScheduler\n            OnStart go-cron AddFunc '0 2 * * 6',\n            OnStop cron.Stop, wrapped in cron.Recover\nall three   metrics.Server, OnStart net.Listen,\n            OnStop Shutdown with a 5s bound\ninference   FastAPI lifespan()\n            startup → runtime.startup, shutdown →\n            runtime.shutdown\n\nThe listener opens inside OnStart, in the calling\ngoroutine. That is deliberate: a busy port fails\nstartup rather than leaving a process that answers\n/metrics for nothing."
+hooks.class: ctl
+
+# --- the DI failure that actually happened ------------------------------------
+
+difail: "The single most instructive failure in the repo,\nbecause no unit test could have found it (7b8c268).\n\nfx.New(core.Module, jobs.Module).Run() exited\nbefore the scheduler ever started:\n\n  missing types: NewKiteHistory asked for\n  InstrumentResolver, NewBackfillWorker for\n  HistoricalClient and SegmentStore,\n  NewParquetStore for a bare string.\n\nfx resolves concrete types. jobs.Module provided\nthe concrete types and nothing that satisfied the\ninterfaces, so four dependencies could not be built\nand the graph could not be constructed at all."
+difail.class: bad
+
+difix: "Four bindings, added in worker.go:\nfunc(k *broker.Kite) InstrumentResolver\nfunc(h *KiteHistory) HistoricalClient\nfunc(s *ParquetStore) SegmentStore\nNewParquetStoreFromConfig(cfg *config.Config)\nin place of NewParquetStore(dir string) —\nthe config-derived constructor exists so the graph\nnever has to be handed a bare string, which fx\ncannot synthesise. The comment above jobs.Module\nnow names this failure on purpose."
+difix.class: ctl
+
+blind: "70 unit tests passed the whole time it was broken\n(`go test -list` in services/jobs counts 70).\n\n-run-now builds the same graph by hand in\nrunOnce(): config.Load, log.New,\nbroker.NewKiteFromConfig, then NewBackfillWorker\nwith the concrete values already in hand. It never\ngoes near fx, so it could not see the bug.\nOnly `make dev` builds the graph the service\nactually runs on. A green suite proved nothing\nabout whether the process started."
+blind.class: bad
+
+# --- disk ---------------------------------------------------------------------
+
+disk: "What every process reads from disk\nconfigs/config.yaml — via MFT_CONFIG, default\n  configs/config.yaml when the variable is unset\ndata/ticks, data/candles, data/historical — Parquet,\n  the source of truth, written by Go and read by\n  Python through DuckDB over the same paths\ndata/mft.duckdb — analytics.duckdb_path, read_only: true"
+disk.class: store
+
+venvnode: "services/inference/.venv\nmake venv then make inference-deps; run-inference\nand backtest both refuse to start without it.\nmake dev skips the service entirely if it is\nabsent and says so, rather than starting four of\nfive processes and implying a full stack."
+venvnode.class: store
+
+hfnode: "TabFM weights, ~6.6GB\n~/.cache/huggingface/hub/models--google--tabfm-1.0.0-pytorch\npredictor.load() at startup is what pulls them in\non a machine with inference.model: tabfm.\nAGENTS.md forbids loading them here — 14GB of RAM\nand an active OOM killer."
+hfnode.class: ext
+
+# --- the other path -----------------------------------------------------------
+
+dockerc: "docker compose up -d — the alternative, not the default" {
+  class: ext
+  direction: down
+
+  dcports: "Every Go container binds :9090 and it is fine:\na container has its own network namespace.\nThat is why compose needs no MFT_METRICS_ADDR\nand maps 9090:9090, 8080:8080, 9091:9090,\n9092:9090, 8000:8000 onto the host. Port 9091 on\nthe host is container 9090, not a second port\nthe image knows about."
+  dcmount: "MFT_CONFIG=/app/configs/config.yaml —\nbaked in as ENV by each Go Dockerfile and set\nagain in compose. The image ships\nconfigs/config.example.yaml as its config.yaml,\nso the credentials are empty and the broker calls\nfail on authentication rather than on a missing file.\nThe mft_data volume mounts /app/data into all three\nGo containers. inference mounts nothing."
+  dcstale: "Stale relative to the native path.\n\nservices/inference/Dockerfile copies\nservices/inference/app/ only — but app/main.py\nopens with 'from model import MAX_CONTEXT_ROWS',\nand model/ is not in the image. It also ships no\nconfigs/ directory, and compose gives the inference\nservice neither MFT_CONFIG nor a volume, so\nbuild_app() raises ConfigError and _module_app()\nre-raises it out of module __getattr__. The image\ncannot start as written."
+}
+
+dockerc.class: ext
+
+footer: "Sources: Makefile (dev, stop, status, run-ingestion, run-execution, run-jobs,\nrun-inference, setup) · core/fx.go · core/config/config.go · core/metrics/metrics.go ·\ncore/metrics/server_test.go · services/ingestion/cmd/server/main.go ·\nservices/ingestion/pipeline.go · services/ingestion/candles.go ·\nservices/execution/cmd/server/main.go · services/execution/engine.go ·\nservices/execution/http.go · services/jobs/cmd/server/main.go ·\nservices/jobs/worker.go · services/jobs/store.go · services/jobs/interfaces.go ·\nservices/inference/app/main.py · services/inference/app/runtime.py ·\nservices/inference/app/config.py · services/inference/app/predictor.py ·\nservices/inference/Dockerfile · configs/config.example.yaml · docker-compose.yml ·\n.gitignore · commit 7b8c268 'Make the platform actually boot'"
+footer.class: note
+
+# --- edges --------------------------------------------------------------------
+
+mkdev -> mkstop: "target dev, before any child"
+mkdev -> mkstatus
+mkdev -> devlogs: "each child redirected with\n> .dev/NAME.log 2>&1 &"
+
+mkdev -> ing: "MFT_CONFIG=configs/config.yaml\nMFT_METRICS_ADDR=:9090"
+mkdev -> exe: "MFT_CONFIG=configs/config.yaml\nMFT_METRICS_ADDR=:9091"
+mkdev -> job: "MFT_CONFIG=configs/config.yaml\nMFT_METRICS_ADDR=:9092"
+mkdev -> inf: "MFT_CONFIG=configs/config.yaml\nMFT_METRICS_ADDR=:9090\nonly inside the if -x PY guard"
+mkdev -> dockerc: "make docker-up — the other path.\nMakefile: 'deliberately not Docker-based:\nthe north star is local-first'"
+
+cfgfile -> metricsenv: "read by config.Load in all three Go graphs"
+cfgfile -> collide: "metrics.addr is the same in every reader"
+metricsenv -> collide: "the fix, and the whole fix"
+ing -> pygap: "owns :9090 first"
+
+ing -> coremod: "fx.New(core.Module,\ningestion.Module).Run()"
+exe -> coremod: "fx.New(core.Module,\nexecution.Module).Run()"
+job -> coremod: "fx.New(core.Module,\njobs.Module).Run()"
+coremod -> lazynote: "provides fluxkv.New and\nNewStorageWriter to all three"
+job -> lazynote: "consumes neither"
+coremod -> hooks: "fx.Invoke(metrics.Server),\nin all three Go graphs"
+inf -> hooks: "lifespan() replaces\nfx.Lifecycle here"
+hooks -> collide: "net.Listen runs inside OnStart"
+
+job -> difail: "what `make run-jobs` printed"
+difail -> difix: "fixed by"
+difail -> blind: "and nothing noticed"
+
+inf -> venvnode: "runs .venv/bin/uvicorn"
+venvnode -> hfnode: "tabfm loads on startup"
+disk -> inf: "DuckDB SELECT over\n<data_dir>/candles"

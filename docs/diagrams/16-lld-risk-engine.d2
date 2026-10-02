@@ -1,0 +1,173 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  go: {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  lib: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  mem: {
+    style.fill: "#fff8e1"
+    style.stroke: "#f9a825"
+  }
+  ctl: {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  ext: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+  }
+  bad: {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+}
+
+cfg: "config.ExecutionConfig — core/config/config.go, frozen\nexecution.capital · execution.max_position_pct ·\nexecution.max_open_positions · execution.max_drawdown_pct ·\nexecution.daily_loss_limit · execution.max_order_quantity ·\nexecution.debounce_ttl_seconds · execution.market_holidays\nread once, at startup; nothing here is consulted per signal" {
+  class: ctl
+}
+
+calendar: "NewStaticCalendar(cfg.MarketHolidays...) — risk/market.go:64\nbuilt once by FromConfig; MarketHoursCheck never reads the config\nunparseable dates are dropped — a typo must not stop the boot\nnil or empty ⇒ IsHoliday is always false ⇒ every weekday trades\nno network call: a stale holiday list can never block a signal" {
+  class: go
+}
+
+clock: "Clock / SystemClock — risk/clock.go\nSystemClock() = time.Now().UTC(); a nil Clock is a normal value\nand falls back to it. IST() is a sync.OnceValue: Asia/Kolkata,\nor a fixed +05:30 when the host has no tz database" {
+  class: go
+}
+
+fromconfig: "risk.FromConfig(cfg.Execution) — risk.go:86\nthe frozen contracts.Policy plus the three inputs it has no field\nfor: LotSizes (left nil — the schema has no lot-size key), Calendar,\nClock. A zero cap means the cap is not enforced." {
+  class: go
+}
+
+newchain: "Policy.New(store TTLStore) — risk.go:109\none list literal, composed at startup and shared as a value;\nthe order is asserted by TestPolicyChainOrder (risk_test.go:397)" {
+  class: go
+}
+
+validate: "risk.ValidateSignal — engine.go:135, before the chain\nsymbol non-empty · side ∈ {BUY, SELL} · price > 0 ·\nidempotency key non-empty (POST /v1/orders derives one from the\norder's own content). Transport faults, not policy: a plain error\nand no reason code. QuantityCheck still judges quantity." {
+  class: go
+}
+
+gate: "contracts.Checks — core/contracts/risk.go:32\nCheck(ctx, sig, portfolio) walks the slice and returns on the first\nerror. First failure wins, so the order is load-bearing." {
+  class: lib
+
+  c1: "1. MaxPositionCheck\n[MaxPct: execution.max_position_pct]\n|quantity × price| ≤ MaxPct% of Equity, and a BUY also ≤ Cash\nequity ≤ 0 refuses; MaxPct 0 disables the cap\n→ RISK_MAX_POSITION" {
+    class: go
+  }
+
+  c2: "2. MaxPositionsCheck\n[Max: execution.max_open_positions]\ncounts the position the signal WOULD create, so a symbol\nalready held adds nothing — the same formula, never looser\nMax 0 disables\n→ RISK_MAX_POSITIONS" {
+    class: go
+  }
+
+  c3: "3. DrawdownCheck\n[MaxPct: execution.max_drawdown_pct]\n(PeakEquity − Equity) / PeakEquity ≤ MaxPct\npeak ≤ 0 refuses — an undefined limit is not a limit\n→ RISK_MAX_DRAWDOWN" {
+    class: go
+  }
+
+  c4: "4. DailyLossCheck\n[Limit: execution.daily_loss_limit]\nRealisedPnL ≥ −Limit; Limit ≤ 0 means no daily cap — the one\nexecution key config.Validate deliberately does not default\n→ RISK_DAILY_LOSS" {
+    class: go
+  }
+
+  c5: "5. DebounceCheck\n[Store: fluxkv, TTL: execution.debounce_ttl_seconds]\nGet(DebounceKey(symbol, side)) — read only; a nil Store\ndisables the check\n→ RISK_DEBOUNCED" {
+    class: go
+  }
+
+  c6: "6. QuantityCheck\n[MaxQuantity: execution.max_order_quantity, LotSizes]\n1 ≤ quantity ≤ max · quantity % lot == 0 · SELL ≤ held\nv1 is long-only, so a short never reaches the broker\n→ RISK_BAD_QUANTITY" {
+    class: go
+  }
+
+  c7: "7. MarketHoursCheck\n[Clock, Calendar]\n09:15–15:30 IST inclusive · not Saturday · not Sunday ·\nnot a holiday. Clock.now().In(IST()); 555 … 930 past midnight\n→ RISK_MARKET_CLOSED" {
+    class: go
+  }
+
+  c1 -> c2: "exposure — how much room is left"
+  c2 -> c3: "exposure"
+  c3 -> c4: "exposure first, so a cheap hard bound is never reported\nwhen the account is the thing that is actually spent"
+  c4 -> c5: "hygiene — and debounce sits BEFORE quantity, so a\nrepeated signal is reported as a repeat rather than as\nwhatever happens to be wrong with its size"
+  c5 -> c6: "hygiene — is the order well-formed"
+  c6 -> c7: "last: the session itself, because a closed market is a\nfact about the clock, not about this signal"
+}
+
+book: "risk.Book — risk/book.go:43\nfree cash · realised PnL · peak equity · held[symbol] ·\ncost[symbol] average entry — the cost basis the frozen\ncontracts.Portfolio has no field for. Mutex-guarded;\nNewBook(capital) seeds cash and peak." {
+  class: mem
+}
+
+snapshot: "Book.Snapshot() → contracts.Portfolio\nCash = free cash + Σ quantity × cost; OpenPositions is a copy,\nso a caller can mutate neither the arithmetic nor the state" {
+  class: go
+}
+
+cashreading: "the design decision: Cash is TOTAL account cash\ncontracts.Portfolio is frozen and carries no cost basis, so cash\nsitting in an open position has not left the account. Reporting\nfree cash alone would make every buy look like a drawdown the\ninstant it filled, and check 3 would refuse the second order of\nthe day. Book.FreeCash() is the internal affordability figure —\nBook.Apply refuses a buy it cannot fund instead." {
+  class: lib
+}
+
+equity: "risk.Equity(p) = p.Cash + p.RealisedPnL — risk.go:125\nexact for a flat book; an open position is carried at entry cost,\nnot at mark, because surfacing marked equity needs a field the\nfrozen contract does not have" {
+  class: lib
+}
+
+kv: "fluxkv.KV — core/fluxkv, the one legitimate fluxKV use\nTTL is enforced on read, so an expired window reads as absent;\nSweep reclaims the dead keys. A per-process cache, never a bus\n(Plan.md §4): ingestion's candles and this window never meet." {
+  class: mem
+}
+
+arm: "armed by the engine, not by the check — engine.go:213\ncache.Set(DebounceKey(symbol, side), order_id, debounce_ttl)\nonly after a placement, so a rejected signal or a failed broker\ncall never opens a window it cannot honour" {
+  class: go
+}
+
+apply: "Book.Apply(sig) — after the fill; fails closed\nBUY: free cash −= quantity × price, average cost reweighted\nSELL: free cash += quantity × avgCost, realisedPnL +=\n(price − avgCost) × quantity; closing to zero deletes held/cost\npeak rises only when equity exceeds it" {
+  class: go
+}
+
+applyerr: "Apply refuses and leaves the book untouched: price ≤ 0,\nquantity < 1, unknown side, notional > free cash, sell > long\nengine.go logs it and KEEPS the fill — a silently dropped fill\nwould corrupt every subsequent limit" {
+  class: bad
+}
+
+rej: "rejected — first failure wins\ncontracts.Reject(code, message) → *contracts.Rejection\nChecks.Check returned immediately: checks 2…7 never ran for this\nsignal. No broker call, no key armed, nothing written to the book" {
+  class: bad
+}
+
+rejmetrics: "the code travels verbatim\nmft_execution_rejections_total{reason} is keyed on rej.Code and\nclassify() copies it into the HTTP body's error field, so a code\nthat nothing dashboards read would be a silent gap" {
+  class: ctl
+}
+
+pass: "all seven passed\nbroker.Client.PlaceOrder(ctx, symbol, side, quantity, price)" {
+  class: ext
+}
+
+cfg -> calendar: "execution.market_holidays"
+cfg -> fromconfig: "execution.*"
+calendar -> fromconfig: "Policy.Calendar"
+clock -> fromconfig: "Policy.Clock = SystemClock"
+fromconfig -> newchain
+newchain -> gate: "contracts.Checks{...} — the seven, in this order"
+newchain -> kv: "store TTLStore — fluxkv.KV satisfies it"
+newchain -> c7: "Clock and Calendar are injected here,\nnot read from config at check time"
+validate -> gate: "a request that is not a decision never\nbecomes one: it stops here, with no reason code"
+book -> snapshot: "Snapshot()"
+snapshot -> cashreading: "Cash is reported this way, and only this way"
+cashreading -> equity: "Equity = Cash + RealisedPnL holds\nonly under this reading"
+snapshot -> gate: "the portfolio every check reads — one snapshot per signal"
+equity -> c1: "limit = equity × MaxPct / 100"
+equity -> c3: "drawdown = (peak − equity) / peak × 100"
+c5 -> kv: "Get(EXEC:<symbol>:<side>)"
+kv -> arm: "Set, only after a fill"
+gate -> rej: "the first failing check returns; the remaining\nchecks are never called"
+gate -> pass: "nothing rejected the signal"
+pass -> apply: "fill"
+apply -> applyerr
+apply -> book: "cash, realised, peak, held, cost"
+rej -> rejmetrics
+
+footer: "Derived from: services/execution/risk/risk.go (FromConfig, Policy.New, Equity) · risk/checks.go (the seven Check methods, DebounceKey, ValidateSignal) · risk/book.go (Book, Snapshot, FreeCash, Apply) · risk/market.go (MarketHoursCheck, StaticCalendar, IST) · risk/clock.go · services/execution/engine.go (execute, arming) · core/contracts/risk.go (Checker, Checks.Check) · core/contracts/contracts.go (Portfolio, Reject, Reason*) · core/fluxkv/fluxkv.go · core/config/config.go · docs/contracts.md §6" {
+  class: ctl
+  style.fill: "#ffffff"
+  style.stroke-dash: 4
+}

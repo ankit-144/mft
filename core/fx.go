@@ -4,7 +4,6 @@
 package core
 
 import (
-	"context"
 	"os"
 
 	"github.com/mft/core/broker"
@@ -13,9 +12,7 @@ import (
 	"github.com/mft/core/log"
 	"github.com/mft/core/metrics"
 	"github.com/mft/core/storage"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/fx"
-	"go.uber.org/zap"
 )
 
 // Module bundles the core dependencies into an FX module.
@@ -28,12 +25,21 @@ var Module = fx.Module("core",
 		metrics.Handler,
 		fluxkv.New,
 		NewStorageWriter,
-		broker.NewKite,
+		NewKite,
 		func(k *broker.Kite) broker.Streamer { return k },
 		func(k *broker.Kite) broker.Client { return k },
+		broker.NewOrderClient,
 	),
 	fx.Invoke(metrics.Server),
 )
+
+// NewKite builds the broker connector from config. Binding NewKite here
+// instead of the bare broker.NewKite matters: the zero-config constructor
+// leaves the connector without credentials or a watchlist, so a service
+// started through fx would fail to authenticate on every call.
+func NewKite(cfg *config.Config) (*broker.Kite, error) {
+	return broker.NewKiteFromConfig(cfg.Broker)
+}
 
 // ConfigPath resolves the config file path, honoring the MFT_CONFIG
 // environment variable and defaulting to configs/config.yaml.
@@ -44,24 +50,11 @@ func ConfigPath() string {
 	return "configs/config.yaml"
 }
 
-// NewStorageWriter constructs the Parquet storage writer from config.
+// NewStorageWriter constructs the Parquet tick writer from config.
+//
+// The writer's lifecycle is owned by whoever consumes it: ingestion starts and
+// stops both writers itself so it can drain the tick channel first, so this
+// constructor must not Start anything.
 func NewStorageWriter(cfg *config.Config) (*storage.Writer, error) {
-	return storage.NewWriter(cfg.Storage.DataDir+"/ticks", 10000), nil
-}
-
-// ShutdownStorage registers the storage writer for graceful shutdown.
-var ShutdownStorage = fx.Invoke(
-	func(lc fx.Lifecycle, w *storage.Writer, log *zap.Logger) {
-		lc.Append(fx.Hook{
-			OnStop: func(ctx context.Context) error {
-				log.Info("stopping storage writer")
-				return nil
-			},
-		})
-	},
-)
-
-// Registry exposes the shared registry for service-level metric registration.
-func Registry(r *prometheus.Registry) *prometheus.Registry {
-	return r
+	return storage.NewWriterFromConfig(cfg.Storage)
 }
