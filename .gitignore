@@ -35,3 +35,4 @@ data/*.duckdb.wal
 .idea/
 .vscode/
 .commandcode/
+docs/diagrams/svg/

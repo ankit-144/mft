@@ -3,7 +3,7 @@
 	setup dev stop down status test-python \
 	run-ingestion run-execution run-jobs run-inference \
 	venv inference-deps tabfm-weights \
-	backtest \
+	backtest diagrams diagrams-check \
 	wt wt-list wt-remove wt-prune \
 	docker-build docker-up docker-down docker-logs
 
@@ -12,6 +12,7 @@ VENV    := services/inference/.venv
 PY      := $(VENV)/bin/python
 PIP     := $(VENV)/bin/pip
 ROOT    := $(shell pwd)
+DIAGRAMS := docs/diagrams
 
 # --- build & quality -------------------------------------------------------
 
@@ -182,3 +183,40 @@ docker-down:
 
 docker-logs:
 	docker compose logs -f
+
+# --- diagrams --------------------------------------------------------------
+# Architecture docs written in D2, rendered to SVG. d2 v0.9.0 has no --quiet or
+# --dry-run, so both targets compile for real and differ only in whether the
+# output is kept. diagrams-check is the CI form: it still proves the file
+# parses and every shape reference resolves.
+
+DIAGRAM_SVG := $(DIAGRAMS)/svg
+
+diagrams:
+	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
+	@mkdir -p $(DIAGRAM_SVG)
+	@ok=0; fail=0; \
+	for f in $$(ls $(DIAGRAMS)/*.d2 2>/dev/null); do \
+		name=$$(basename "$$f" .d2); \
+		if d2 "$$f" "$(DIAGRAM_SVG)/$$name.svg" >/dev/null 2>&1; then \
+			ok=$$((ok+1)); \
+		else \
+			echo "FAILED  $$f"; d2 "$$f" "$(DIAGRAM_SVG)/$$name.svg" 2>&1 | head -5; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "rendered $$ok, failed $$fail -> $(DIAGRAM_SVG)/"; \
+	test $$fail -eq 0
+
+diagrams-check:
+	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
+	@tmp=$$(mktemp -d); ok=0; fail=0; \
+	for f in $$(ls $(DIAGRAMS)/*.d2 2>/dev/null); do \
+		if d2 "$$f" "$$tmp/out.svg" >/dev/null 2>&1; then \
+			ok=$$((ok+1)); \
+		else \
+			echo "SYNTAX ERROR  $$f"; d2 "$$f" "$$tmp/out.svg" 2>&1 | head -5; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	rm -rf "$$tmp"; \
+	echo "parsed $$ok, failed $$fail"; \
+	test $$fail -eq 0
