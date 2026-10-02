@@ -1,0 +1,266 @@
+direction down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ext: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+  }
+  go: {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  py: {
+    style.fill: "#ede7f6"
+    style.stroke: "#5e35b1"
+  }
+  core: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  store: {
+    style.fill: "#e8f5e9"
+    style.stroke: "#2e7d32"
+  }
+  mem: {
+    style.fill: "#fff8e1"
+    style.stroke: "#f9a825"
+  }
+  ctl: {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  bad: {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+  src: {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+}
+
+kite: "Kite WebSocket\nfull quote stream, server 'ping' every ~30s\ndemands a 'pong' or the session is dropped" {
+  class: ext
+}
+
+ingest: "services/ingestion  (C4, Go)" {
+  stream: "broker.Kite.Stream(ctx, symbols, upstream)\nreconnects internally, capped by\nbroker.reconnect_max_backoff_seconds" {
+    class: go
+  }
+
+  upstream: "upstream  chan broker.Tick  cap 1024\nwritten by Stream, closed by supervise" {
+    class: mem
+  }
+
+  relay: "Pipeline.relay / Pipeline.deliver(tick, queue)\nrelay is the queue's only writer; it takes no ctx,\nso the shutdown drain is complete by construction" {
+    class: go
+  }
+
+  process: "Pipeline.process(queue)\nthe single writer goroutine + sweep ticker\nsweepInterval = 5s" {
+    class: go
+  }
+
+  handle: "Pipeline.handle(tick)\nappend the raw tick FIRST, then fold\nraw ticks are durable even when the fold drops" {
+    class: go
+  }
+
+  fold: "Pipeline.fold(tick)\nminute = tick.Timestamp.Truncate(1m)\nstate[symbol]{open Candle, closed time.Time}" {
+    class: go
+  }
+
+  late: "late tick dropped\nminute <= state.closed watermark\ncounted in mft_ingestion_ticks_late_total" {
+    class: bad
+  }
+
+  kv: "fluxkv.KV.UpdateCandle(symbol, ts, price, volume)\nnew minute -> OHLCV = price; same minute ->\nHigh/Low extended, Close=price, Volume+=" {
+    class: core
+  }
+
+  complete: "Pipeline.complete(open)\nclears open and advances the closed watermark\nin the same step: written exactly once" {
+    class: go
+  }
+}
+
+stores: "core/storage  (C2, durable Parquet)" {
+  tickset: "data/ticks/symbol=SYM/date=YYYY-MM-DD/\nstorage.Writer.Append(storage.NewTick(tick))" {
+    class: store
+  }
+
+  candleset: "data/candles/symbol=SYM/date=YYYY-MM-DD/\nCandleStore.Append -> storage.CandleWriter" {
+    class: store
+  }
+
+  flush: "writer.flush: encode -> fsync -> os.Rename\n.inflight-*.parquet -> part-<timestamp>.parquet\nrows stay buffered and are retried on failure" {
+    class: store
+  }
+}
+
+infer: "services/inference  (C10, Python)" {
+  sched: "MinuteScheduler.run -> tick() -> evaluate(symbol)\nsleeps to the next UTC minute, TICK_PERIOD = 1m\none Decision per instrument, in order" {
+    class: py
+  }
+
+  pull: "DuckDBCandleStore.tail(symbol, wanted + WARMUP_ROWS)\nread_parquet(symbol_glob) ORDER BY timestamp ASC\nQUALIFY row_number() de-dupes same-minute files" {
+    class: py
+  }
+
+  stale: "Outcome.STALE_CONTEXT, skip the symbol\nnewest candle older than\nstaleness_guard(storage.flush_interval_seconds)" {
+    class: bad
+  }
+
+  features: "FeatureBuilder.build(candles) -> FeatureTable\n18 columns FEATURE_COLUMNS, ret_1..spread_proxy\nunder 60 candles -> FeatureError, never a short table" {
+    class: py
+  }
+
+  ctx: "FeatureTable.context(wanted)\ndrops the first WARMUP_ROWS=60 rows,\nkeeps the last wanted, reset_index" {
+    class: py
+  }
+
+  predict: "Predictor.predict(context, horizon)\nhorizon = inference.horizon_bars, one worker thread\nscore in [-1, 1]; not_loaded -> Outcome.NOT_LOADED" {
+    class: py
+  }
+
+  gate: "_maybe_signal: |score| vs inference.score_threshold\nscore 0.0 or out of [-1,1] -> NO_DIRECTION\nside_for_score(score) -> BUY | SELL" {
+    class: py
+  }
+
+  signal: "Signal.from_score(price = close of candles[-1])\nidempotency_key(symbol, side, as_of)\n'RELIANCE:BUY:20260929T1031' from UTC as_of" {
+    class: py
+  }
+
+  dryrun: "inference.dry_run = true by default\nlogs the whole to_wire() body and returns\nOutcome.DRY_RUN: nothing leaves the process" {
+    class: bad
+  }
+
+  client: "ExecutionClient.submit(signal)\n3 attempts, jittered backoff, 5s timeout\nretry only transport, 429, 5xx -- never 400 or 409" {
+    class: py
+  }
+}
+
+exec: "services/execution  (C7, Go)" {
+  http: "POST /v1/signals -> api.handleSignal\ndecodeJSON (DisallowUnknownFields) ->\nnormaliseSignal -> validateSignal, else 400 BAD_REQUEST" {
+    class: ctl
+  }
+
+  engine: "Engine.ExecuteSignal(ctx, sig)\nrisk.ValidateSignal, then execute under e.mu:\nIDEM:<key> claimed in fluxKV before any check" {
+    class: go
+  }
+
+  checks: "contracts.Checks -- the seven checks, docs/contracts.md 6\nMaxPosition, MaxPositions, Drawdown, DailyLoss,\nDebounce, Quantity, MarketHours -> RISK_MAX_POSITION\n... RISK_MARKET_CLOSED; any failure places nothing" {
+    class: bad
+  }
+
+  place: "broker.Kite.PlaceOrder(ctx, symbol, side, quantity, price)\nprice > 0 -> LIMIT, resolved through the\ninstrument master; lot size enforced by the broker" {
+    class: go
+  }
+
+  book: "risk.Book.Apply(sig)\nfluxKV DEBOUNCE:<symbol>:<side> for\nexecution.debounce_ttl_seconds; IDEM TTL = 24h" {
+    class: mem
+  }
+
+  resp: "response body per docs/contracts.md 7\n200 {order_id, status OPEN, score} -- a limit\norder, no fill is claimed\n400 {error: RISK_*, message}" {
+    class: ctl
+  }
+}
+
+src: "Derived from: services/ingestion/pipeline.go, services/ingestion/candles.go,\ncore/broker/{stream,orders,broker}.go, core/fluxkv/fluxkv.go, core/storage/{storage,writer,reader}.go,\nservices/inference/app/{loop,candles,features,predictor,signals,execution,runtime}.py,\nservices/execution/{http,engine}.go, services/execution/risk/{risk,checks,market}.go, docs/contracts.md 1/3/4/6/7" {
+  class: src
+}
+
+# --- broker to ingestion -------------------------------------------------
+
+kite -> stream: "NSE 'tick' frames -> Tick{Symbol,Token,Price,Volume,Timestamp}"
+
+stream -> upstream: "cancellable send: out <- Tick\nctx.Err() -> Stream returns, supervise backoff 1s..60s"
+
+upstream -> relay: "for tick := range upstream"
+
+relay -> process: "queue <- tick (cap 1024)\nnever blocks: a full queue evicts the OLDEST tick,\nthen admits the newest; mft_ingestion_ticks_dropped_total" {
+  style.stroke-dash: 3
+}
+
+process -> handle: "case tick := <-queue: p.handle(tick)"
+
+# --- fold, the candle, and the raw tick ----------------------------------
+
+handle -> tickset: "Append(storage.NewTick(tick))\nblocks until the row is durable or the error is returned;\nflush_max_rows / flush_interval_seconds, mft_ingestion_ticks_processed_total"
+
+handle -> fold: "p.fold(tick)"
+
+fold -> late: "clock skew, reordered frame, or a reconnect replay\n-> counted and skipped; the tick is still in the tick store" {
+  style.stroke-dash: 3
+}
+
+fold -> kv: "UpdateCandle(symbol, tick.Timestamp, tick.Price, tick.Volume)\ntoContract(snapshot) -> state.open"
+
+fold -> complete: "a tick for minute+1 closes the previous bar:\nopen.Timestamp != minute -> complete(open)"
+
+process -> complete: "sweep every 5s: open.Timestamp < now.Truncate(1m)\n-> an illiquid symbol's bar still lands"
+
+complete -> candleset: "Append(storage.NewCandle(candle))\nexactly once; mft_ingestion_candles_completed_total"
+
+tickset -> flush: "storage.Writer"
+candleset -> flush: "storage.CandleWriter"
+
+# --- the pull: no message crosses this line ------------------------------
+
+flush -> pull: "PULL, not push. DuckDB globs part-*.parquet and can only\nsee files the rename has already published. No channel,\nno HTTP: the scheduler reads whatever is on disk now." {
+  style.stroke: "#2e7d32"
+  style.stroke-width: 2
+}
+
+sched -> pull: "for symbol in inference.instruments:\nawait store.tail(symbol, min(context_rows, 100) + 60)"
+
+pull -> stale: "now - candles[-1].timestamp > max(5m, flush + 1m)"
+
+pull -> features: "candles ascending, oldest first"
+
+features -> ctx: "FeatureTable(frame, as_of = candles[-1].timestamp)"
+
+ctx -> predict: "wanted rows x 18 columns of float64\nshorter than MIN_CONTEXT_ROWS + horizon -> BAD_CONTEXT"
+
+predict -> gate: "score: float in [-1, 1]\nmodel = heuristic-v1 | tabfm-v1.0.0"
+
+gate -> signal: "|score| >= inference.score_threshold (0.55)\n|below_threshold| -> no signal; last_close is the price"
+
+# --- the dry_run gate: the last hop sends nothing by default -------------
+
+signal -> dryrun: "if config.dry_run: log and stop\nDEFAULT, so no order is ever placed out of the box" {
+  style.stroke-dash: 3
+}
+
+signal -> client: "only when dry_run is false"
+
+client -> http: "POST {inference.execution_url}/v1/signals\n{symbol, side, quantity, price, score, model, as_of, idempotency_key}"
+
+# --- execution -----------------------------------------------------------
+
+http -> engine: "sig contracts.Signal -> ExecuteSignal(ctx, sig)"
+
+engine -> checks: "checks.Check(ctx, sig, book.Snapshot())"
+
+checks -> place: "all seven pass"
+
+checks -> resp: "RISK_MAX_POSITION | RISK_DEBOUNCED | ... ->\n400 with the reason code, broker never touched" {
+  style.stroke-dash: 3
+}
+
+place -> book: "order_id returned; nothing claimed if PlaceOrder fails,\nso the same key can be retried"
+
+book -> resp: "mft_execution_orders_placed_total"
+
+engine -> resp: "IDEM:<key> already set -> RISK_DUPLICATE\n409 with the order_id the first attempt produced" {
+  style.stroke-dash: 3
+}
+
+resp -> client: "200 -> SignalAck(order_id, status, score)\n409 -> duplicate ack, reported as a success" {
+  style.stroke-dash: 3
+}

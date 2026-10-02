@@ -1,0 +1,185 @@
+direction: right
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  cls_go:    { style.fill: "#e3f2fd"; style.stroke: "#1976d2" }
+  cls_py:    { style.fill: "#ede7f6"; style.stroke: "#5e35b1" }
+  cls_core:  { style.fill: "#e0f2f1"; style.stroke: "#00897b" }
+  cls_store: { style.fill: "#e8f5e9"; style.stroke: "#2e7d32" }
+  cls_mem:   { style.fill: "#fff8e1"; style.stroke: "#f9a825"; style.stroke-width: 3 }
+  cls_plane: { style.fill: "#e5e7eb"; style.stroke: "#37474f" }
+  cls_bad:   { style.fill: "#ffebee"; style.stroke: "#c62828" }
+}
+
+# -------------------------------------------------------------- boundaries ----
+# The only two substrates that cross a process boundary. Declared first because
+# every arrow that leaves a tier lands on one of these four nodes.
+x_fs: "FILESYSTEM   Parquet files\ningestion writes, DuckDB and the\nGo reader read — the only channel\nthat carries data between services" { class: cls_store }
+
+x_scrape: "HTTP   GET /metrics\nboth Go processes, from core/metrics\nPrometheus scrapes metrics.addr, default :9090\ncounters only — no state returned" { class: cls_plane }
+
+x_none: "NOTHING crosses through fluxKV\nno shared memory, no broker, and no\nsecond reader of another process's map" { class: cls_bad }
+
+x_http: |md
+
+  **HTTP** — control plane, `POST /v1/signals`
+
+  inference → execution, one way, idempotent
+
+  `202` filled · `200` working
+
+  `400` rejected by risk · `409` `RISK_DUPLICATE`
+
+  retried on transport error / `429` / `5xx`,
+
+  always carrying the same `idempotency_key`
+
+|
+
+# ----------------------------------------------------------------- tier 1 ----
+# Tier 1: amber, in memory, per process. Two boxes because there are two
+# processes. fluxKV is a cache, never a bus.
+ingestp: "TIER 1   PROCESS-LOCAL, IN-MEMORY   ·   ingestion process (Go)   services/ingestion\nits own OS process, its own fluxkv.KV — dies with the process" {
+  class: cls_mem
+
+  pipe: "Pipeline.handle(tick)\none processor goroutine" { class: cls_go }
+
+  kv_ing: "fluxkv.KV\nthis process's map, and only it" { class: cls_mem }
+
+  ing_candle: "candles['RELIANCE'] — the live open bar\nKV.UpdateCandle(symbol, ts, price, volume)\nKV.Candle() / KV.Candles() hand back clones,\nso a caller can never hold a pointer into the map" { class: cls_mem }
+
+  ing_writes: "storage.Writer  →  data/ticks\nstorage.CandleWriter  →  data/candles" { class: cls_core }
+}
+
+execp: "TIER 1   PROCESS-LOCAL, IN-MEMORY   ·   execution process (Go)   services/execution\na different OS process with a different map — the two boxes never touch" {
+  class: cls_mem
+
+  engine: "Engine.execute(ctx, sig)\nserialised on e.mu" { class: cls_go }
+
+  kv_exec: "fluxkv.KV\na different map, a different address space" { class: cls_mem }
+
+  ttl: "KV.Set(key, value, ttl) / KV.Get(key)\nTTL is enforced on read: an expired entry\nreports absent, and is left for Sweep\nSet overwrites in place, never duplicates" { class: cls_mem }
+
+  debounce: |md
+
+    **debounce window** — risk check 5, contracts §6
+
+    `risk.DebounceKey(symbol, side)` = `EXEC:<symbol>:<side>`
+
+    armed only after a filled order, so a refused
+
+    signal or a failed broker call arms nothing
+
+    a second order inside the TTL → `RISK_DEBOUNCED`
+
+  |
+
+  idem: |md
+
+    **idempotency claim** — taken before the risk chain
+
+    `"IDEM:" + sig.IdempotencyKey` = `IDEM:<idempotency_key>`
+
+    `execution.idempotency_ttl_seconds`, default 86400
+
+    a replay → `RISK_DUPLICATE`, `409`, and the
+
+    original `order_id` — never a second order
+
+  |
+
+  sweep: "StartCacheSweeper(lc, cache, log)\nKV.Sweep(time.Now()) every SweepInterval = 1m\nreclaims expired one-shot keys;\ncandles are never swept" { class: cls_mem }
+}
+
+pipe -> kv_ing: "broker.Tick arrives" { style.stroke: "#f9a825" }
+kv_ing -> ing_candle: "KV.UpdateCandle(...)" { style.stroke: "#f9a825" }
+ing_candle -> ing_writes: "Pipeline.complete(candle)" { style.stroke: "#f9a825" }
+engine -> kv_exec: "read, then claim" { style.stroke: "#f9a825" }
+kv_exec -> ttl: "DebounceCheck.Store.Get(key)" { style.stroke: "#f9a825" }
+kv_exec -> debounce: "Get → armed ⇒ reject" { style.stroke: "#f9a825" }
+kv_exec -> idem: "Get → claimed ⇒ the stored order_id" { style.stroke: "#f9a825" }
+sweep -> kv_exec: "Sweep(now) → n reclaimed" { style.stroke: "#f9a825" }
+kv_ing -> kv_exec: "Plan.md §4 — the cross-process read that never worked:\nalways empty, so every EXEC: key looked unset" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+
+# ----------------------------------------------------------------- tier 2 ----
+# Tier 2: green, on disk. A published file is immutable, and that is the point.
+diskx: "TIER 2   DURABLE, ON DISK\nsurvives restart — the source of truth" {
+  class: cls_store
+
+  inflight: "'.inflight-*.parquet'\na partial file, and no reader's glob matches it\nthis is what makes tier 2 safe to read while written" { class: cls_bad }
+
+  pub_candles: "data/candles/symbol=<SYMBOL>/date=<YYYY-MM-DD>/part-<timestamp>.parquet\nclosed, fsynced, renamed — never reopened for writing\nfreePartPath: os.Lstat must miss, so a closed file is never rewritten\nTHE INVARIANT: a reader takes no lock, because a published file has no mutable state"
+
+  pub_ticks: "data/ticks/symbol=<SYMBOL>/date=<YYYY-MM-DD>/part-<timestamp>.parquet\npartition taken from Tick.Symbol and the row's own UTC date"
+
+  pub_hist: "data/historical/symbol=<SYMBOL>/from=<date>/to=<date>/candles.parquet\nstorage.RangePartition — one file per range; the backfill dataset"
+
+  duckfile: |md
+
+    **the research database, deliberately never attached here**
+
+    `analytics.duckdb_path` = `<data_dir>/mft.duckdb`
+
+    `analytics.read_only` defaults true
+
+  |
+}
+
+diskx.inflight -> diskx.pub_candles: "encode, file.Sync, then os.Rename" { style.stroke: "#2e7d32" }
+ing_writes -> diskx.inflight: "os.CreateTemp('.inflight-*')" { style.stroke: "#2e7d32" }
+ing_writes -> diskx.pub_ticks: "Flush(ctx)" { style.stroke: "#2e7d32" }
+diskx.pub_candles -> x_fs: "published part-*.parquet" { style.stroke: "#2e7d32" }
+
+# ----------------------------------------------------------------- tier 3 ----
+# Tier 3: the query layer. In-memory DuckDB over files nobody will change again.
+query: "TIER 3   QUERY LAYER   ·   inference process (Python)   services/inference/app\nDuckDB over the immutable files — read only, never a writer" {
+  class: cls_store
+
+  go_glob: "storage.CandleReader.Glob(symbol)\n'<root>/symbol=<SYMBOL>/date=*/part-*.parquet'\nexists so the Go reader and DuckDB address\nthe same files, in the same tree" { class: cls_core }
+
+  duck: "duckdb.connect()  —  IN-MEMORY\nsymbol_glob(root, symbol) builds the path\nDuckDBCandleStore owns the connection,\nand analytics.duckdb_path is never contended" { class: cls_store }
+
+  tail: |md
+
+    **`_TAIL_SQL`** over `PART_GLOB = 'part-*.parquet'`
+
+    `read_parquet(...)` with `hive_partitioning = false`
+
+    `QUALIFY row_number() OVER (PARTITION BY timestamp ORDER BY filename DESC) = 1`
+
+    the glob never matches `'.inflight-*'`
+
+    pushdown tail — only the last N bars are decoded
+
+  |
+
+  loop: "loop.py InferenceLoop\npulls on each minute close, TICK_PERIOD = 1m\nrestart at any minute, catch-up is free" { class: cls_py }
+
+  dstore: "DuckDBCandleStore\ncandles_root(data_dir) → <data_dir>/candles" { class: cls_py }
+}
+
+x_fs -> query.go_glob: "read_parquet" { style.stroke: "#2e7d32" }
+query.go_glob -> query.duck: "the same glob" { style.stroke: "#2e7d32" }
+query.duck -> query.tail: "connection.execute(sql).fetchall()" { style.stroke: "#2e7d32" }
+query.loop -> query.dstore: "tail(symbol, limit) — empty list, not an error" { style.stroke: "#5e35b1" }
+query.dstore -> query.duck: "await store.tail(symbol, limit)" { style.stroke: "#5e35b1" }
+
+# ---------------------------------------------------------------- crossings ----
+# Every arrow that leaves a tier lands on one of the four nodes above.
+ingestp -> x_scrape: "GET /metrics" { style.stroke: "#37474f" }
+execp -> x_scrape: "GET /metrics" { style.stroke: "#37474f" }
+
+ingestp -> x_none: "fluxKV stops here" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+
+query.loop -> x_http: "ExecutionClient.post" { style.stroke: "#37474f" }
+x_http -> execp: "Engine.ExecuteSignal" { style.stroke: "#37474f" }
+
+# ------------------------------------------------------------------ footer ----
+src: "Derived from\nPlan.md §4  ·  docs/contracts.md §3, §6, §7\ncore/fluxkv/fluxkv.go  ·  core/config/config.go  ·  core/storage/storage.go, writer.go (inflightPrefix, writePartition,\nfreePartPath), reader.go (CandleReader.Glob, partGlob), layout.go (Partition, RangePartition)\nservices/execution/engine.go (ExecuteSignal, StartCacheSweeper, idempotencyKey, SweepInterval)\nservices/execution/risk/checks.go (DebounceKey, DebounceCheck)  ·  services/ingestion/pipeline.go (fold, complete)\nservices/inference/app/candles.py (DuckDBCandleStore, _TAIL_SQL), execution.py, loop.py" { class: cls_core }

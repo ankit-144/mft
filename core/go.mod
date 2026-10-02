@@ -3,6 +3,7 @@ module github.com/mft/core
 go 1.25.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/parquet-go/parquet-go v0.30.1
 	github.com/prometheus/client_golang v1.22.0
 	go.uber.org/fx v1.23.0

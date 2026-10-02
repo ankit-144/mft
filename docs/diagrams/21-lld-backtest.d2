@@ -1,0 +1,157 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ext:   { style.fill: "#eceff1"; style.stroke: "#90a4ae" }
+  py:    { style.fill: "#ede7f6"; style.stroke: "#5e35b1" }
+  lib:   { style.fill: "#e0f2f1"; style.stroke: "#00897b" }
+  store: { style.fill: "#e8f5e9"; style.stroke: "#2e7d32" }
+  mem:   { style.fill: "#fff8e1"; style.stroke: "#f9a825" }
+  ctl:   { style.fill: "#e5e7eb"; style.stroke: "#37474f" }
+  bad:   { style.fill: "#ffebee"; style.stroke: "#c62828" }
+}
+
+# ============================================================  input  =======
+
+src_parquet: "INPUT - STORED CANDLES\n\nload_candles(store, symbols, limit) over\nDuckDBCandleStore(candles_root(config.storage.data_dir))\n\nstore.tail(symbol, limit) per symbol. A read that throws, or\nthat returns nothing, logs and DROPS THE SYMBOL - the run\ncontinues. A symbol the broker has never streamed is an\nordinary state, not a fault.\n\nwindow_candles(c, start, end) keeps [start, end] inclusive,\nboth bounds compared in UTC, so 2026-01-01T00:00:00+05:30 and\n2025-12-31T18:30:00Z select the same bars." { class: store }
+
+src_synth: "INPUT - SYNTHETIC   --synthetic\n\nSynthSpec(bars, seed, start_price) -> generate_many(symbols, spec)\n\nSeeded geometric Brownian motion. sigma =\nDEFAULT_ANNUAL_VOLATILITY 0.30 / sqrt(BARS_PER_YEAR),\ndrift DEFAULT_ANNUAL_DRIFT 0.0 on purpose - a positive drift\nwould flatter a long-only strategy for reasons that have\nnothing to do with the model.\n\nSession grid: 09:15-15:30 IST, SESSION_BARS_PER_DAY = 375\none-minute bars, weekdays only, UTC on the wire. Volatility\nand volume are U-shaped across the session\n(VOL_SHAPE_EDGE 1.55 / MIDDAY 0.62). Prices rounded to paise.\n\nrandom.Random(seed:SYMBOL) is SHA-512 seeded, so it does not\ndepend on PYTHONHASHSEED: the same --seed gives byte-identical\ncandles on any machine.\n\nPROVES PLUMBING, NOT AN EDGE. No overnight gaps, no cross-\nsymbol correlation, no halts or circuits, volume independent\nof the price move, drift seasonality zero." { class: store }
+
+guards: "REFUSE BEFORE ANY WORK   BacktestError -> exit 2\n\nno symbols in inference.instruments and no --symbol\nlen(candles) > --max-bars   DEFAULT_MAX_BARS 5000. Refuses\n  rather than truncates: 'a silently shortened run is a\n  different run'\nexecution.capital <= 0   core/config/config.go does NOT\n  default it, and every order would fail RISK_MAX_POSITION\n  against zero equity\n--model tabfm without --allow-weights   ~6.6 GB of checkpoint\n  licensed tabfm-non-commercial-v1.0\n--from later than --to, --bars negative, --max-bars < 1\n\nDEFAULT_MODEL is 'heuristic', deliberately NOT inference.model:\nthat key is tabfm in the frozen config, and a research tool\nthat loaded 6.6 GB because nobody passed a flag would be a\nfoot-gun aimed at the person who wanted a number quickly." { class: bad }
+
+# ====================================================  the walk-forward  ====
+
+walk: "WALK-FORWARD   WalkForward.run(symbol, candles)\n\nPhase 1, one symbol at a time. Returns rather than raises for\na window the builder rejects, because one bad symbol must not\ntake the whole run down: the reason is logged and that symbol\ncontributes nothing.\n\nThis is the only place a score is computed. app/loop.py calls\nthe same FeatureBuilder, Predictor, side_for_score and\nidempotency_key at every minute close." { class: py }
+
+bounds: "for index in range(wanted, last):\n\n  wanted = first_decision\n         = WARMUP_ROWS + MIN_CONTEXT_ROWS + horizon - 1\n  last   = len(candles) - horizon\n\nTHE LOOP STOPS AT len - horizon. The newest bar any prompt\ncan hold is therefore candles[len - horizon - 1], and every bar\nfrom len - horizon onward is reachable only as\ncandles[i + horizon].\n\nwanted is NOT WARMUP_ROWS. FeatureTable.context drops the\nwarm-up, model.validate_context then wants MIN_CONTEXT_ROWS +\nhorizon survivors, and a shorter prompt answers from whatever\nit can still attend to - a confident number computed from\nalmost nothing. The backtest starts where the live loop can\nactually trade.\n\nlast <= wanted: logs why and scores nothing." { class: lib }
+
+slice: "context = candles[: i + 1]\nONLY up to and including i.\n\nThis one expression is the entire no-lookahead contract. The\nfuture is not suppressed by a flag or a mask - it is out of\nscope for the code that builds the prompt, so no future value\ncan reach the model even by accident." { class: mem; style.stroke-width: 4 }
+
+modes: "--feature-mode\nFeatureMode = Literal['rebuild', 'incremental']\n\nBoth modes hand the SAME context to the model for bar i. The\nonly difference is how many times FeatureBuilder.build is\ncalled, and how much of the series each call validates." { class: lib }
+
+m_rebuild: "rebuild   DEFAULT   O(n^2) per symbol\n\nFeatureBuilder.build(candles[: index + 1]).context(rows)\n\nOne build per decision bar, nothing clever, and the slicing is\nright there in the source to be read. build is O(len(window)),\nso n decision bars cost O(n^2).\n\nAt the measured FEATURE_ROW_SECONDS = 8.4e-6 that is ~17 s for\n2000 bars and ~7 minutes for 10000, PER SYMBOL.\nprojected_rebuild_minutes(bars, horizon) logs the estimate\nBEFORE any work starts, so the refusal names a number rather\nthan saying 'this might take a while'.\n\nFeatureError on a slice: break, and the walk ends there." { class: lib }
+
+m_incremental: "incremental   O(n) per symbol\n\nbuilder.build(candles).frame ONCE, up front, then per bar:\n  context_from_frame(frame, index, rows)\n    frame.iloc[: index + 1].iloc[WARMUP_ROWS:].iloc[-rows:]\n\nThe slice truncates to [: index + 1] BEFORE the warm-up is\ndropped, so a row derived from a candle after the decision bar\ncannot reach the prompt even though that row exists in the\nframe.\n\nFeatureError on the whole build: the symbol is skipped.\n\nONE REAL DIFFERENCE, stated in the module docstring because it\nis real: incremental validates the entire series up front, so a\nmalformed bar AFTER the last decision point is an error here\nand invisible in rebuild." { class: lib }
+
+identical: "BYTE-IDENTICAL OUTPUT, ASSERTED EXACTLY\n\npd.testing.assert_frame_equal(\n    context_from_frame(full, index, rows),\n    builder.build(candles[: index + 1]).context(rows),\n    check_exact=True)\n\nand end to end, on a whole run:\n  [t.to_json() for t in a.trades] == [t.to_json() for t in b.trades]\n  a.metrics.to_json() == b.metrics.to_json()\n  a.rejections == b.rejections\n  a.outcomes   == b.outcomes\n  b.timing.feature_seconds < a.timing.feature_seconds / 4.0\n\nLegitimate ONLY because every feature at row i is a pure\nfunction of candles 0..i with the same summation order, which\nis why core/features pins the newest row of a 100-bar build to\nthe newest row of a 100000-bar build." { class: lib }
+
+prompt: "score = await self.predictor.predict(context, horizon)\n\nOne Predictor for the whole run, so the model loads once and\nevery symbol shares it. The prompt is a pandas DataFrame of at\nmost min(inference.context_rows, MAX_CONTEXT_ROWS) rows.\n\nInstrumented separately from the features, because this is the\nnumber that decides whether a one-minute cadence is viable\nlive." { class: py }
+
+threshold: "BAR OUTCOMES, BEFORE THE RISK GATE   BarOutcome\n\nabs(score) < inference.score_threshold -> below_threshold, skip\nside_for_score(score) raises ValueError -> no_direction, skip.\n  A score of exactly 0.0 with a threshold of 0, or anything\n  outside [-1, 1]: REFUSED, never coerced into a BUY or a SELL.\n\nPassing bars append a Candidate and count as candidate; the\nportfolio decides whether they become trades." { class: bad }
+
+cand: "Candidate(symbol, index, as_of, exit_as_of, price,\n             exit_price, score, side, quantity, key)\n\nprice     = candles[index].close\nexit_as_of = candles[index + horizon].timestamp\nkey       = idempotency_key(symbol, side, as_of) - the SAME\n            function app/loop.py calls, so the backtest and the\n            live loop cannot disagree about what a key is\nnotional  = quantity * price, which is what check 1 sees\nquantity  = inference.order_quantity, fixed. Never sized from\n            equity, so this harness never models a compounding\n            or a compounding failure." { class: mem }
+
+the_label: "exit_price = candles[index + horizon].close\n\nTHE LABEL. Read here and nowhere else, and only AFTER the\nscore already exists.\n\nNever handed to FeatureBuilder. Never handed to the model. It\nexists in the artifact as walk_forward.label_is, which spells\nthis out to whoever opens the JSON:\n  'candles[i + N].close, read only after the score exists'\n\nA backtest that leaks the future is worse than no backtest,\nbecause it manufactures a result that looks like an edge and\nis not." { class: mem; style.stroke-width: 4 }
+
+# ==============================================  the lookahead test  ======
+
+la_clean: "test_no_lookahead_scores_and_candidates_are_identical\n    parametrised mode = rebuild, incremental\n\nclean = generate('TEST',\n           SynthSpec(bars=200, seed=11, start_price=1000.0))\n\nA real feature build, a real model prompt, a real risk gate -\nonly the MODEL is a constant-score stub. That is deliberate: a\nmetrics assertion should be asserting the harness and not C5's\nblend. No test in this suite loads the TabFM checkpoint." { class: store }
+
+la_dirty: "dirty = corrupt_tail(clean, horizon, factor=6.0)\n\nThe final `horizon` bars replaced by a 6x jump, high = 1.5x,\nlow = 0.5x, volume = 10,000,000 shares.\n\nWELL-FORMED ON PURPOSE. A malformed bar would make\nFeatureBuilder reject the whole series, which in incremental\nmode would turn a leak test into a build-failure test and\nprove nothing.\n\nTHE MUTATION IS CHOSEN BECAUSE bars from len - horizon onward\nare labels and never contexts. That is exactly why the mutation\nisolates the leak instead of merely testing it: a 6x jump with\na million shares is unmissable in a score if it ever leaks." { class: mem; style.stroke: "#c62828" }
+
+la_assert: "THE ASSERTION, AS WRITTEN\n\nassert len(a.trades) == len(b.trades)\nassert [t.entry_as_of  for t in a.trades] == [t.entry_as_of  for t in b.trades]\nassert [t.entry_price  for t in a.trades] == [t.entry_price  for t in b.trades]\nassert [t.key          for t in a.trades] == [t.key          for t in b.trades]\nassert [t.score        for t in a.trades] == [t.score        for t in b.trades]\n\ndiffering = [i for i, (x, y) in enumerate(zip(a.trades, b.trades))\n            if x.exit_price != y.exit_price]\nassert differing == list(range(len(a.trades) - horizon,\n                               len(a.trades)))\n\nThe failure message names the horizon and the offending indices:\n  'only the last 5 labels may differ, but [3, 9] did'\n\nSo for horizon = 5, differing must be exactly the final five\nindices and nothing else: the last five exit prices, and no\nother field anywhere. Not 'similar'. Not 'within tolerance'.\nEvery score, every idempotency key, every entry price and every\nentry timestamp upstream must be unchanged.\n\nParametrised horizon = 1, 2, 5: the property holds for any\nhorizon, not only the configured one. A leak that shifted the\ndecision set would change len(a.trades) and the indices\nthemselves, so it fails this assertion rather than passing it\nby being small." { class: mem; style.stroke-width: 4 }
+
+la_trunc: "test_truncating_the_label_bars_shortens_the_run_and_nothing_else\n\nhorizon = 3\nshort = backtest(clean[: len(clean) - horizon])\n\nWHY TRUNCATION IS A DIFFERENT EXPERIMENT, and why strict\nequality would fail FOR THE RIGHT REASON:\nremoving the final `horizon` bars also removes `horizon`\nDECISION POINTS, because the loop stops at len - horizon. The two\nruns are legitimately a different run with fewer trades, so\nasserting they were equal would be testing the wrong property.\n\nWhat must hold is the strict-prefix property:\n  assert len(short.trades) == len(full.trades) - horizon\n  for a, b in zip(short.trades, full.trades):\n      assert (a.key, a.score, a.entry_price, a.exit_price,\n              a.net_pnl) == (b.key, b.score, b.entry_price,\n              b.exit_price, b.net_pnl)\n\nREPLACING holds the decision set fixed and varies only the\nlabels. That is the variant that isolates the leak." { class: lib }
+
+la_mech: "test_the_prompt_never_receives_a_row_from_after_the_decision_bar\n\nassert len(context) <= available          # available = index+1-WARMUP\nassert context.iloc[-1].equals(frame.iloc[index])\nassert context.iloc[0].equals(frame.iloc[index - len(context) + 1])\n\nThe MECHANISM asserted directly rather than through the\noutcome: at decision bar i the prompt's newest row IS candle i,\nand its oldest row is the row context_rows back.\n\nAlso: test_the_walk_starts_where_the_model_can_actually_use_a_\nprompt pins first_decision == WARMUP_ROWS + 60 + horizon - 1 and\nthat the first decision bar leaves exactly 61 survivors - the\nmodel's 60 rows plus the label bar it must not be shown." { class: lib }
+
+# ======================================================  transaction  ======
+
+charges: "ChargeModel.round_trip(side, quantity, entry, exit_)\n  = ChargeModel.leg(is_buy=..., quantity, price) summed\n\nTwo legs per trade: one entry, one exit.\nTrade.net_pnl = gross - entry_leg.total - exit_leg.total.\nA return that does not carry both legs is a return on a fiction.\n\nThe gross figure is reported beside the net one.\nChargeModel.zero() exists for that comparison ONLY - a run\nnever defaults to it, because a costless backtest is not a\nbacktest.\n\nEvery rate is an ASSUMPTION. docs/contracts.md section 8\ndeclares no charge keys, so a run cannot know this broker's\nschedule, and CHARGE_DISCLAIMER says so in every artifact." { class: ctl }
+
+rates: "NAMED CONSTANTS, NOT INLINE LITERALS\n\nBROKERAGE_PCT           0.03    both legs\nBROKERAGE_CAP_RUPEES   20.00    both legs\nSTT_BUY_PCT            0.10    buy only\nSTT_SELL_PCT           0.10    sell only\nEXCHANGE_TRANSACTION_PCT 0.00297 both legs\nSEBI_TURNOVER_PCT       0.0001  both legs  (Rs 10 per crore)\nDP_CHARGE_RUPEES      15.93    SELL ONLY, per scrip\nSTAMP_DUTY_BUY_PCT      0.015   BUY ONLY\nGST_PCT                18.00    on brokerage + exchange + SEBI + DP\n                                and NOT on STT\n\nNamed constants rather than literals so a reader can change one\nand see the effect. Modelling them on the delivery-equity\nschedule; a user must re-verify every line against their own\nbroker's current contract." { class: ctl }
+
+floor: "brokerage = min(notional * BROKERAGE_PCT / 100, BROKERAGE_CAP_RUPEES)\n\nTHE Rs 20 FLOOR ONLY ENGAGES ABOVE Rs 66,667 of notional:\n20 / 0.0003. inference.order_quantity: 10 reaches that only on a\nstock above ~Rs 6,700.\n\nAt the platform's own default - 10 shares of a ~Rs 1,400\nlarge-cap, ~Rs 14,000 entry notional - the PERCENTAGE is what\nbinds: 2 x Rs 4.20 = Rs 8.40 for the round trip." { class: mem }
+
+derived: "DERIVED, NOT ASSUMED\n0.43% of entry notional per round trip\n\n  brokerage    2 x 0.03%        =  Rs  8.40\n  STT          2 x 0.10%        =  Rs 28.00\n  stamp duty   0.015% of the buy=  Rs  2.10\n  exchange     2 x 0.00297%     =  Rs  0.83\n  SEBI         2 x 0.0001%      =  Rs  0.03\n  DP           one, on the sell =  Rs 15.93\n  GST          18% of the fee base, not on STT = Rs 4.53\n                                  --------\n                                  Rs 59.82  on Rs 14,000\n\n0.43% against a 1-bar sigma of\n0.30 / sqrt(94500) = 0.098% on the same series:\n\n  A 1-MINUTE STRATEGY MUST BE RIGHT BY ABOUT 4.4 OF ITS OWN\n  STANDARD DEVIATIONS ON EVERY SINGLE TRADE MERELY TO BREAK\n  EVEN.\n\nThat is the finding the cost model exists to produce, and it is\nwhat a costless backtest reports as an edge." { class: mem; style.stroke-width: 4 }
+
+# ======================================================  the risk gate  ====
+
+portfolio: "Portfolio(limits, charges, zone=trading_zone(config.app.timezone))\n    .run(walks, candidates_by_time)\n\nPhase 2: one merged timeline of candidate timestamps, sorted.\nAt each moment - roll the IST day, close positions whose label\nbar has arrived, run the gate on every candidate, mark equity,\nupdate peak and drawdown, append an EquityPoint.\n\nEXITS BEFORE ENTRIES ON PURPOSE. A position opened at bar i with\nhorizon 1 closes at bar i+1, and the decision for bar i+1\nshould be able to use the cash it released; the reverse order\ndouble-counts a bar of capital and refuses a trade the live\nengine would have accepted.\n\nPositions whose label bar falls after the LAST candidate\ntimestamp are still closed at that bar, and the count is\nreported, so the trade list and the equity curve cannot\ndisagree by one leg.\n\nThere is no HTTP client in this module and there must never be\none. A backtest posts nowhere." { class: py }
+
+gate: "Reason - docs/contracts.md section 6, in the contract's own order\n\n  1  RISK_MAX_POSITION   notional > equity * max_position_pct\n  2  RISK_MAX_POSITIONS  counts DISTINCT SYMBOLS, because the\n                         contract's Portfolio is a map keyed by\n                         symbol: a second leg on an already-open\n                         symbol does not consume a slot\n  3  RISK_MAX_DRAWDOWN   (peak - equity) / peak * 100\n  4  RISK_DAILY_LOSS     realised today < -daily_loss_limit\n  5  RISK_DEBOUNCED      SYMBOL:SIDE\n  6  RISK_BAD_QUANTITY   1 <= quantity <= max_order_quantity\n  7  RISK_MARKET_CLOSED  weekday, not execution.market_holidays,\n                         09:15-15:30 IST\n  8  RISK_DUPLICATE      idempotency key\n\nFirst one wins; each refusal is counted globally and per symbol\nand returned as outcome 'rejected'. A str enum, so a backtest\nrefusal and a production refusal are reported with the same\nword and greppable as the same thing.\n\nREASON_CHECK holds each code's position in the contract's\nordered list, and the report sorts by it." { class: lib }
+
+ledgers: "TWO LEDGERS, AND THEY ARE NOT THE SAME KEY\n\nself._debounce[SYMBOL:SIDE] -> as_of\n    execution.debounce_ttl_seconds, default 300\n    0 <= (as_of - previous) < TTL  ->  RISK_DEBOUNCED\n    the key docs/contracts.md section 6 check 5 gives the\n    debounce, worded exactly as the contract words it\n\nself._keys[idempotency_key(symbol, side, as_of)] -> as_of\n    execution.idempotency_ttl_seconds, default 86400\n    RISK_DUPLICATE\n    keyed by the SAME function app/loop.py calls\n\nDEBOUNCE IS SYMBOL:SIDE, NOT PER KEY. A BUY at 13:00\nsuppresses BUYs for the TTL window and nothing else, so a BUY\nthen a SELL on the same symbol is not debounced.\n\nBoth are in-process dicts. A backtest gate that quietly\ndiverged from the production one would validate a gate nobody\nruns, which is why all six divergences below are printed by\nevery run and written to the JSON." { class: mem }
+
+dd: "THE LIMITS ARE THE FROZEN `execution` SECTION\n\nload_execution_limits reads the same YAML the Go services read,\nwith yaml.safe_load, because app.config.Config does not model\nthat section (extra='ignore'). The inference service has no\nbusiness holding a risk policy.\n\n  max_drawdown_pct      5.0    check 3\n  max_open_positions    10     check 2\n  max_position_pct     10.0    check 1\n  daily_loss_limit      25000  check 4, reset on an IST date change\n  debounce_ttl_seconds  300    check 5\n  idempotency_ttl_seconds 86400 check 8\n  max_order_quantity    500    check 6\n  capital               0.0    NOT defaulted - and a run that\n                              would divide by it is refused\n\nCapital is left at 0 here exactly as core/config/config.go\nleaves it, rather than quietly defaulting to a friendly number.\n\nThe daily loss resets ONLY on a date change. Resetting every\ntimestamp would make check 4 a no-op, because a one-bar horizon\nrealises the previous fill and then starts counting from zero\nagain on the very next bar." { class: bad }
+
+drift: "RISK_DRIFT_NOTES - six named divergences from\nservices/execution/risk (C6), not smoothed over\n\n  1 the two key schemes: debounce is a SYMBOL:SIDE ledger while\n    the duplicate ledger is keyed by idempotency_key. They are\n    DIFFERENT keys and the contract names both.\n  2 lot size is not in the frozen config, so check 6 is applied\n    without the qty % lot_size term.\n  3 max_open_positions counts distinct symbols, the literal\n    reading of len(OpenPositions).\n  4 the market-hours window is the NSE session from\n    features.SESSION_OPEN_MINUTE, not a value read from the risk\n    engine, plus execution.market_holidays.\n  5 drawdown and daily loss read THIS simulation's equity,\n    marked to the last known close per symbol. C6 reads a broker\n    portfolio.\n  6 NO MARGIN OR BORROW MODEL. A SELL is covered by the whole of\n    execution.capital and its proceeds are treated as fully\n    available. That flatters any strategy that leans on shorts.\n\nEvery note is printed after the rejection table and written to\nrisk_drift_notes in the artifact." { class: bad }
+
+# ==============================================  the honesty surface  =====
+
+banner: "THE HONESTY SURFACE, PART 1 - THE HEADER\n\n  MFT BACKTEST - SYNTHETIC INPUT.\n  THIS IS NOT A STRATEGY RESULT.\n\nPrinted ABOVE the numbers, not below them, so a reader skimming\nthe top three lines cannot miss it. The stored-candles header is\n'MFT BACKTEST - STORED CANDLES' and the body swaps\nSYNTHETIC_DISCLAIMER for PARQUET_DISCLAIMER.\n\nThen, in this order:\n  SYNTHETIC_DISCLAIMER  the generator's parameters are named;\n    a model forecasting this data is forecasting an RNG\n  CHARGE_DISCLAIMER     every rate is an assumption, re-verify\n  POSITION_MODEL_NOTE   one order is one round trip over horizon\n    bars, BUY long / SELL short = intraday MIS, broker.product's\n    default. NOT delivery CNC buy-and-hold.\n\nThe whole report is logged once through the\n'mft.inference.backtest' logger, never print-ed." { class: ctl }
+
+whatnot: "THE HONESTY SURFACE, PART 2 - THE CLOSING SECTION\n\nWHAT THIS RUN DOES NOT TELL YOU\n\n  * Out-of-sample performance. This is one history, scored once,\n    by the same model that would see it live. There is no\n    held-out set, no cross-validation and no parameter fitting,\n    so a good number here is not evidence of a good number\n    anywhere else.\n\n  * Whether the model has any predictive power. On synthetic\n    data it provably does not: the series is a random walk. A\n    positive Sharpe here is a property of the cost and size\n    assumptions, not of a signal.\n\n  * Anything about live execution. No fills, no slippage, no\n    partial rejects, no circuit limits, no broker downtime, no\n    square-off.\n\n  * The real risk engine. The gate above is an offline\n    re-implementation of the checks that make sense without a\n    broker; see the drift notes." { class: ctl }
+
+artifact: "THE HONESTY SURFACE, PART 3 - THE JSON\n\nBacktestResult.to_json(), schema 'mft.backtest.v1', written\nonly under --json with allow_nan=False.\n\n'synthetic' and 'disclaimer' are TOP-LEVEL, and 'synthetic' is\nREPEATED inside 'data', because an artifact that gets split up\nloses its outermost keys first. Also carried at the top:\ncharge_disclaimer, position_model, risk_drift_notes.\n\nInside the payload:\n  charge_model.name 'indian_equity_cash_delivery' + every rate\n    from ChargeModel.assumptions()\n  walk_forward.mode, .complexity ('O(n^2) per symbol' or\n    'O(n) per symbol'), .label_is, .first_decision_index,\n    .positions_closed_after_the_last_candidate\n  walk_forward.fills AND walk_forward.trades - both, so a reader\n    can CHECK that every fill became a trade rather than take\n    it on trust\n  timing.feature_ms_per_bar / model_ms_per_bar\n  the equity curve downsampled to MAX_JSON_CURVE_POINTS 1000,\n    first and last point always kept; the full curve stays in\n    memory for the metrics." { class: ctl }
+
+# ==========================================  the cost of the model  =======
+
+timing: "COST OF THE MODEL ITSELF   Timing\n\nTwo time.perf_counter() brackets around the two things a live\nminute has to fit inside one minute:\n\n  model_ms_per_bar   = model_seconds / bars_scored * 1000\n  feature_ms_per_bar = feature_seconds / bars_scored * 1000\n\nThe features are timed PER BAR, which is only honest in rebuild;\nthe report annotates the incremental figure '(one build for the\nwhole series)' so the two are not read as the same thing.\n\nSymbolWalk.feature_seconds / .model_seconds accumulate per\nsymbol and sum into the run total." { class: py }
+
+budget: "BUDGET: a 1-minute cadence allows 60000 ms/bar\nthis run used model_ms_per_bar + feature_ms_per_bar\n\nWHAT DECIDES VIABILITY IS model_ms_per_bar. The live loop\nbuilds ONE bounded window a minute - tail(symbol, wanted +\nWARMUP_ROWS) - not the whole series, so rebuild's\nfeature_ms_per_bar is a research cost, not a production cost.\n\nThis is also why the modes differ so much in wall time and\nidentical in output: the shortcut exists to make a laptop run\naffordable without changing a single number." { class: mem }
+
+# ==============================================  a representative run  =====
+
+result: "A REPRESENTATIVE RUN   --synthetic, model heuristic\n\n  trades                627\n  wins                    0\n  hit rate              0.0%\n  return, net        -3.73%\n\nTHE CORRECT ANSWER, NOT A DISAPPOINTING ONE.\n\nThe input is a zero-drift random walk. It was traded 627 times\nat roughly 4.4 standard deviations of cost per round trip, so\nevery one of those trades loses to the charges alone, and 0 wins\nis the arithmetic rather than a broken threshold or a broken\nmodel.\n\nChargeModel.zero() exists to print the gross figure beside the\nnet one. That gross number - what a costless backtest would\nhave shown instead - is the whole reason this module charges\nanything at all.\n\nThe pipeline is validated. The result is not." { class: mem }
+
+# ======================================================  sources  =========
+
+src: "Derived from\n\nservices/inference/app/backtest.py\n  WalkForward.run, first_decision, context_from_frame, Candidate,\n  BarOutcome, ChargeModel.leg / .round_trip / .zero, ChargeBreakdown,\n  ExecutionLimits, load_execution_limits, Reason, REASON_CHECK,\n  Portfolio._check / ._realise / ._close_arrived, RISK_DRIFT_NOTES,\n  Metrics, Timing, BacktestResult.to_json, format_summary,\n  run_backtest, projected_rebuild_minutes, plan_model,\n  SYNTHETIC_DISCLAIMER, CHARGE_DISCLAIMER, POSITION_MODEL_NOTE,\n  WEIGHTS_WARNING, DEFAULT_MAX_BARS, FEATURE_ROW_SECONDS\n\nservices/inference/app/synth.py\n  SynthSpec, generate, generate_many, session_grid,\n  SESSION_BARS_PER_DAY, BARS_PER_YEAR, DEFAULT_ANNUAL_VOLATILITY,\n  DEFAULT_ANNUAL_DRIFT, DEFAULT_START_PRICE, VOL_SHAPE_EDGE,\n  VOL_SHAPE_MIDDAY, PRICE_DECIMALS\n\nservices/inference/app/tests/test_backtest.py\n  corrupt_tail, test_no_lookahead_scores_and_candidates_are_identical,\n  test_no_lookahead_is_exact_for_every_horizon,\n  test_truncating_the_label_bars_shortens_the_run_and_nothing_else,\n  test_the_prompt_never_receives_a_row_from_after_the_decision_bar,\n  test_the_walk_starts_where_the_model_can_actually_use_a_prompt,\n  test_incremental_and_rebuild_produce_identical_prompts,\n  test_both_modes_agree_on_the_whole_run\n\nCross-referenced, not owned here\n  app/loop.py, app/features.py, app/signals.py, app/predictor.py,\n  app/candles.py, core/features/, core/config/config.go,\n  docs/contracts.md sections 4, 6, 8, Plan.md section 5" { class: lib }
+
+# ============================================================  edges  ======
+
+src_parquet -> guards: "read before anything else"
+src_synth -> guards: "generated before anything else"
+guards -> walk: "accepted: WalkForward(...)"
+walk -> bounds: "one symbol at a time"
+
+bounds -> slice: "the loop body"
+slice -> modes: "--feature-mode picks how"
+modes -> m_rebuild: "'rebuild'"
+modes -> m_incremental: "'incremental'"
+m_rebuild -> prompt: "table.context(rows)"
+m_incremental -> prompt: "context_from_frame(frame, i, rows)"
+m_rebuild -> identical: "asserted value for value"
+m_incremental -> identical: "and the shortcut earns its name"
+
+prompt -> threshold: "score"
+threshold -> cand: "above threshold, with a side"
+cand -> the_label: "exit_as_of and exit_price"
+slice -> the_label: "candles[i + horizon] is NOT in the slice" { style.stroke: "#c62828"; style.stroke-width: 3 }
+
+the_label -> portfolio: "candidates, keyed by as_of"
+portfolio -> gate: "one merged timeline, exits before entries"
+gate -> ledgers: "checks 5 and 8"
+gate -> dd: "the peak moves BEFORE the checks"
+ledgers -> drift: "where this may differ from C6"
+
+portfolio -> charges: "leg(entry) at fill, leg(exit) at close"
+charges -> rates: "the named constants"
+charges -> floor: "brokerage = min(pct, cap)"
+rates -> derived: "summed over both legs"
+floor -> derived: "the percentage binds at this size"
+derived -> result: "4.4 sigma per round trip"
+
+slice -> la_clean: "this is the property being tested"
+la_clean -> la_dirty: "corrupt_tail"
+la_dirty -> la_assert: "run both, compare"
+bounds -> la_assert: "the loop stops at len - horizon"
+la_assert -> la_mech: "and the mechanism, asserted directly"
+la_assert -> la_trunc: "a DIFFERENT experiment, a different assertion"
+
+src_synth -> banner: "which is why the header exists"
+drift -> whatnot: "and the closing section says so"
+whatnot -> artifact: "and it all lands in the JSON"
+
+m_rebuild -> timing: "feature_seconds, per bar"
+prompt -> timing: "model_seconds, per bar"
+m_incremental -> timing
+timing -> budget: "against 60000 ms/bar"

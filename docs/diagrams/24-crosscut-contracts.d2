@@ -1,0 +1,251 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+# --- classes: STYLE.md's colour vocabulary, no new colours ------------------
+classes: {
+  frz: Frozen surface {
+    style.fill: "#e0f2f1"
+    style.stroke: "#00897b"
+  }
+  go-c: Go consumer {
+    style.fill: "#e3f2fd"
+    style.stroke: "#1976d2"
+  }
+  py-c: Python consumer {
+    style.fill: "#ede7f6"
+    style.stroke: "#5e35b1"
+  }
+  ctl: Mechanism, no owner {
+    style.fill: "#e5e7eb"
+    style.stroke: "#37474f"
+  }
+  store: Declared, never read {
+    style.fill: "#e8f5e9"
+    style.stroke: "#2e7d32"
+  }
+  leak: Leak {
+    style.fill: "#ffebee"
+    style.stroke: "#c62828"
+  }
+}
+
+# =============================================================================
+# LAYER 1 — the frozen surface. Nine files, no component branch may edit one.
+# =============================================================================
+
+ag: "AGENTS.md\n'Frozen files - do not edit'\n'Ownership' table, C1-C10\nexclusive path sets" {
+  class: frz
+}
+
+pl: "Plan.md\n§6 the ten-component matrix\n§6 'Stacks on' column\nconflict-avoidance rules 1-5" {
+  class: frz
+}
+
+cm: "docs/contracts.md\n§1 domain types, §4 the 18 columns\n§6 the seven checks, §7 HTTP\n§8 'No component may add one'" {
+  class: frz
+}
+
+ct: "core/contracts/contracts.go\nTick  Candle  Signal\nOrderRequest  Position  Instrument\nPortfolio  Rejection  Reject(code, msg)\nSideBuy/SideSell, OrderTypeMarket/Limit\nReasonMaxPosition .. ReasonDuplicate\n(the 8 RISK_* codes)" {
+  class: frz
+}
+
+cr: "core/contracts/risk.go\nChecker   Check(ctx, sig, portfolio) error\nCheckerFunc   func adapter\nChecks   ordered chain, first failure wins\nPolicy   the risk budget from config" {
+  class: frz
+}
+
+whychk: "WHY Checker is in contracts, not in\nservices/execution/risk\n\nhttp.go (C7) imports core/contracts and\ncore/broker. It does NOT import\nservices/execution/risk.\nrisk.Policy.New returns contracts.Checks\nengine.checks is a contracts.Checks\n\nThe interface is the seam: C6 built the\nchecks and C7 the HTTP edge in parallel,\nmerged in either order." {
+  class: ctl
+}
+
+cfg: "core/config/config.go\nConfig + 8 sections: app metrics broker\nstorage analytics execution inference jobs\nLoad() honours MFT_METRICS_ADDR\nValidate() fills every default\ncrossValidate() rejects unsafe combos" {
+  class: frz
+}
+
+mk: "Makefile\nfrozen target list, 30 targets\nmake lint, make test, make diagrams" {
+  class: frz
+}
+
+gw: "go.work + 4 x go.mod + go.sum\nuse ./core ./services/execution\n./services/ingestion ./services/jobs\nparquet-go, kiteconnect, prometheus,\nfx, zap, yaml.v3, go-cron resolved once" {
+  class: frz
+}
+
+# =============================================================================
+# LAYER 1b — the pre-resolved-dependency mechanism. Two files, no owner.
+# =============================================================================
+
+tools: "core/tools.go\n//go:build tools\nimport _ \"github.com/gorilla/websocket\"\n\nPins one dependency in core/go.mod so\nfour branches sharing it never each add\ntheir own line. Result: gorilla is\n'// indirect' in all 3 service go.mod,\nand only C1's core/broker imports it." {
+  class: ctl
+}
+
+req: "services/inference/requirements.txt\nFROZEN, 16 pins: fastapi, pydantic,\npandas, pyarrow, duckdb, torch, tabfm\nrequirements-dev.txt is additive only" {
+  class: ctl
+}
+
+# =============================================================================
+# LAYER 2 — consumers. Every package that imports the frozen surface, and
+# exactly which symbol it takes. Measured from the import blocks at
+# integration/wave1, .worktrees excluded.
+# =============================================================================
+
+b1: "C1  core/broker\ncontracts.Instrument, OrderRequest,\n  Position, SideBuy, SideSell,\n  OrderTypeMarket, OrderTypeLimit\ntype Tick = contracts.Tick  (alias)\nreads config: broker.api_key, api_secret,\n  access_token, instruments,\n  request_timeout_seconds,\n  reconnect_max_backoff_seconds" {
+  class: go-c
+}
+
+b2: "C2  core/storage\ncontracts.Tick, contracts.Candle\nreads config.StorageConfig:\n  data_dir, flush_interval_seconds,\n  flush_max_rows, partition_by" {
+  class: go-c
+}
+
+b2b: "C2  core/analytics\ncontracts.Candle — that is all\nNewFromConfig takes config.StorageConfig,\nnever config.AnalyticsConfig" {
+  class: go-c
+}
+
+b3: "C3  core/features\ncontracts.Candle — its ONLY import\nBuilder.Build(candles) -> FeatureTable\nthe 18 frozen columns\n\nPlan.md §6 says C3 'Stacks on C2'.\nIt imports neither core/storage nor\ncore/analytics." {
+  class: go-c
+}
+
+b4: "C4  services/ingestion\ncontracts.Candle. Its Tick is C1's\nalias broker.Tick, not a second import\nreads config: broker.instruments,\n  broker.reconnect_max_backoff_seconds,\n  the whole storage section" {
+  class: go-c
+}
+
+b6: "C6  services/execution/risk\nimplements contracts.Checker\ncontracts.Checks, contracts.Policy,\n  Portfolio, Reject, Rejection,\n  6 of the 8 Reason* codes\nreads config.ExecutionConfig: capital,\n  max_position_pct, max_open_positions,\n  max_drawdown_pct, daily_loss_limit,\n  max_order_quantity, debounce_ttl_seconds,\n  market_holidays" {
+  class: go-c
+}
+
+b7: "C7  services/execution/http.go\ncontracts.Signal, Rejection, Reject,\n  OrderRequest, Checks, Portfolio,\n  SideBuy/SideSell, 7 of the 8 Reason* codes\nreads config.Execution: addr + the 9\npolicy keys. Never imports core/contracts/\nrisk, never imports services/execution/risk" {
+  class: go-c
+}
+
+b8: "C8  services/jobs\ncontracts.Candle, contracts.Instrument\nreads config: jobs.schedule,\n  rate_limit_per_second, historical_dir,\n  backfill_lookback_days, broker.api_key,\n  api_secret, instruments,\n  request_timeout_seconds, storage.data_dir" {
+  class: go-c
+}
+
+b9: "C9  core/metrics + core/log\nno contracts import at all\nmetrics reads app.name, metrics.addr,\n  metrics.path\nlog reads app.env, log_level, timezone" {
+  class: go-c
+}
+
+b10: "C10  services/inference/app\nPython. No Go import is possible:\napp/config.py re-declares app, storage,\ninference as pydantic models with the\nsame defaults, extra='ignore' for the rest" {
+  class: py-c
+}
+
+# =============================================================================
+# LAYER 3 — the config schema as a node, and who actually reads it.
+# =============================================================================
+
+schema: "the config schema, one YAML file,\neight sections, every key declared\nby core/config/config.go and read by\nwhoever binds that struct" {
+  class: ctl
+}
+
+exec_keys: "execution.*\naddr, capital, debounce_ttl_seconds,\nidempotency_ttl_seconds, max_position_pct,\nmax_open_positions, max_drawdown_pct,\ndaily_loss_limit, max_order_quantity,\nmarket_holidays\n\nread by: engine.go (C6), risk.FromConfig (C6)" {
+  class: frz
+}
+
+inf_keys: "inference.*\naddr, model, execution_url, context_rows,\nhorizon_bars, score_threshold, order_quantity,\ninstruments, dry_run\n\nread by: app/config.py (C10) — and by\nNO Go package anywhere in the repo" {
+  class: frz
+}
+
+dead: "analytics.duckdb_path   analytics.read_only\ndefaulted in Validate(), absent from\nevery pydantic model, read by nothing\n\nbroker.product\ndefaulted to MIS, cross-validated,\nread by nothing — C1 defaults itself\n\nTwo keys that exist only in the schema." {
+  class: store
+}
+
+# =============================================================================
+# LAYER 4 — the leaks. Six files, five ownership holes, one wrong doc comment.
+# =============================================================================
+
+l1: "LEAK 1  core/fx.go\nnot frozen, owned by nobody, and it is\nthe DI root: fx.Module('core') provides\nconfig.Load, log.New, metrics.Registry,\nfluxkv.New, NewStorageWriter, NewKite\nimported by services/{ingestion,execution,\njobs}/cmd/server\n\nEDITED TWICE on integration/wave1 —\n3713734 and 63999b3. Exactly the conflict\nthe ownership table exists to prevent." {
+  class: leak
+}
+
+l2: "LEAK 2  core/testutil/\nAGENTS.md makes it mandatory\n('Tests use core/testutil') and no\ncomponent owns it. 4 packages import it\nin 9 test files: C9 metrics, C7 execution,\nC4 ingestion, C8 jobs.\n\nIt imports core/broker, so C9's metric\nassertions depend on C1 compiling." {
+  class: leak
+}
+
+l3: "LEAK 3  no owner, no freeze, all shipped\nservices/*/cmd/server/main.go\nservices/{ingestion,execution,jobs,\ninference}/Dockerfile\nservices/inference/venv.sh\ndocker-compose.yml, scripts/worktree.sh" {
+  class: leak
+}
+
+l4: "LEAK 4  §8 says no component may add a\nconfig key. Three were added mid-flight\nby editing the frozen config.go in\n3713734, which also edited docs/contracts.md\nto make the addition look pre-existing:\n  broker.product\n  execution.idempotency_ttl_seconds\n  execution.market_holidays\nThe rule was bypassed, then the record\nof the bypass was rewritten." {
+  class: leak
+}
+
+l5: "LEAK 5  zero Go importers, anywhere\ncore/features    (C3)\ncore/analytics  (C2)\n\nBoth are built, tested and unreferenced.\nC10's app/features.py is a second port of\nthe 18-column schema, 500 lines of pandas\nagainst 300 of Go. The only thing binding\nthem is features/feature_golden.json,\ntranscribed by hand, 1e-9 tolerance." {
+  class: leak
+}
+
+l6: "LEAK 6  the comment is wrong, not the code\ncore/features/features.go:199 and\napp/features.py:143 both say a UTC\nminute_of_session at the 09:15 IST open\n'reads -345 instead of 0'.\n\n09:15 IST is 03:45 UTC. 3x60 + 45 - 555\n= -330. The arithmetic in the code is\nright; the doc comment is off by one bar\nof offset and both copies say it." {
+  class: leak
+}
+
+l7: "LEAK 7  the frozen Client is not the\nimplemented Client\ndocs/contracts.md §2 freezes\n  PlaceOrder(ctx, req OrderRequest)\ncore/broker.Client is the deprecated 5-arg\n  PlaceOrder(ctx, symbol, side, qty, price)\ncore/testutil.MockClient implements the\n5-arg form. broker.OrderClient is the\none that matches §2, behind an adapter.\ncontract, code and mock disagree." {
+  class: leak
+}
+
+footer: "Derived from — core/contracts/contracts.go, core/contracts/risk.go, core/config/config.go,\ncore/broker/broker.go, core/testutil/testutil.go, core/fx.go, core/tools.go, core/features/{features,columns}.go,\nservices/execution/{engine.go,http.go,risk/risk.go}, services/jobs/worker.go, core/storage/layout.go,\ncore/analytics/analytics.go, services/inference/app/{config.py,features.py,candles.py},\nservices/inference/requirements.txt, go.work, the four go.mod files, AGENTS.md, Plan.md §6, docs/contracts.md §8;\ngit log --oneline master..integration/wave1 (43 commits) and git show 3713734, 63999b3." {
+  class: ctl
+  style.stroke-dash: 4
+}
+
+# --- layer 1 wiring ---------------------------------------------------------
+ag -> pl: "the matrix the rules live in"
+ag -> cm
+pl -> cm
+ct -> cm: "§1, §4, §6 are the prose for this file"
+cr -> ct: "adds the gate interface\nand the reason codes"
+cr -> whychk
+whychk -> b6: "C6 implements it"
+whychk -> b7: "C7 calls it without importing C6"
+cfg -> cm: "§8 freezes this struct"
+mk -> ag: "'Makefile is frozen'"
+gw -> ag: "'go.mod/go.sum are frozen'"
+tools -> gw: "the pin that keeps it shared"
+req -> b10: "C5 owns it; C10 imports from it"
+
+# --- layer 2 wiring: exactly what each consumer imports ---------------------
+b1 -> ct
+b2 -> ct
+b2b -> ct
+b3 -> ct
+b4 -> ct
+b6 -> cr
+b7 -> ct
+b7 -> cr
+b8 -> ct
+b9 -> cfg
+b10 -> req
+
+# --- layer 3 wiring: the schema and its readers ------------------------------
+schema -> cfg: "the Go declaration"
+schema -> b10: "the pydantic re-declaration"
+b6 -> schema: "binds config.ExecutionConfig"
+b7 -> schema: "binds config.Execution"
+b10 -> schema: "binds app, storage, inference"
+b9 -> schema: "binds app, metrics"
+b2 -> schema: "binds config.StorageConfig"
+b2b -> schema: "binds StorageConfig too"
+b8 -> schema: "binds config.JobsConfig"
+b1 -> schema: "binds config.BrokerConfig"
+b4 -> schema: "binds broker + storage"
+exec_keys -> b6: "read here"
+exec_keys -> b7: "and here"
+inf_keys -> b10: "read only here"
+dead -> cfg: "declared, defaulted,\nvalidated, never used"
+
+# --- layer 4 wiring: every leak anchored to the file it lives in ------------
+l1 -> mk: "frozen-adjacent, unfrozen,\nand universally imported"
+l2 -> ag: "'Tests use core/testutil'\nmakes it mandatory; no row owns it"
+l3 -> gw: "entrypoints and images,\nshipped unowned"
+l4 -> cm: "§8 vs commit 3713734"
+l4 -> cfg: "core/config/config.go edited\nby a component merge"
+l5 -> b3: "core/features"
+l5 -> b2b: "core/analytics"
+l5 -> b10: "app/features.py\nsecond port, golden fixture only"
+l6 -> b3: "features.go:199\napp/features.py:143"
+l7 -> b1: "core/broker.Client\n5-arg, deprecated"
+l7 -> l2: "MockClient implements it"
+l7 -> cm: "§2 froze the other one"
