@@ -1,0 +1,148 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ext:   {style.fill: "#eceff1"; style.stroke: "#90a4ae"}
+  go:    {style.fill: "#e3f2fd"; style.stroke: "#1976d2"}
+  py:    {style.fill: "#ede7f6"; style.stroke: "#5e35b1"}
+  lib:   {style.fill: "#e0f2f1"; style.stroke: "#00897b"}
+  store: {style.fill: "#e8f5e9"; style.stroke: "#2e7d32"}
+  mem:   {style.fill: "#fff8e1"; style.stroke: "#f9a825"}
+  ctl:   {style.fill: "#e5e7eb"; style.stroke: "#37474f"}
+  bad:   {style.fill: "#ffebee"; style.stroke: "#c62828"}
+}
+
+title: "LLD - services/jobs: the historical backfill (Plan.md 3).\nThe only way candle history reaches the store, so inference has nothing to run without it.\nA run is resumable by construction: the unit of work is a segment, and a segment already on\ndisk is skipped." {
+  style.bold: true
+  style.font-size: 20
+}
+
+# --- scheduling -------------------------------------------------------------
+
+sched: "scheduling - two ways into RunBackfill, and one reason only one of them is fx-built" {
+  class: ctl
+  fxmod: "jobs.Module = fx.Module('jobs'): Provide(NewLimiterFromConfig, NewParquetStoreFromConfig,\nNewScheduler, NewBackfillWorker, NewKiteHistory) and Invoke(StartScheduler).\nfx resolves CONCRETE types, so the interface bindings further down are what make\nNewBackfillWorker's HistoricalClient / SegmentStore arguments satisfiable at all" {class: go}
+  schedn: "NewScheduler(log) -> cron.New(cron.WithChain(cron.Recover(\ncron.VerbosePrintfLogger(cronLogWriter{log})))))\ncronLogWriter adapts zap to go-cron's Printf logger so a cron message lands in the\nservice's structured log rather than on stderr" {class: go}
+  schedrun: "StartScheduler(lc, s, w, cfg): lc.Append(fx.Hook{ OnStart: cron.AddFunc(cfg.Jobs.Schedule,\nw.RunBackfill, cron.WithName('weekly-backfill')); cron.Start() ... OnStop: cron.Stop() })\njobs.schedule default '0 2 * * 6'. The job body only LOGS the error it gets back:\nRunBackfill already decided what is fatal." {class: go}
+  panic: "RECOVERY: cron.Recover wraps the job, so a panicking run is logged through\ncronLogWriter and skipped - never allowed to take down the process that also serves\nthe metrics endpoint a human would use to diagnose the panic. Recover stays the\nOUTERMOST link in the chain for exactly that reason" {class: ctl}
+  runnow: "cmd/jobs/main.go runOnce() - the -run-now one-shot, ONE pass then exit. It assembles\nthe graph BY HAND: config.Load(core.ConfigPath()), log.New, broker.NewKiteFromConfig,\nkite.SetLogger, then NewBackfillWorker(cfg, NewKiteHistory(cfg, kite, logger),\nNewParquetStore(cfg.Jobs.HistoricalDir), NewLimiterFromConfig(cfg), logger,\nmetrics.Registry())\nWHY NOT fx: fx.Module includes core.Module, which binds the metrics port. An operator\nbackfilling on a laptop must not fail because a second copy of the service is already\nrunning. The price is that this graph is written twice and only one copy is fx-checked." {class: go}
+  runback: "BackfillWorker.RunBackfill(ctx): a cancelled ctx is rejected up front, then\nw.running.Lock() serialises runs - the scheduler can fire while a -run-now pass is still\ngoing, and two concurrent runs would fight over the same segment files. Then\nsymbols(), runs.Inc(), one runSymbol per symbol accumulating candles and failures,\nbreaking out the moment ctx.Err() != nil, and duration.Observe at the end" {class: go}
+
+  fxmod -> schedn -> schedrun
+  schedrun -> panic: "job body"
+  schedrun -> runback: "every fire"
+  fxmod -> runnow: "same wiring, assembled by hand" {style.stroke-dash: 3}
+  runnow -> runback: "one pass, then exit"
+}
+
+# --- segmentation -----------------------------------------------------------
+
+seg: "segmentation - a Segment is the unit of durability, and the unit of the file name" {
+  class: ctl
+  cfg: "jobs config block: jobs.schedule '0 2 * * 6', jobs.rate_limit_per_second 3,\njobs.backfill_lookback_days 730, jobs.historical_dir = storage.data_dir + '/historical',\ninterval defaultInterval 'minute'. NewBackfillWorker re-declares defaults 3 / 730 / minute\nso a zero-valued config still yields a runnable worker. The watchlist is COPIED from\ncfg.Broker.Instruments: symbols() -> normaliseSymbols trims, upper-cases and dedupes,\nfirst-seen order - those are the symbols the platform trades, therefore the ones the\nmodel trains on" {class: ctl}
+  segs: "segments(from, to) and segmentsFor(symbol, from, to) - a PURE function of the date range,\nso the chunking rule is testable on its own: cursor from now-lookback stepping\nsegmentLen = segmentDays * day, end clamped to to, last chunk short when the lookback is\nnot a whole multiple. segmentsFor then stamps Symbol on each chunk. 60 days is Kite's\ndocumented cap on one intraday /data/historical call, so 730 / 60 = 13 segments per symbol.\nChunking also bounds the blast radius: one bad segment is refetched on its own, and a\nsegment that landed is never refetched" {class: go}
+  segtype: "Segment (interfaces.go): Symbol, From (INCLUSIVE, UTC), To (EXCLUSIVE, UTC),\nCandles. String() renders it as 'RELIANCE 2024-01-01..2024-03-01', which is what a log line\nwants. The From/To pair IS the segment identity - it is also the directory name in the\nParquet layout, so resuming a run is a question about what is already on disk" {class: lib}
+  segpath: "ParquetStore.SegmentPath(seg): data/historical/symbol=<SYM>/from=<YYYY-MM-DD>/\nto=<YYYY-MM-DD>/candles.parquet - hive partitioning of docs/contracts.md 3, which DuckDB\nreads natively. The path is a pure function of the segment, so two runs of the same\nbackfill land on the same file" {class: store}
+
+  cfg -> segs: "lookback"
+  segs -> segtype: "one chunk each"
+  segtype -> segpath: "identity -> path"
+}
+
+# --- pacing and retry -------------------------------------------------------
+
+pace: "pacing - NewLimiter(rate) / TakeAt(now), and why the clock is a parameter" {
+  class: ctl
+  takeat: "NewLimiter(rate) -> newLimiter(rate, math.Ceil(rate)): burst is the rate rounded up, so a\nrate of 3 lets an idle client spend one full second of quota at once and no more. RATE 0\nMEANS UNLIMITED: newLimiter turns rate <= 0 into math.Inf(1) and seeds tokens = burst.\nTakeAt(now) refills tokens += (now - last).Seconds() * rate, capped at burst - a backwards\nclock step counts as NO elapsed time rather than as a refill - then tokens < 1 -> false,\nelse tokens-- and true. Taking the clock as an argument is what lets a test grant a\nthousand tokens across a SIMULATED minute and assert on the number granted: no sleeping,\nno flake" {class: go}
+  take: "Limiter.Take(ctx) - the blocking form fetchSegment uses: loop { ctx.Err(); TakeAt(l.now());\nl.sleep(ctx, l.retryAfter()) }, and ctx.Err() is returned to the caller wrapped as\n'rate limit: %w'. retryAfter = (1 - tokens) / rate seconds, and exactly 0 when the rate is\n+Inf, which is why an unlimited limiter grants immediately instead of dividing by Inf" {class: go}
+  bo: "Backoff.Delay(attempt) = base * 2^n, base defaultBackoffBase 500ms, clamped to\ndefaultBackoffMax 30s, then FullJitter into [d/2, d]. DefaultBackoff() is what\nNewBackfillWorker installs. A negative attempt is clamped to 0, and fetchSegment passes\nattempt-1, so the FIRST retry does not sleep - only every retry after it does" {class: go}
+  float: "WHY float64: d = float64(base) * math.Pow(2, float64(attempt)), then\nif d >= float64(max) || math.IsInf(d, 1) { d = float64(max) }. An integer base << n on\ntime.Duration would wrap past 2^63 to a NEGATIVE delay - an immediate retry - and the run\nwould hot-loop against an endpoint that is already throttling us. Jitter never returns\nbelow d/2 for the same class of reason: full jitter down to zero busy-loops, while a\nfactor-of-two spread still breaks up two workers that were throttled together" {class: go}
+
+  takeat -> take: "TakeAt(l.now())"
+  bo -> float: "the shift"
+  float -> bo: "then jitter"
+}
+
+# --- fetchSegment -----------------------------------------------------------
+
+fetch: "fetchSegment(ctx, seg) - one segment, at most maxAttempts = 4 attempts" {
+  class: ctl
+  loop: "for attempt := 0; attempt < maxAttempts; attempt++ {\n  if attempt > 0 -> w.sleep(ctx, w.backoff.Delay(attempt-1)) - ctx cancelled mid-backoff\n  w.limiter.Take(ctx) -> error stops the segment\n  mft_jobs_backfill_requests_total.Inc() - counts RETRIED attempts too\n  candles, err := w.history.HistoricalCandles(ctx, seg.Symbol, seg.From, seg.To, 'minute')\n}\nerr == nil -> return the candles. Two sleeps hooks exist so the retry and pacing tests\nare instant: sleep is replaced by a recorder and now defaults to time.Now" {class: go}
+  hist: "KiteHistory.HistoricalCandles(ctx, symbol, from, to, interval) -\nGET https://api.kite.trade/data/historical/<exchange>/<symbol>/<interval>/<from>/<to>\n?instrument_token=<int>&continuous=0&include_oi=0, header\n'Authorization: token <api_key>:<access_token>'\nIt holds cfg.Broker.APIKey / AccessToken itself rather than a *broker.Kite, because C1's\ncredential fields are unexported by design and reading the same frozen config block is\nthe lesser coupling. Only InstrumentResolver is delegated to C1. Empty access_token is\nrejected as broker.ErrAuth BEFORE any request is made. Body capped at\nhistoryResponseMaxBytes 16 MiB; timeout defaultHistoryTimeout 10s, overridden by\nbroker.request_timeout_seconds" {class: ext}
+  map: "historyStatusError mirrors core/broker's classifyStatus so the two clients agree on\nwhat a 429 is, preferring the JSON body over the status line because Kite's wording\ncarries 'too many requests': 429 -> broker.ErrRateLimit, 401/403 -> broker.ErrAuth,\n404 -> broker.ErrInstrumentNotFound - on this route a 404 means Kite does not know the\nexchange or symbol, NOT that an order is missing, and ErrInstrumentNotFound is what lets\nthe job give up on the symbol instead of retrying. 5xx -> broker.ErrUnavailable, anything\nelse -> broker.ErrInvalidOrder. decode() trusts the envelope too: a body saying 'error'\nthat arrived 2xx is mapped by statusFromError, because Kite does that when a token\nexpires mid-session. One malformed row is logged and SKIPPED, never a reason to discard\nthe whole segment - Kite has shipped rows with a missing volume before" {class: ctl}
+  thr: "broker.ErrRateLimit -> mft_jobs_backfill_throttles_total.Inc() and CONTINUE the loop.\nThis is what maxAttempts exists for: a throttle is transient, so it is retried on the\nbackoff schedule and only this one segment is affected" {class: bad}
+  fatal: "isFatal(err) = errors.Is(err, broker.ErrAuth) || errors.Is(err,\nbroker.ErrInstrumentNotFound) -> RETURN IMMEDIATELY, no sleep, no retry.\nA Kite access token lives for a trading day, so burning four attempts and four rate-limit\nslots on a dead token learns nothing; a vanished instrument is not coming back either.\nApplied after fetchSegment AND after a HasSegment error, so a bad HasSegment cannot spin\nthe whole symbol. NOT applied to a WriteSegment error - that one is local and cheap to\nretry, and it only `continue`s, never breaks" {class: bad}
+  exh: "ATTEMPTS EXHAUSTED -> 'backfill <seg>: 4 attempts exhausted: %w' wrapping the last error.\nThe segment is abandoned, appended to failures, and the symbol moves to its NEXT segment -\nnot to the end of the symbol, and not out of the run" {class: bad}
+
+  loop -> hist: "one attempt"
+  hist -> map: "status / envelope"
+  hist -> thr: "broker.ErrRateLimit"
+  hist -> fatal: "broker.ErrAuth, ErrInstrumentNotFound"
+  map -> fatal: "a 401 or 404 envelope"
+  map -> thr: "a 429 envelope"
+  thr -> loop: "next attempt"
+  loop -> exh: "4 x throttled"
+}
+
+# --- resumability -----------------------------------------------------------
+
+storec: "resumability - HasSegment, fetch, WriteSegment, and the tail of RunBackfill" {
+  class: ctl
+  runsym: "runSymbol(ctx, symbol): from = now-lookback, to = now, both UTC, then per segment\nctx.Err() -> return; store.HasSegment; fetchSegment; WriteSegment. failures accumulate\nand the symbol returns errors.Join of them, but ONE SYMBOL NEVER ABORTS THE RUN -\na delisted ticker must not cost the other two their history" {class: go}
+  has: "ParquetStore.HasSegment(ctx, seg) - os.Stat on the segment path. IsNotExist ->\nfalse, nil, no error. A ZERO-LENGTH FILE COUNTS AS ABSENT (info.Size() > 0), so the\nplaceholder an earlier crash left behind is refetched rather than trusted.\ntrue -> mft_jobs_backfill_segments_skipped_total.Inc() and continue, with NO request\nto Kite at all. That is the checkpoint: a 730-day backfill over three symbols,\ninterrupted at any point, resumes at the first missing segment" {class: store}
+  write: "ParquetStore.WriteSegment(ctx, seg) - validSegment first: no symbol, an unbound\ndate, or a range that ends before it starts is ErrInvalidSegment. Then EVERY candle is\nchecked to lie in [From, To) and a bar outside the segment is rejected rather than\nwritten into a file that is keyed on that range" {class: store}
+  partial: "ATOMIC PUBLISH: rows go to candles.parquet.partial, a SIBLING of the final file,\nand os.Rename(tmp, path) only after a successful close. A run interrupted mid-write\nleaves a .partial that the next run simply overwrites - never a truncated\ncandles.parquet that HasSegment would mistake for a finished segment, which is exactly\nwhat would silently poison the model with a short history. writeParquet removes the\n.partial on a write or close failure. Dir 0o755, file 0o644" {class: store}
+  nohist: "ErrNoHistory - returned ONLY when candles == 0 AND len(failures) > 0:\n'backfill: %d of %d symbols failed, 0 candles written: jobs: no historical data was\nbackfilled' plus errors.Join(failures). mft_jobs_backfill_runs_failed_total.Inc() on\nthat path. A silent zero-candle week is worse than a loud one" {class: bad}
+  tail: "THE TAIL: candles > 0 with failures -> logged at Warn with the joined error and\nRunBackfill RETURNS NIL. Partial success is not an error, because the checkpoint makes\nthe failed segments the whole of the next run's work.\ncandles == 0 with no failures -> every segment was already on disk, logs 'backfill run\nalready complete' and returns nil.\nCONTRADICTION, drawn not smoothed: BOTH tails set last_success, including the branch\nthat wrote nothing, so mft_jobs_backfill_last_success_timestamp_seconds reports a success\nits own Help string forbids ('last run that landed at least one candle')" {class: ctl}
+
+  runsym -> has: "already there?"
+  runsym -> write: "land it"
+  write -> partial: "tmp then rename"
+  write -> nohist: "nothing landed"
+  runsym -> tail: "the count"
+}
+
+# The two cross-container edges are declared at root scope with qualified ids:
+# inside a container block, a bare `fetch` would resolve in that container's scope
+# and d2 would create a junk rectangle called storec.fetch.
+
+storec.has -> fetch: "absent -> fetch it" {style.stroke-dash: 3}
+fetch.loop -> storec.runsym: "candles" {style.stroke-dash: 3}
+pace.take -> fetch.loop: "Take(ctx) before every request" {style.stroke-dash: 3}
+
+# --- the three seams --------------------------------------------------------
+
+seams: "three narrow interfaces, declared in jobs rather than reached for in core" {
+  class: ctl
+  ihc: "HistoricalClient - ONE method:\nHistoricalCandles(ctx, symbol, from, to, interval) ([]contracts.Candle, error)\nIt ASSUMES: bars ascending by Timestamp inside [from, to), a throttle wraps\nbroker.ErrRateLimit so the caller can back off, and an auth failure wraps\nbroker.ErrAuth so the caller can stop rather than retry" {class: lib}
+  iir: "InstrumentResolver - ONE method:\nInstruments(ctx) ([]contracts.Instrument, error)\n*broker.Kite satisfies it UNCHANGED, so C1's connector stays the single source of truth\nfor symbol resolution and the binding costs no adapter.\nvar _ InstrumentResolver = (*broker.Kite)(nil) makes that compile-time: if core/broker\nchanges its method set this file stops compiling rather than the service failing at\nstartup" {class: lib}
+  iss: "SegmentStore - TWO methods:\nWriteSegment(ctx, seg) error and HasSegment(ctx, seg) (bool, error)\nIt ASSUMES WriteSegment is ATOMIC, because HasSegment is what a resumed run uses to\ndecide what to skip. Deliberately segment-shaped rather than row-shaped: the historical\ntree is a set of immutable files, and a store that could append into one would break the\nDuckDB rule that readers only ever see closed files" {class: lib}
+  why: "WHY HERE AND NOT IN core: C2's core/storage Writer is TICK-shaped - it appends into\nwall-clock-keyed files, has no notion of a bounded immutable segment, and flushes on a\ntimer rather than on the date range the request asked for, so it cannot express a closed,\ndate-range-keyed segment at all. C1 scoped core/broker to the WebSocket stream and the\norder endpoints and never implemented /data/historical, which is why the Kite client also\nlives here rather than behind C1. Widening a frozen contract in docs/contracts.md, or\nadding a file to another component's package, is a merge conflict with every parallel\nbranch. A one- and two-method seam is substitutable with a HAND-WRITTEN FAKE and states\nexactly what this component assumes of a component it does not own" {class: ctl}
+  binds: "THE fx BINDINGS, added in the integration PR because the module genuinely could not\nstart without them:\n  func(k *broker.Kite) InstrumentResolver\n  func(h *KiteHistory) HistoricalClient\n  func(s *ParquetStore) SegmentStore\nfx resolves concrete types, so a constructor asking for an interface is 'missing types'\nand Run fails. NewLimiterFromConfig and NewParquetStoreFromConfig exist for the same\nreason - DI cannot synthesise a bare int or string. runOnce assembles the same objects by\nhand and was UNAFFECTED, so the failure only ever showed up under make dev" {class: go}
+
+  ihc -> why: "1 method"
+  iir -> why: "0 lines of adapter"
+  iss -> why: "atomicity assumed"
+  binds -> ihc: "HistoricalClient"
+  binds -> iir: "InstrumentResolver"
+  binds -> iss: "SegmentStore"
+}
+
+# --- metrics ----------------------------------------------------------------
+
+counters: "metrics - 7 counters, 1 histogram, 1 gauge, all registered on the shared\n*prometheus.Registry with the mft_ prefix; core/metrics panics on a violation at\nregistration, so a typo stops the process at startup rather than shipping a series\nnobody is watching\n\nmft_jobs_backfill_runs_total                     runs started\nmft_jobs_backfill_runs_failed_total              ended without landing a single candle\nmft_jobs_backfill_candles_total                  candles written, added once per run\nmft_jobs_backfill_requests_total                 broker historical requests, retried ones INCLUDED\nmft_jobs_backfill_throttles_total                times Kite answered 429\nmft_jobs_backfill_segments_total                 segments written to the Parquet store\nmft_jobs_backfill_segments_skipped_total         skipped, a previous run already landed them\nmft_jobs_backfill_duration_seconds               HISTOGRAM, observed once per run\nmft_jobs_backfill_last_success_timestamp_seconds GAUGE, w.now().Unix(); zero means never" {
+  class: ctl
+}
+
+footer: "Derived from\n  services/jobs/worker.go - Module (fx bindings), backfillMetrics, BackfillWorker,\n    NewBackfillWorker, RunBackfill, runSymbol, fetchSegment, segments, segmentsFor,\n    symbols, normaliseSymbols, isFatal, Scheduler, NewScheduler, StartScheduler;\n    constants defaultRateLimitPerSecond 3, defaultLookbackDays 730, defaultInterval\n    'minute', segmentDays 60, maxAttempts 4, day 24h\n  services/jobs/history.go - KiteHistory, NewKiteHistory, HistoricalCandles, instrument,\n    get, historyStatusError, decode, statusFromError, decodeHistoryRow, histFloat, histInt\n  services/jobs/store.go - ParquetStore, SegmentPath, HasSegment, WriteSegment,\n    writeParquet, ReadHistoricalCandles, Segment.String, validSegment, HistoricalCandle;\n    layout symbol=<SYM>/from=<date>/to=<date>/candles.parquet, segmentTmpSuffix '.partial'\n  services/jobs/limiter.go - Limiter, NewLimiter, newLimiter, TakeAt, Take, retryAfter, sleepCtx\n  services/jobs/backoff.go - Backoff, DefaultBackoff, Delay, FullJitter; 500ms base, 30s max\n  services/jobs/interfaces.go - HistoricalClient, InstrumentResolver, Segment, SegmentStore\n  services/jobs/errors.go - ErrInvalidSegment, ErrNoHistory\n  services/jobs/cmd/jobs/main.go - the -run-now flag and runOnce()\n  core/config/config.go - JobsConfig: schedule, rate_limit_per_second, historical_dir,\n    backfill_lookback_days; the watchlist is broker.instruments\n  core/broker/errors.go - ErrAuth, ErrRateLimit, ErrInstrumentNotFound, ErrUnavailable\nFrozen interfaces that were NOT widened for this: core/contracts, core/storage (C2's\ntick-shaped Writer), core/broker (C1 never implemented /data/historical)" {
+  style.fill: "#eceff1"
+  style.stroke: "#90a4ae"
+  style.font-size: 13
+}
