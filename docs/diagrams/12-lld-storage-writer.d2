@@ -1,0 +1,234 @@
+direction: down
+
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: dagre
+    pad: 40
+  }
+}
+
+classes: {
+  ext:   { style.fill: "#eceff1"; style.stroke: "#90a4ae" }
+  go:    { style.fill: "#e3f2fd"; style.stroke: "#1976d2" }
+  lib:   { style.fill: "#e0f2f1"; style.stroke: "#00897b" }
+  store: { style.fill: "#e8f5e9"; style.stroke: "#2e7d32" }
+  mem:   { style.fill: "#fff8e1"; style.stroke: "#f9a825" }
+  bad:   { style.fill: "#ffebee"; style.stroke: "#c62828" }
+}
+
+title: |md
+  # storage writer — the atomic-publish invariant
+
+  `core/storage` LLD: `Writer` / `CandleWriter` → hive-partitioned Apache Parquet
+
+  a reader never observes a partial file, because a `part-*.parquet` name
+  only ever appears once the bytes behind it are on disk
+| {
+  style.bold: true
+  style.fill: "#ffffff"
+  style.stroke: "#37474f"
+  style.stroke-width: 2
+}
+
+# ------------------------------------------------------- 1. entry points ----
+# Four constructors, two row types. The *FromConfig pair is the only path that
+# reads the frozen config; the two-argument pair predates it and keeps the shape
+# core/fx.go and services/ingestion already compile against.
+entr: "ENTRY POINTS   ·   core/storage/storage.go" {
+  class: go
+
+  ctor_pos: "NewWriter(dir string, flushEvery int) *Writer          —  ticks\nNewCandleWriter(dir string, flushEvery int) *CandleWriter  —  candles\nboth build Options{MaxRows: flushEvery, FlushInterval: DefaultFlushInterval}\nthen newWriter(opts, DatasetTicks, tickPartition) / (…, DatasetCandles, candlePartition)"
+
+  ctor_cfg: "NewWriterFromConfig(cfg config.StorageConfig) (*Writer, error)\nNewCandleWriterFromConfig(cfg config.StorageConfig) (*CandleWriter, error)\nrows land under <data_dir>/ticks and <data_dir>/candles,\npartitioned by symbol and UTC date"
+
+  cfg: |md
+    `optionsFromConfig(cfg, dataset)` — **fails closed**
+
+    `flush_interval_seconds` ≤ 0 → error
+    `flush_max_rows` ≤ 0 → error
+    `partition_by` not `""` and not `date` → error
+    `data_dir` empty → `"data"`, as `core/config.Validate` does
+  |
+}
+
+ctor_pos -> core: { style.stroke: "#1976d2" }
+ctor_cfg -> cfg: { style.stroke: "#1976d2" }
+cfg -> core: "Options{Root, MaxRows, FlushInterval}" { style.stroke: "#1976d2" }
+
+# ------------------------------------------------- 2. row type conversion ----
+# The parquet row struct IS the on-disk schema; contracts.Tick and
+# contracts.Candle are the domain types. Both directions are one function and
+# both normalise to UTC Unix milliseconds, per contracts §1.
+rows: "ROW TYPES AND CONVERSION" {
+  class: lib
+
+  c_in: "contracts.Tick / contracts.Candle   →   NewTick / NewCandle\nin: Symbol · Token · Price · Volume · time.Time\nt.Timestamp.UTC().UnixMilli()  —  UTC Unix ms, contracts §1"
+
+  c_out: "Tick / Candle  —  the parquet row struct\nsymbol · timestamp int64 · last_price · volume\nCandle adds open · high · low · close\nContract() returns contracts.Tick / contracts.Candle via\ntime.UnixMilli(t.Timestamp).UTC() — the round trip is lossless\nvar _ RowWriter[Tick] = (*Writer)(nil)\nvar _ RowWriter[Candle] = (*CandleWriter)(nil)"
+}
+
+c_in -> c_out: { style.stroke: "#00897b" }
+c_out -> c_in: { style.stroke: "#00897b" }
+c_out -> c_append: "Append(row T)" { style.stroke: "#f9a825" }
+
+# ------------------------------------------- 3. the writer and its buffer ----
+# Writer and CandleWriter are one-line wrappers over *writer[T]. All mutable
+# state is behind mu.
+core: "writer[T]   —   core/storage/writer.go\nWriter{ w *writer[Tick] }   ·   CandleWriter{ w *writer[Candle] }" { class: go }
+
+c_append: "Append(row T) error\ntakes mu; ErrClosed if closed\nappends to rows; if len(rows) >= maxRows it calls\nflushLocked(context.Background()) BEFORE returning,\nso a filesystem error reaches the caller, not a goroutine"
+
+c_buf: "rows []T   —   process-local buffer, make([]T, 0, maxRows)\nDefaultFlushMaxRows = 10000 when unset\nwritten rows are dropped: rows = rows[:0]"
+
+c_start: "Start(ctx) error\ntakes startMu; ErrClosed if closed;\n'storage: ticks writer already started' if started twice\ngo loop(context.WithCancel(ctx))"
+
+c_loop: "loop(ctx) — the background flusher\nticker every interval (storage.flush_interval_seconds,\nDefaultFlushInterval = 5m when unset)\non <-ctx.Done: one last flushLocked on context.WithoutCancel(ctx),\nso shutdown is never cancelled half-way through a batch"
+
+c_close: "Flush(ctx) error  ·  Close() error — Close is idempotent\nFlush takes mu and returns to the caller. Close sets\nclosed = true under mu, then stop() under startMu, then wg.Wait(),\nthen flushLocked(context.Background()), then returns lastErr —\na background failure a later flush recovered from is reported\nby Err, not here, because the rows did land"
+
+c_observe: "Err() error   ·   Pending() int\nErr is the ONLY way to observe a failure that happened on the\nflusher goroutine rather than on the caller's stack;\nPending() = len(rows), i.e. rows still owed to disk"
+
+c_append -> c_buf: { style.stroke: "#f9a825" }
+c_buf -> c_start: "flush_max_rows reached" { style.stroke: "#f9a825" }
+c_buf -> c_loop: "flush_interval_seconds tick" { style.stroke: "#f9a825" }
+c_buf -> c_close: { style.stroke: "#f9a825" }
+c_start -> c_loop: { style.stroke: "#f9a825" }
+c_loop -> c_close: "flushLocked — the same call" { style.stroke: "#f9a825" }
+c_loop -> c_observe: "record(err) → lastErr" { style.stroke: "#c62828" }
+
+# ------------------------------------------------------- 4. inside flush ----
+flush: |md
+  ### flushLocked(ctx) — the caller must hold `mu`
+
+  `len(w.rows) == 0` → return nil, no file created
+
+  `ctx.Err()` → `storage: flush ticks: context canceled` —
+  aborted before any file exists; rows stay buffered
+
+  public `Flush(ctx)`, `Append` at the row threshold, the loop ticker and
+  `Close` all arrive here
+| {
+  class: lib
+}
+
+f_group: "groupByPartition()\nmap[Partition][]T plus an order slice kept in first-seen order,\nso a flush's output is deterministic"
+
+f_part: "tickPartition(t) / candlePartition(c)   —   w.part(row)\nNewPartition(row.Symbol, time.UnixMilli(row.Timestamp));\nthe key comes from THE ROW, never from configuration —\nthe old writer ignored symbol entirely and wrote one flat dir\n\nPartition.Dir(root) = <root>/symbol=<SYM>/date=<YYYY-MM-DD>\nescapeHiveValue percent-encodes anything outside [A-Za-z0-9._-],\nso a symbol carrying '/' or '=' cannot relocate a dataset"
+
+f_loop: "for i, p := range order  →  writePartition(p, groups[p])\nctx re-checked before every partition"
+
+f_group -> f_part: { style.stroke: "#00897b" }
+f_part -> f_loop: { style.stroke: "#00897b" }
+
+# ------------------------------------------- 5. writePartition, step by step ----
+# Every failure below is wrapped with %w and returned. The old flush() discarded
+# the errors from MkdirAll, Create, Write and Close, so a corrupt batch vanished
+# behind a nil error.
+wp: "writePartition(p Partition, rows []T) error   —   writer.go:295\none partition, one brand-new file, never reopened" {
+  class: store
+
+  w_mkdir: "os.MkdirAll(dir, 0o755)\nerr → 'storage: create partition dir <dir>: %w'"
+
+  w_temp: "os.CreateTemp(dir, inflightPrefix+\"*.parquet\")\nname pattern: <dir>/.inflight-<random>.parquet\nerr → 'storage: create temp parquet in <dir>: %w'\nreaders glob part-*.parquet and never match this"
+
+  w_encode: "encode(f *os.File, rows []T) error   —   the seam\nproduction: parquetEncode[T] — parquet.NewGenericWriter[T],\npw.Write(rows), pw.Close(); BOTH are checked, because a footer\nthat failed to write is an unreadable file"
+
+  w_sync: "file.Sync()  then  file.Close()\nSync err → 'storage: sync <temp> for …: %w'\nClose err → 'storage: close <temp> for …: %w'\nthe file is closed BEFORE the rename, never after"
+
+  w_free: "freePartPath(dir, time.Now())\npart-<ts>.parquet, ts = 20060102T150405.000000000Z, UTC\nos.Lstat(candidate) must return fs.ErrNotExist, else retry with\nts+attempt, up to maxPartNameAttempts = 1024.\nRefusing to reuse a name is guarantee 2: a closed file is never\nopened for writing, let alone overwritten"
+
+  w_rename: "os.Rename(temp, final)   ←   THE INVARIANT\none syscall, same directory, atomic on POSIX: the name\npart-<timestamp>.parquet becomes visible only when it already\nrefers to complete, fsynced bytes.\nTHIS is what lets DuckDB read the tree while ingestion is\nstill writing it — a reader needs no lock, because a published\nfile has no mutable state.\nerr → 'storage: publish <final>: %w'"
+
+  w_dirsync: "syncDir(dir, p)   —   the last step\nos.Open(dir) then d.Sync(), so the rename that published the\npart file survives a crash.\nOpen err and Sync err are both wrapped and returned"
+}
+
+w_mkdir -> w_temp: { style.stroke: "#2e7d32" }
+w_temp -> w_encode: { style.stroke: "#2e7d32" }
+w_encode -> w_sync: { style.stroke: "#2e7d32" }
+w_sync -> w_free: { style.stroke: "#2e7d32" }
+w_free -> w_rename: { style.stroke: "#2e7d32" }
+w_rename -> w_dirsync: { style.stroke: "#2e7d32" }
+
+# ------------------------------------------------- 6. what lands on disk ----
+# The destination of the heaviest edge in the diagram.
+pub: "data/ticks/symbol=<SYMBOL>/date=<YYYY-MM-DD>/part-<timestamp>.parquet\ndata/candles/symbol=<SYMBOL>/date=<YYYY-MM-DD>/part-<timestamp>.parquet\n\nclosed · fsynced · renamed · never opened for writing again\nCandleReader.Glob → '<root>/symbol=<SYM>/date=*/part-*.parquet',\nthe same glob the Python side builds for read_parquet" { class: store }
+
+w_rename -> pub: "THE ATOMIC PUBLISH — a reader can never see a partial file\n'part-*.parquet' matches only finished bytes, so DuckDB reads\nthis tree while ingestion is still flushing into it" {
+  style.stroke: "#2e7d32"
+  style.stroke-width: 8
+  style.bold: true
+}
+
+w_dirsync -> pub: { style.stroke: "#2e7d32" }
+
+# ------------------------------------------------------- 7. failure paths ----
+# Where every error lands. Nothing is swallowed and no row is dropped.
+errs: "ERROR SURFACING   —   the old flush() discarded the errors from\nMkdirAll, Create, Write and Close" {
+  class: bad
+
+  x_surf: |md
+    `lastErr` (guarded by `mu`) — **the single sink**
+
+    set by every failing `writePartition` and by the ctx guard;
+    cleared to nil on a clean `flushLocked`
+
+    `Append` → returns it · `Flush` → returns it
+
+    `Close` → returns it if the *final* flush failed
+
+    `Err()` → the background-goroutine failure, else nil
+
+    every hop uses `%w`, so `errors.Is(err, target)` survives
+  |
+
+  x_cleanup: "cleanup(cause) — failure cleanup on encode / Sync\nfile.Close() and os.Remove(temp), combined with errors.Join,\nfs.ErrNotExist tolerated on Remove, so a failed flush leaves\nNO .inflight-* file behind for a reader to trip over"
+
+  x_retain: "retainUnwritten(order[:i])\nkeeps every row whose partition had not been written yet, in\noriginal order: no loss, no duplicate. The next flush retries\nexactly what is missing"
+
+  x_closed: "ErrClosed = errors.New(\"storage: writer is closed\")\nreturned by Append, Flush and Start once Close has run — never by\nClose itself, which is idempotent"
+
+  x_seam: "encode func(*os.File, []T) error  is a FIELD, not a call site\nproduction always sets parquetEncode[T]; a test swaps in a failing\nclosure and gets a real, asserted Write / Close failure path:\nrows retained, temp removed, zero part files, Err() wrapping the\nsentinel, retry landing exactly once.\nTestable, rather than merely assertable by inspection"
+}
+
+x_retain -> c_buf: "rows stay buffered — Pending() > 0 after the failure" { style.stroke: "#c62828" }
+x_surf -> c_observe: "Err() reads it under mu" { style.stroke: "#c62828" }
+
+# -------------------------------------------------------- 8. concurrency ----
+# Two mutexes with distinct jobs. closed is read by start() and written by
+# close(): reading it there without mu is the race -race caught.
+conc: "LOCKING DISCIPLINE   —   the -race finding" {
+  class: mem
+
+  k_mu: "mu sync.Mutex\nguards rows, closed and lastErr, and is held across the WHOLE\nencode-and-rename, so two flushes cannot interleave, Append\ncannot race a flush, and no closed file is ever reopened.\nthe deliberate price: Append blocks for the length of a\nthreshold flush"
+
+  k_startmu: "startMu sync.Mutex\nguards started, stop and wg — start-once and\nstop-the-flusher only. It does NOT guard closed."
+
+  k_race: "the race -race caught\nstart() read w.closed without holding mu while close()\nwrote it under mu.\nfixed: start() takes mu purely to snapshot\n'closed := w.closed', releases it, then takes startMu.\nTestConcurrentAppendAndFlush: 4 Appenders, 3 flushers, -race"
+}
+
+core -> c_append: { style.stroke: "#1976d2" }
+c_append -> flush: "flush_max_rows" { style.stroke: "#00897b" }
+c_loop -> flush: { style.stroke: "#00897b" }
+c_close -> flush: { style.stroke: "#00897b" }
+k_mu -> c_append: { style.stroke: "#f9a825"; style.stroke-dash: 3 }
+k_mu -> flush: { style.stroke: "#f9a825"; style.stroke-dash: 3 }
+k_startmu -> c_start: { style.stroke: "#f9a825"; style.stroke-dash: 3 }
+k_race -> k_startmu: "snapshot closed under mu" { style.stroke: "#c62828" }
+
+# ---------------------------------------------- failure wiring, one per step ----
+f_loop -> wp: "writePartition err" { style.stroke: "#c62828" }
+f_loop -> x_retain: "writePartition err → keep the rest" { style.stroke: "#c62828" }
+w_mkdir -> x_surf: "%w" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+w_temp -> x_surf: "%w" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+w_encode -> x_cleanup: "encode err" { style.stroke: "#c62828" }
+w_sync -> x_cleanup: "Sync err" { style.stroke: "#c62828" }
+w_free -> x_cleanup: "no free name → remove temp, join" { style.stroke: "#c62828" }
+w_rename -> x_cleanup: "publish err → remove temp, join" { style.stroke: "#c62828" }
+w_dirsync -> x_surf: "%w" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+x_seam -> w_encode: "the injected closure is this field" { style.stroke: "#c62828" }
+c_append -> x_closed: "Append after Close" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+c_close -> x_closed: "Flush / Start after Close" { style.stroke: "#c62828"; style.stroke-dash: 3 }
+
+# --------------------------------------------------------------- footer ----
+src: "Derived from\ncore/storage/storage.go  —  RowWriter, Tick, Candle, NewTick, NewCandle, Contract, Writer, CandleWriter,\nNewWriter, NewWriterFromConfig, NewCandleWriter, NewCandleWriterFromConfig, tickPartition, candlePartition,\noptionsFromConfig, ErrClosed, DefaultFlushInterval, DefaultFlushMaxRows, DateLayout, PartitionByDate\ncore/storage/writer.go  —  writer, newWriter, parquetEncode, append, flushLocked, groupByPartition, retainUnwritten,\nwritePartition, freePartPath, syncDir, start, close, loop, record, inflightPrefix, fileStampLayout, maxPartNameAttempts\ncore/storage/layout.go  —  Options, Partition, NewPartition, Dir, escapeHiveValue, dataDirFor, DatasetRoot\ncore/storage/storage_test.go  —  TestEncodeFailureIsSurfacedAndTempRemoved, TestFailedFlushRetainsRowsAcrossRetry,\nTestConcurrentAppendAndFlush, TestReadWhileWriting, TestClosedFilesAreNeverMutated, TestNoInflightFilesSurvive\ndocs/contracts.md §3, §8   ·   core/config/config.go (StorageConfig)" { class: lib }
