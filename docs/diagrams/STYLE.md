@@ -42,6 +42,23 @@ agent a wasted render.
    an edge between its children. It is cosmetic; do not try to fix it by
    restructuring the diagram.
 8. `font-family` is rejected inside a `classes:` block.
+9. **`style.dashed` does not exist.** Use `style.stroke-dash: 3`.
+10. **Reserved keywords**: `shape` and `label` cannot be used as node names, and
+    `shape` is rejected even as an *edge endpoint* (`decode -> shape` fails with
+    "reserved keywords are prohibited in edges").
+11. **`style.stroke-dash: 3`** rather than dashed lines, and a bare identifier
+    inside a container can silently resolve to a *new* node at root scope. When
+    an edge crosses a container boundary, declare it at root with a qualified
+    id: `storec.has -> fetch`, never inside the container.
+12. **Only the last `edge:` block's label renders.** Earlier captions are
+    silently dropped. Use containers for labelled bands instead.
+13. **`|` is rejected inside an `|md` block**, even in prose — so a code snippet
+    containing a pipe fails to parse. Keep pipes out of markdown labels.
+14. **You cannot attach an attribute block after a `|md` label.**
+    `x: |md … |` followed by `{ class: go }` is a hard parse error. Use a
+    following statement: `x.class: go`.
+15. **A file containing several `edge:` blocks only renders the last block's
+    label.** Container labels are unaffected.
 
 ## The hard rules
 

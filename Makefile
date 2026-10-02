@@ -40,8 +40,8 @@ test:
 PYTEST_PERMITTED := model/tests/test_base.py model/tests/test_heuristic_model.py
 
 test-python:
-	@test -x $(PY) || { echo "run 'make setup' first"; exit 1; }
-	cd $(ROOT)/services/inference && PYTHONPATH=. $(PY) -m pytest app/tests $(PYTEST_PERMITTED) -q
+	@test -x $(ROOT)/$(VENV)/bin/python || { echo "run 'make setup' first"; exit 1; }
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(VENV)/bin/python -m pytest app/tests $(PYTEST_PERMITTED) -q
 
 vet:
 	@for m in $(MODULES); do \
