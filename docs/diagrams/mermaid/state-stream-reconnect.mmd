@@ -1,0 +1,33 @@
+stateDiagram-v2
+    direction TB
+    [*] --> Idle
+
+    Idle --> Preflight: Stream(ctx, symbols)
+    Preflight --> Dialing: ok
+    Preflight --> Failed: ErrAuth / bad config
+
+    Dialing --> Subscribing: handshake ok
+    Dialing --> Backoff: dial refused
+
+    Subscribing --> Reading: subscribe frame sent, mode=full
+    Reading --> Reading: binary LTP frame -> contracts.Tick
+    Reading --> Reading: JSON ping -> pong, refresh read deadline
+
+    Reading --> Backoff: read deadline exceeded
+    Reading --> Stopped: ctx cancelled
+
+    Backoff --> Dialing: delay elapsed (1s 2s 4s 8s 16s 32s 60s 60s...)
+    Backoff --> Stopped: ctx cancelled
+
+    Failed --> [*]
+    Stopped --> [*]
+
+    note right of Reading
+        Deadline refreshes on ANY read.
+        Sequence() survives reconnects.
+    end note
+
+    note right of Backoff
+        Session errors never escape Stream.
+        Pipeline.supervise re-invokes it.
+    end note

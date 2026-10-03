@@ -38,3 +38,6 @@ data/*.duckdb.wal
 docs/diagrams/svg/
 docs/diagrams/explorer.html
 docs/diagrams/explorer.py
+docs/diagrams/mermaid/*.svg
+docs/diagrams/mermaid/*.png
+.mmdcfg.json

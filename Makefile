@@ -3,7 +3,7 @@
 	setup dev stop down status test-python \
 	run-ingestion run-execution run-jobs run-inference \
 	venv inference-deps tabfm-weights \
-	backtest diagrams diagrams-check \
+	backtest diagrams diagrams-check mermaid \
 	wt wt-list wt-remove wt-prune \
 	docker-build docker-up docker-down docker-logs
 
@@ -220,4 +220,28 @@ diagrams-check:
 	done; \
 	rm -rf "$$tmp"; \
 	echo "parsed $$ok, failed $$fail"; \
+	test $$fail -eq 0
+
+# --- mermaid ---------------------------------------------------------------
+# Mermaid renders inline on GitHub with no tooling, which is why the HLD and the
+# sequence/state diagrams live in .mmd as well as D2. This target produces the
+# .svg and .png for anywhere Mermaid cannot render natively.
+
+MERMAID_DIR := docs/diagrams/mermaid
+
+mermaid:
+	@command -v mmdc >/dev/null 2>&1 || { echo "mmdc not installed (npm i -g @mermaid-js/mermaid-cli)"; exit 1; }
+	@ok=0; fail=0; \
+	for f in $$(ls $(MERMAID_DIR)/*.mmd 2>/dev/null); do \
+		name=$$(basename "$$f" .mmd); \
+		if mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.svg" \
+			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null \
+			&& mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.png" \
+			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null; then \
+			ok=$$((ok+1)); \
+		else \
+			echo "FAILED  $$f"; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "rendered $$ok, failed $$fail -> $(MERMAID_DIR)/"; \
 	test $$fail -eq 0
