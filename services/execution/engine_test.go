@@ -3,10 +3,13 @@ package execution
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mft/core/broker"
 	"github.com/mft/core/config"
 	"github.com/mft/core/contracts"
 	"github.com/mft/core/fluxkv"
@@ -21,6 +24,10 @@ var openTime = time.Date(2026, 9, 29, 5, 0, 0, 0, time.UTC)
 
 func testConfig() *config.Config {
 	cfg := &config.Config{}
+	journalDir, _ := os.MkdirTemp("", "mft-execution-test-")
+	cfg.Execution.JournalPath = filepath.Join(journalDir, "state.json")
+	cfg.Execution.PaperTrading = false
+	cfg.Execution.APIToken = "test-token"
 	cfg.Execution.Addr = ":0"
 	cfg.Execution.Capital = 1_000_000
 	cfg.Execution.DebounceTTLSeconds = 300
@@ -40,7 +47,11 @@ func newEngineWithRegistry(t *testing.T, client *countingClient, cfg *config.Con
 	policy := risk.FromConfig(cfg.Execution)
 	policy.Clock = func() time.Time { return now }
 	reg := testutil.NewRegistry()
-	return newEngine(client, fluxkv.New(), cfg, reg, testutil.NewLogger(), policy, policy.Clock), reg
+	engine := newEngine(client, fluxkv.New(), cfg, reg, testutil.NewLogger(), policy, policy.Clock)
+	// Unit tests exercise submission paths directly; Fx startup performs the
+	// real broker reconciliation before setting this flag in production.
+	engine.ready = true
+	return engine, reg
 }
 
 // rejectionCount reads one label of the reason-code counter vec.
@@ -51,7 +62,7 @@ func rejectionCount(t *testing.T, reg *prometheus.Registry, reason string) int {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, f := range families {
-		if f.GetName() != "execution_rejections_total" {
+		if f.GetName() != "mft_execution_rejections_total" {
 			continue
 		}
 		for _, m := range f.GetMetric() {
@@ -84,23 +95,121 @@ func validSignal(mutators ...func(*contracts.Signal)) contracts.Signal {
 // countingClient records every PlaceOrder call. The risk tests need the exact
 // call count, which testutil.MockClient only gives indirectly by slicing.
 type countingClient struct {
-	mu     sync.Mutex
-	calls  int
-	orders []testutil.OrderCall
-	err    error
+	mu          sync.Mutex
+	calls       int
+	orders      []testutil.OrderCall
+	err         error
+	states      map[string]broker.Order
+	state       broker.OrderState
+	acceptedErr error
+	started     chan struct{}
+	release     chan struct{}
+	quoteCalls  int
+	quoteErr    error
 }
 
-func (c *countingClient) PlaceOrder(_ context.Context, symbol, side string, quantity int, price float64) (string, error) {
+func (c *countingClient) PlaceOrder(ctx context.Context, req contracts.OrderRequest) (string, error) {
+	return c.place(ctx, req, "")
+}
+
+func (c *countingClient) PlaceOrderTagged(ctx context.Context, req contracts.OrderRequest, tag string) (string, error) {
+	return c.place(ctx, req, tag)
+}
+
+func (c *countingClient) place(_ context.Context, req contracts.OrderRequest, tag string) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.err != nil {
+		c.mu.Unlock()
 		return "", c.err
 	}
 	c.calls++
 	c.orders = append(c.orders, testutil.OrderCall{
-		Symbol: symbol, Side: side, Quantity: quantity, Price: price,
+		Symbol: req.Symbol, Side: req.Side, Quantity: req.Quantity, Price: req.Price,
 	})
-	return "mock-order", nil
+	if c.states == nil {
+		c.states = make(map[string]broker.Order)
+	}
+	state := c.state
+	if state == "" {
+		state = broker.OrderFilled
+	}
+	filled := 0
+	if state == broker.OrderFilled {
+		filled = req.Quantity
+	}
+	avg := req.Price
+	if avg == 0 {
+		avg = 1000
+	}
+	orderID := "mock-order"
+	c.states[orderID] = broker.Order{ID: orderID, Tag: tag, Status: state, Symbol: req.Symbol, Side: req.Side, Quantity: req.Quantity, Price: req.Price, FilledQuantity: filled, AverageFillPrice: avg, UpdatedAt: openTime}
+	started, release, acceptedErr := c.started, c.release, c.acceptedErr
+	c.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	if acceptedErr != nil {
+		return "", acceptedErr
+	}
+	return orderID, nil
+}
+
+func (c *countingClient) CancelOrder(context.Context, string) error { return nil }
+func (c *countingClient) GetPositions(context.Context) ([]contracts.Position, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	quantities := map[string]int{}
+	for _, o := range c.states {
+		if o.FilledQuantity > 0 {
+			q := o.FilledQuantity
+			if o.Side == contracts.SideSell {
+				q = -q
+			}
+			quantities[o.Symbol] += q
+		}
+	}
+	var out []contracts.Position
+	for symbol, quantity := range quantities {
+		if quantity != 0 {
+			out = append(out, contracts.Position{Symbol: symbol, Quantity: quantity})
+		}
+	}
+	return out, nil
+}
+func (c *countingClient) GetOrder(_ context.Context, id string) (broker.Order, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	o, ok := c.states[id]
+	if !ok {
+		return broker.Order{}, errors.New("unknown order")
+	}
+	return o, nil
+}
+func (c *countingClient) GetOrders(context.Context) ([]broker.Order, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]broker.Order, 0, len(c.states))
+	for _, o := range c.states {
+		out = append(out, o)
+	}
+	return out, nil
+}
+func (c *countingClient) GetLastPrices(_ context.Context, symbols []string) (map[string]float64, error) {
+	c.mu.Lock()
+	c.quoteCalls++
+	err := c.quoteErr
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	prices := make(map[string]float64, len(symbols))
+	for _, symbol := range symbols {
+		prices[symbol] = 1000
+	}
+	return prices, nil
 }
 
 func (c *countingClient) count() int {
@@ -122,6 +231,90 @@ func TestExecuteSignalPlacesOrder(t *testing.T) {
 	}
 	if client.count() != 1 {
 		t.Fatalf("broker called %d times, want 1", client.count())
+	}
+}
+
+func TestPaperModeBooksSimulatedFillWithoutBrokerCall(t *testing.T) {
+	client := &countingClient{quoteErr: errors.New("quotes offline")}
+	cfg := testConfig()
+	cfg.Execution.PaperTrading = true
+	policy := risk.FromConfig(cfg.Execution)
+	policy.Clock = func() time.Time { return openTime }
+	engine, err := buildEngine(client, fluxkv.New(), cfg, testutil.NewRegistry(), testutil.NewLogger(), policy, policy.Clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
+		t.Fatal(err)
+	}
+	if client.count() != 0 {
+		t.Fatalf("paper mode sent %d broker orders", client.count())
+	}
+	if got := engine.OrderStatus("RELIANCE:BUY:20260929T1031"); got.Status != contracts.OrderStatusPaperFilled || got.FilledQuantity != 10 {
+		t.Fatalf("paper order result = %+v", got)
+	}
+	stale := validSignal(func(s *contracts.Signal) { s.AsOf = openTime.Add(-24 * time.Hour) })
+	if _, err := engine.ExecuteSignal(context.Background(), stale); err == nil {
+		t.Fatal("duplicate request should still report the existing claim")
+	} else if rej, ok := err.(*contracts.Rejection); !ok || rej.Code != contracts.ReasonDuplicate {
+		t.Fatalf("duplicate error = %T(%v), want duplicate rejection", err, err)
+	}
+	client.mu.Lock()
+	quoteCalls := client.quoteCalls
+	client.mu.Unlock()
+	if quoteCalls != 0 {
+		t.Fatalf("paper execution made %d quote calls, want none", quoteCalls)
+	}
+}
+
+func TestReconcileRunsIdempotentExitPolicyAfterLossLimit(t *testing.T) {
+	client := &countingClient{}
+	cfg := testConfig()
+	cfg.Execution.PaperTrading = true
+	cfg.Execution.MaxDrawdownPct = 1
+	cfg.Execution.DailyLossLimit = 100
+	policy := risk.FromConfig(cfg.Execution)
+	policy.Clock = func() time.Time { return openTime }
+	engine, err := buildEngine(client, fluxkv.New(), cfg, testutil.NewRegistry(), testutil.NewLogger(), policy, policy.Clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	book := risk.NewBook(cfg.Execution.Capital)
+	if err := book.ApplyFill(contracts.Signal{Symbol: "RELIANCE", Side: contracts.SideBuy}, 100, 1000, openTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.ApplyFill(contracts.Signal{Symbol: "RELIANCE", Side: contracts.SideSell}, 10, 500, openTime); err != nil {
+		t.Fatal(err)
+	}
+	engine.book = book
+	policyCalls := 0
+	engine.SetExitPolicy(ExitPolicyFunc(func(_ context.Context, p contracts.Portfolio) ([]contracts.OrderRequest, error) {
+		policyCalls++
+		if policyCalls == 1 && p.OpenPositions["RELIANCE"] != 90 {
+			t.Fatalf("exit policy saw %d shares, want 90", p.OpenPositions["RELIANCE"])
+		}
+		return []contracts.OrderRequest{{
+			Symbol: "RELIANCE", Side: contracts.SideSell, Quantity: 1,
+			Price: 500, Type: contracts.OrderTypeLimit, IdempotencyKey: "strategy:exit:RELIANCE:1",
+		}}, nil
+	}))
+	if err := engine.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile/exit failed: %v", err)
+	}
+	result := engine.OrderStatus("strategy:exit:RELIANCE:1")
+	if result.Status != contracts.OrderStatusPaperFilled || result.FilledQuantity != 1 {
+		t.Fatalf("exit result = %+v", result)
+	}
+	if err := engine.Reconcile(context.Background()); err != nil {
+		t.Fatalf("repeat reconcile failed: %v", err)
+	}
+	if got := engine.Portfolio().OpenPositions["RELIANCE"]; got != 89 {
+		t.Fatalf("repeated exit policy changed position to %d, want 89", got)
+	}
+	if client.count() != 0 {
+		t.Fatalf("paper exit called broker %d times", client.count())
 	}
 }
 
@@ -155,6 +348,29 @@ func TestExecuteSignalIdempotent(t *testing.T) {
 	}
 }
 
+func TestDebounceReservationSurvivesRestart(t *testing.T) {
+	client := &countingClient{}
+	cfg := testConfig()
+	engine, _ := newEngineWithRegistry(t, client, cfg, openTime)
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, _ := newEngineWithRegistry(t, client, cfg, openTime)
+	defer restarted.Close()
+	sig := validSignal(func(s *contracts.Signal) { s.IdempotencyKey = "different-key-same-decision" })
+	_, err := restarted.ExecuteSignal(context.Background(), sig)
+	var rejection *contracts.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != contracts.ReasonDebounced {
+		t.Fatalf("error = %v, want restored debounce rejection", err)
+	}
+	if client.count() != 1 {
+		t.Fatalf("broker placements after restart = %d, want 1", client.count())
+	}
+}
+
 // TestExecuteSignalIdempotentConcurrent proves the exactly-once property holds
 // when a retry storm arrives in parallel, not just sequentially.
 func TestExecuteSignalIdempotentConcurrent(t *testing.T) {
@@ -178,9 +394,8 @@ func TestExecuteSignalIdempotentConcurrent(t *testing.T) {
 		t.Fatalf("broker called %d times for one key under %d concurrent retries, want 1", client.count(), racers)
 	}
 
-	// Exactly one racer wins the key; every other one is told it is a
-	// duplicate and is handed the winner's order id. The winner is whatever
-	// the broker returned, since the losers are defined by comparison to it.
+	// Exactly one racer wins the key. A loser that arrives before the broker
+	// acknowledges sees a truthful empty order id and SUBMITTING state.
 	winner := ""
 	for _, err := range errs {
 		if err == nil {
@@ -195,8 +410,8 @@ func TestExecuteSignalIdempotentConcurrent(t *testing.T) {
 		if !errors.As(err, &rej) || rej.Code != contracts.ReasonDuplicate {
 			t.Fatalf("goroutine %d error = %v, want a RISK_DUPLICATE rejection", i, err)
 		}
-		if orderIDs[i] != winner {
-			t.Fatalf("goroutine %d got order %q, want the winner's %q", i, orderIDs[i], winner)
+		if orderIDs[i] != "" && orderIDs[i] != winner {
+			t.Fatalf("goroutine %d got order %q, want pending or the winner's %q", i, orderIDs[i], winner)
 		}
 	}
 }
@@ -307,7 +522,7 @@ func TestExecuteSignalRejectedNeverReachesBroker(t *testing.T) {
 				cache.Set(tc.preArm, "mock-order", time.Hour)
 			}
 			if tc.preClaim != "" {
-				cache.Set("IDEM:"+tc.preClaim, "mock-order", time.Hour)
+				engine.state.Orders[tc.name+":key"] = OrderRecord{Key: tc.name + ":key", OrderID: "prior", Status: contracts.OrderStatusFilled, CreatedAt: now}
 			}
 
 			before := client.count()
@@ -384,7 +599,7 @@ func TestExecuteSignalDebounceIsPerSide(t *testing.T) {
 	}
 }
 
-func TestExecuteSignalBrokerErrorLeavesNoClaim(t *testing.T) {
+func TestExecuteSignalBrokerErrorFailsClosed(t *testing.T) {
 	client := &countingClient{err: errors.New("broker down")}
 	engine, reg := newEngineWithRegistry(t, client, testConfig(), openTime)
 
@@ -393,18 +608,19 @@ func TestExecuteSignalBrokerErrorLeavesNoClaim(t *testing.T) {
 		t.Fatal("a broker failure must propagate")
 	}
 
-	// The failed attempt must not have claimed the key or armed the debounce:
-	// a retry after the broker recovers has to be able to place the order.
+	// A network error may hide an accepted order. The stable key stays claimed
+	// and readiness remains closed until reconciliation resolves it.
 	client.err = nil
-	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
-		t.Fatalf("retry after a broker failure error = %v, want success", err)
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err == nil {
+		t.Fatal("retry after an indeterminate broker failure must fail closed")
 	}
-	if client.count() != 1 {
-		t.Fatalf("broker called %d times, want 1", client.count())
+	if client.count() != 0 {
+		t.Fatalf("broker calls = %d, want no accepted placement", client.count())
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg, nil); got != 1 {
-		t.Fatalf("orders_placed_total = %d, want 1", got)
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg, nil); got != 0 {
+		t.Fatalf("orders_placed_total = %d, want 0", got)
 	}
+	_ = reg
 }
 
 // TestExecuteSignalRejectionMetrics asserts the reason-code counter vec is
@@ -424,10 +640,10 @@ func TestExecuteSignalRejectionMetrics(t *testing.T) {
 	if got := rejectionCount(t, reg, contracts.ReasonDuplicate); got != 1 {
 		t.Fatalf("%s = %d, want 1", contracts.ReasonDuplicate, got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_rejected_total", reg, nil); got != 1 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_rejected_total", reg, nil); got != 1 {
 		t.Fatalf("orders_rejected_total = %d, want 1", got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg, nil); got != 1 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg, nil); got != 1 {
 		t.Fatalf("orders_placed_total = %d, want 1", got)
 	}
 
@@ -439,7 +655,7 @@ func TestExecuteSignalRejectionMetrics(t *testing.T) {
 	if got := rejectionCount(t, reg2, contracts.ReasonMarketClosed); got != 1 {
 		t.Fatalf("%s = %d, want 1", contracts.ReasonMarketClosed, got)
 	}
-	if got := testutil.MetricValue(t, "execution_orders_placed_total", reg2, nil); got != 0 {
+	if got := testutil.MetricValue(t, "mft_execution_orders_placed_total", reg2, nil); got != 0 {
 		t.Fatalf("orders_placed_total = %d, want 0", got)
 	}
 }
@@ -461,8 +677,8 @@ func TestExecuteSignalMaintainsPortfolio(t *testing.T) {
 	if p.OpenPositions["RELIANCE"] != 10 {
 		t.Fatalf("positions after buy = %+v, want RELIANCE 10", p.OpenPositions)
 	}
-	if p.Cash != 1_000_000 {
-		t.Fatalf("account cash after buy = %v, want 1000000", p.Cash)
+	if p.Cash != 990_000 {
+		t.Fatalf("account cash after buy = %v, want 990000", p.Cash)
 	}
 	if p.PeakEquity != 1_000_000 {
 		t.Fatalf("peak equity after buy = %v, want 1000000", p.PeakEquity)
@@ -490,6 +706,236 @@ func TestExecuteSignalMaintainsPortfolio(t *testing.T) {
 	}
 	if p.PeakEquity != 1_001_000 {
 		t.Fatalf("peak equity = %v, want 1001000", p.PeakEquity)
+	}
+}
+
+func TestAcknowledgementReservesUntilFill(t *testing.T) {
+	client := &countingClient{state: broker.OrderOpen}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	id, err := engine.ExecuteSignal(context.Background(), validSignal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.OrderStatus("RELIANCE:BUY:20260929T1031"); got.Status != contracts.OrderStatusOpen || got.FilledQuantity != 0 || got.OrderID != id {
+		t.Fatalf("order result = %+v, want acknowledged OPEN with no fill", got)
+	}
+	p := engine.Portfolio()
+	if p.Cash != 1_000_000 || p.OpenPositions["RELIANCE"] != 0 || p.ReservedCash != 10_000 || p.ReservedPositions["RELIANCE"] != 10 {
+		t.Fatalf("portfolio after broker acknowledgement = %+v", p)
+	}
+}
+
+func TestUnknownBrokerStateIsReportedAsIndeterminate(t *testing.T) {
+	client := &countingClient{state: broker.OrderUnknown}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	_, err := engine.ExecuteSignal(context.Background(), validSignal())
+	var indeterminate *IndeterminateError
+	if !errors.As(err, &indeterminate) {
+		t.Fatalf("error = %v, want indeterminate", err)
+	}
+	if got := engine.OrderStatus("RELIANCE:BUY:20260929T1031").Status; got != contracts.OrderStatusUnknown {
+		t.Fatalf("status = %s", got)
+	}
+	if ready, _ := engine.Ready(); ready {
+		t.Fatal("unknown broker state left engine ready")
+	}
+}
+
+func TestPartialFillThenCancelReleasesOnlyUnfilledReservation(t *testing.T) {
+	client := &countingClient{state: broker.OrderPartial}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	o := client.states["mock-order"]
+	o.FilledQuantity, o.AverageFillPrice = 4, 1000
+	client.states[o.ID] = o
+	client.mu.Unlock()
+	if err := engine.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p := engine.Portfolio()
+	if p.OpenPositions["RELIANCE"] != 4 || p.Cash != 996_000 || p.ReservedCash != 6_000 || p.ReservedPositions["RELIANCE"] != 6 {
+		t.Fatalf("portfolio after partial fill = %+v", p)
+	}
+	client.mu.Lock()
+	o.Status = broker.OrderCancelled
+	client.states[o.ID] = o
+	client.mu.Unlock()
+	if err := engine.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec := engine.state.Orders["RELIANCE:BUY:20260929T1031"]
+	client.mu.Lock()
+	delayedOpen := client.states[rec.OrderID]
+	delayedOpen.Status = broker.OrderOpen
+	client.mu.Unlock()
+	if err := engine.applyBrokerOrder("RELIANCE:BUY:20260929T1031", delayedOpen); err != nil {
+		t.Fatal(err)
+	}
+	p = engine.Portfolio()
+	if p.OpenPositions["RELIANCE"] != 4 || p.ReservedCash != 0 || p.ReservedPositions["RELIANCE"] != 0 || engine.OrderStatus("RELIANCE:BUY:20260929T1031").Status != contracts.OrderStatusCancelled {
+		t.Fatalf("portfolio/order after cancellation = %+v / %+v", p, engine.OrderStatus("RELIANCE:BUY:20260929T1031"))
+	}
+}
+
+func TestBrokerUpdatesCannotDowngradeTerminalStatus(t *testing.T) {
+	client := &countingClient{state: broker.OrderFilled}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	key := "RELIANCE:BUY:20260929T1031"
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
+		t.Fatal(err)
+	}
+	rec := engine.state.Orders[key]
+	staleOpen := broker.Order{ID: rec.OrderID, Tag: rec.Tag, Status: broker.OrderOpen,
+		Symbol: rec.Request.Symbol, Side: rec.Request.Side, Quantity: rec.Request.Quantity,
+		FilledQuantity: rec.Request.Quantity, AverageFillPrice: 1000, UpdatedAt: openTime}
+	if err := engine.applyBrokerOrder(key, staleOpen); err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.OrderStatus(key); got.Status != contracts.OrderStatusFilled {
+		t.Fatalf("stale OPEN downgraded FILLED: %+v", got)
+	}
+}
+
+func TestBrokerCannotMarkPartialOrderFilledOrReduceCumulativeNotional(t *testing.T) {
+	client := &countingClient{state: broker.OrderPartial}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	key := "RELIANCE:BUY:20260929T1031"
+	if _, err := engine.ExecuteSignal(context.Background(), validSignal()); err != nil {
+		t.Fatal(err)
+	}
+	rec := engine.state.Orders[key]
+	partial := broker.Order{ID: rec.OrderID, Tag: rec.Tag, Status: broker.OrderPartial,
+		Symbol: rec.Request.Symbol, Side: rec.Request.Side, Quantity: rec.Request.Quantity,
+		FilledQuantity: 4, AverageFillPrice: 1000, UpdatedAt: openTime}
+	if err := engine.applyBrokerOrder(key, partial); err != nil {
+		t.Fatal(err)
+	}
+	partial.FilledQuantity = 3
+	if err := engine.applyBrokerOrder(key, partial); err == nil {
+		t.Fatal("decreasing cumulative fill quantity was accepted")
+	}
+	partial.FilledQuantity = 4
+	partial.Status = broker.OrderFilled
+	if err := engine.applyBrokerOrder(key, partial); err == nil {
+		t.Fatal("incomplete cumulative quantity was accepted as FILLED")
+	}
+	partial.Status = broker.OrderPartial
+	partial.FilledQuantity = 5
+	partial.AverageFillPrice = 700 // cumulative notional falls from 4,000 to 3,500
+	if err := engine.applyBrokerOrder(key, partial); err == nil {
+		t.Fatal("decreasing cumulative notional was accepted")
+	}
+	if got := engine.Portfolio().OpenPositions["RELIANCE"]; got != 4 {
+		t.Fatalf("invalid broker update changed held quantity to %d, want 4", got)
+	}
+	if got := engine.OrderStatus(key); got.Status != contracts.OrderStatusPartial || got.FilledQuantity != 4 {
+		t.Fatalf("invalid broker update changed order state: %+v", got)
+	}
+}
+
+func TestRejectedOrderReleasesCashAndDebounceReservation(t *testing.T) {
+	client := &countingClient{state: broker.OrderRejected}
+	engine, _ := newEngineWithRegistry(t, client, testConfig(), openTime)
+	first := validSignal(func(s *contracts.Signal) { s.IdempotencyKey = "rejected-first" })
+	if _, err := engine.ExecuteSignal(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if got := engine.OrderStatus(first.IdempotencyKey); got.Status != contracts.OrderStatusRejected {
+		t.Fatalf("first status = %+v", got)
+	}
+	p := engine.Portfolio()
+	if p.ReservedCash != 0 || p.OpenPositions["RELIANCE"] != 0 {
+		t.Fatalf("rejected order retained reservation: %+v", p)
+	}
+	client.state = broker.OrderFilled
+	second := validSignal(func(s *contracts.Signal) { s.IdempotencyKey = "rejected-retry" })
+	if _, err := engine.ExecuteSignal(context.Background(), second); err != nil {
+		t.Fatalf("retry after definitive broker rejection: %v", err)
+	}
+	if client.count() != 2 {
+		t.Fatalf("broker placements = %d, want 2", client.count())
+	}
+}
+
+func TestAcceptedButTimedOutReconcilesByDurableTag(t *testing.T) {
+	client := &countingClient{acceptedErr: errors.New("reply lost after broker acceptance")}
+	cfg := testConfig()
+	policy := risk.FromConfig(cfg.Execution)
+	policy.Clock = func() time.Time { return openTime }
+	engine, err := buildEngine(client, fluxkv.New(), cfg, testutil.NewRegistry(), testutil.NewLogger(), policy, policy.Clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	key := "timeout-key"
+	sig := validSignal(func(s *contracts.Signal) { s.IdempotencyKey = key })
+	if _, err := engine.ExecuteSignal(context.Background(), sig); err == nil {
+		t.Fatal("lost broker reply must be reported as indeterminate")
+	}
+	if ready, _ := engine.Ready(); ready {
+		t.Fatal("engine became ready with unresolved submission")
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := buildEngine(client, fluxkv.New(), cfg, testutil.NewRegistry(), testutil.NewLogger(), policy, policy.Clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if ready, _ := recovered.Ready(); ready {
+		t.Fatal("restart became ready before broker reconciliation")
+	}
+	if err := recovered.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := recovered.OrderStatus(key); got.Status != contracts.OrderStatusFilled || got.FilledQuantity != 10 {
+		t.Fatalf("reconciled result = %+v, record=%+v, broker=%+v", got, recovered.state.Orders[key], client.states)
+	}
+	if _, err := recovered.ExecuteSignal(context.Background(), sig); err == nil {
+		t.Fatal("replay after recovery must be rejected as duplicate")
+	}
+	if ready, reason := recovered.Ready(); !ready {
+		t.Fatalf("engine remains unready: %s", reason)
+	}
+	if client.count() != 1 {
+		t.Fatalf("broker placement calls = %d, want exactly 1", client.count())
+	}
+}
+
+func TestConcurrentReservationProtectsAvailableCash(t *testing.T) {
+	client := &countingClient{started: make(chan struct{}, 1), release: make(chan struct{})}
+	cfg := testConfig()
+	cfg.Execution.Capital = 10_000
+	cfg.Execution.MaxPositionPct = 100
+	engine, _ := newEngineWithRegistry(t, client, cfg, openTime)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := engine.ExecuteSignal(context.Background(), validSignal(func(s *contracts.Signal) { s.Quantity = 6; s.Price = 1000; s.IdempotencyKey = "reserve-a" }))
+		firstDone <- err
+	}()
+	<-client.started
+	_, err := engine.ExecuteSignal(context.Background(), validSignal(func(s *contracts.Signal) {
+		s.Symbol = "TCS"
+		s.Quantity = 6
+		s.Price = 1000
+		s.IdempotencyKey = "reserve-b"
+	}))
+	var rejection *contracts.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != contracts.ReasonMaxPosition {
+		t.Fatalf("second order error = %v, want cash rejection", err)
+	}
+	close(client.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if client.count() != 1 {
+		t.Fatalf("broker calls = %d, want 1", client.count())
 	}
 }
 
@@ -554,10 +1000,29 @@ func TestExecuteSignalMalformed(t *testing.T) {
 			if client.count() != 0 {
 				t.Fatalf("broker was called %d times, want 0", client.count())
 			}
-			if got := testutil.MetricValue(t, "execution_orders_rejected_total", reg, nil); got != 1 {
+			if got := testutil.MetricValue(t, "mft_execution_orders_rejected_total", reg, nil); got != 1 {
 				t.Fatalf("orders_rejected_total = %d, want 1", got)
 			}
 		})
+	}
+}
+
+func TestExecuteSignalRejectsStaleTimestamp(t *testing.T) {
+	client := &countingClient{}
+	cfg := testConfig()
+	cfg.Execution.MaxSignalAgeSeconds = 60
+	engine, reg := newEngineWithRegistry(t, client, cfg, openTime)
+	sig := validSignal(func(s *contracts.Signal) { s.AsOf = openTime.Add(-time.Minute - time.Second) })
+	_, err := engine.ExecuteSignal(context.Background(), sig)
+	var rejection *contracts.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != contracts.ReasonStaleSignal {
+		t.Fatalf("error = %v, want stale signal rejection", err)
+	}
+	if client.count() != 0 {
+		t.Fatalf("stale request reached broker %d times", client.count())
+	}
+	if got := rejectionCount(t, reg, contracts.ReasonStaleSignal); got != 1 {
+		t.Fatalf("stale rejection count = %d, want 1", got)
 	}
 }
 
@@ -624,12 +1089,12 @@ func seedLong(symbol string, quantity int, price float64) func(float64) *risk.Bo
 func seedLoss(symbol string, quantity, buyPrice, sellPrice int) func(float64) *risk.Book {
 	return func(capital float64) *risk.Book {
 		book := risk.NewBook(capital)
-		mustBookApply(book, contracts.Signal{
-			Symbol: symbol, Side: contracts.SideBuy, Quantity: quantity, Price: float64(buyPrice),
-		})
-		mustBookApply(book, contracts.Signal{
-			Symbol: symbol, Side: contracts.SideSell, Quantity: quantity, Price: float64(sellPrice),
-		})
+		if err := book.ApplyFill(contracts.Signal{Symbol: symbol, Side: contracts.SideBuy}, quantity, float64(buyPrice), openTime); err != nil {
+			panic(err)
+		}
+		if err := book.ApplyFill(contracts.Signal{Symbol: symbol, Side: contracts.SideSell}, quantity, float64(sellPrice), openTime); err != nil {
+			panic(err)
+		}
 		return book
 	}
 }

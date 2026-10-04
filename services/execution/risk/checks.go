@@ -10,16 +10,7 @@ import (
 	"github.com/mft/core/contracts"
 )
 
-// MaxPositionCheck enforces |quantity * price| <= max_position_pct% of
-// equity, and refuses an order larger than the entire account. A zero MaxPct
-// disables the cap.
-//
-// The cash bound is a sanity net, not the affordability policy: the cash in
-// contracts.Portfolio is total account cash, including notional still deployed
-// in open positions (see Book), so this only catches an order bigger than
-// everything the account owns. The real aggregate bound is this cap times
-// max_open_positions — 100% of equity under the default config — and the
-// free-cash guard is Book.Apply, which refuses to record a buy it cannot fund.
+// MaxPositionCheck enforces a per-symbol marked exposure cap and available-cash bound.
 type MaxPositionCheck struct {
 	MaxPct float64
 }
@@ -36,26 +27,19 @@ func (c MaxPositionCheck) Check(_ context.Context, sig contracts.Signal, portfol
 			fmt.Sprintf("equity %.2f is not positive; refusing to size an order", equity))
 	}
 	limit := equity * c.MaxPct / 100
-	if notional > limit {
+	current := portfolio.PositionValues[sig.Symbol] + portfolio.ReservedValues[sig.Symbol]
+	if sig.Side == contracts.SideBuy && current+notional > limit {
 		return contracts.Reject(contracts.ReasonMaxPosition,
-			fmt.Sprintf("order value %.0f exceeds %.2f%% of equity %.0f", notional, c.MaxPct, equity))
+			fmt.Sprintf("position value %.0f including order %.0f exceeds %.2f%% of equity %.0f", current, notional, c.MaxPct, equity))
 	}
-	if sig.Side == contracts.SideBuy && notional > portfolio.Cash {
+	if sig.Side == contracts.SideBuy && notional > portfolio.Cash-portfolio.ReservedCash {
 		return contracts.Reject(contracts.ReasonMaxPosition,
-			fmt.Sprintf("order value %.0f exceeds account cash %.0f", notional, portfolio.Cash))
+			fmt.Sprintf("order value %.0f exceeds available cash %.0f", notional, portfolio.Cash-portfolio.ReservedCash))
 	}
 	return nil
 }
 
-// MaxPositionsCheck enforces the open-position count. A zero Max disables the
-// cap.
-//
-// The contract states the bound as len(OpenPositions) <= max_open_positions,
-// evaluated before the order lands. Read literally that admits one more than
-// the limit, because a count of exactly the limit still passes and then grows.
-// This check counts the position the signal would create, so a signal for a
-// symbol already held adds nothing and a signal for a new symbol must fit
-// inside the limit. That is the same formula, never more permissive.
+// MaxPositionsCheck enforces the open-position count.
 type MaxPositionsCheck struct {
 	Max int
 }
@@ -67,7 +51,10 @@ func (c MaxPositionsCheck) Check(_ context.Context, sig contracts.Signal, portfo
 	}
 	held := portfolio.OpenPositions[sig.Symbol]
 	prospective := len(portfolio.OpenPositions)
-	if held == 0 {
+	if portfolio.ReservedPositions[sig.Symbol] > 0 && held == 0 {
+		prospective++
+	}
+	if held == 0 && portfolio.ReservedPositions[sig.Symbol] == 0 {
 		prospective++
 	}
 	if prospective > c.Max {
@@ -77,12 +64,7 @@ func (c MaxPositionsCheck) Check(_ context.Context, sig contracts.Signal, portfo
 	return nil
 }
 
-// DrawdownCheck enforces (peak - equity) / peak <= max_drawdown_pct. A zero
-// MaxPct disables the cap.
-//
-// A non-positive peak means the account never had a positive high-water mark;
-// the ratio is undefined there, and an undefined risk limit is not a limit, so
-// the signal is refused.
+// DrawdownCheck enforces (peak - equity) / peak <= max_drawdown_pct.
 type DrawdownCheck struct {
 	MaxPct float64
 }
@@ -106,9 +88,7 @@ func (c DrawdownCheck) Check(_ context.Context, _ contracts.Signal, portfolio co
 	return nil
 }
 
-// DailyLossCheck enforces realised PnL >= -daily_loss_limit. A non-positive
-// Limit means no daily loss cap, which is how a config that never set
-// daily_loss_limit reads.
+// DailyLossCheck enforces realised PnL >= -daily_loss_limit.
 type DailyLossCheck struct {
 	Limit float64
 }
@@ -118,23 +98,20 @@ func (c DailyLossCheck) Check(_ context.Context, _ contracts.Signal, portfolio c
 	if c.Limit <= 0 {
 		return nil
 	}
-	if portfolio.RealisedPnL < -c.Limit {
+	if portfolio.RealisedPnLToday < -c.Limit {
 		return contracts.Reject(contracts.ReasonDailyLoss,
-			fmt.Sprintf("realised PnL %.2f breaches the daily loss limit of %.2f", portfolio.RealisedPnL, c.Limit))
+			fmt.Sprintf("today's realised PnL %.2f breaches the daily loss limit of %.2f", portfolio.RealisedPnLToday, c.Limit))
 	}
 	return nil
 }
 
-// DebounceKey returns the fluxKV key that arms the debounce for one
-// symbol/side pair, as fixed by docs/contracts.md §6.
+// DebounceKey returns the fluxKV key that arms the debounce for one symbol/side pair,
+// as fixed by docs/contracts.md §6.
 func DebounceKey(symbol, side string) string {
 	return fmt.Sprintf("EXEC:%s:%s", symbol, side)
 }
 
-// DebounceCheck refuses a signal for a symbol/side pair that already has an
-// order inside the TTL window. Reading is all this check does: the engine arms
-// the key after a successful placement, so a refused signal or a failed broker
-// call never starts a window it cannot honour.
+// DebounceCheck refuses a symbol/side pair already claimed during the TTL window.
 type DebounceCheck struct {
 	Store TTLStore
 	TTL   time.Duration
@@ -153,14 +130,9 @@ func (c DebounceCheck) Check(_ context.Context, sig contracts.Signal, _ contract
 	return nil
 }
 
-// QuantityCheck enforces 1 <= quantity <= max_order_quantity, that quantity is
-// a whole multiple of the symbol's lot size, and that the engine holds a long
-// position large enough to sell.
-//
-// The sell bound is a platform limit, not a margin decision: v1 trades
-// long-only cash equity and a SELL beyond the holding is a short, which the
-// execution engine cannot price or square. Refusing it here means it can never
-// reach the broker. A zero MaxQuantity disables the upper bound only.
+// QuantityCheck enforces 1 <= quantity <= max_order_quantity, that quantity is a whole
+// multiple of the symbol's lot size, and that the engine holds a long position large
+// enough to sell.
 type QuantityCheck struct {
 	MaxQuantity int
 	LotSizes    map[string]int
@@ -185,7 +157,7 @@ func (c QuantityCheck) Check(_ context.Context, sig contracts.Signal, portfolio 
 			fmt.Sprintf("quantity %d is not a multiple of lot size %d for %s", sig.Quantity, lot, sig.Symbol))
 	}
 	if sig.Side == contracts.SideSell {
-		held := portfolio.OpenPositions[sig.Symbol]
+		held := portfolio.OpenPositions[sig.Symbol] - portfolio.ReservedSells[sig.Symbol]
 		if sig.Quantity > held {
 			return contracts.Reject(contracts.ReasonBadQuantity,
 				fmt.Sprintf("sell %d %s exceeds the long position of %d; shorting is not supported", sig.Quantity, sig.Symbol, held))
@@ -203,16 +175,9 @@ func (c QuantityCheck) lotSize(symbol string) int {
 	return 1
 }
 
-// ValidateSignal reports whether a signal is well-formed enough to be risk
-// checked at all: a symbol, a known side, a positive reference price, and a
-// non-empty idempotency key. These are transport-level faults rather than
-// policy decisions, so they return a plain error and no Rejection — there is
-// no reason code for a malformed request, and inventing one would put an
-// undeclared value in the rejection metric.
-//
-// The idempotency key is required. Inference retries, and a signal without a
-// key cannot be made idempotent, so the engine refuses it rather than placing
-// an order it could place twice.
+// ValidateSignal reports whether a signal is well-formed enough to be risk checked at
+// all: a symbol, a known side, a positive reference price, and a non-empty idempotency
+// key.
 func ValidateSignal(sig contracts.Signal) error {
 	if strings.TrimSpace(sig.Symbol) == "" {
 		return fmt.Errorf("risk: signal has no symbol")
@@ -222,11 +187,17 @@ func ValidateSignal(sig contracts.Signal) error {
 	default:
 		return fmt.Errorf("risk: signal side %q must be %s or %s", sig.Side, contracts.SideBuy, contracts.SideSell)
 	}
-	if sig.Price <= 0 {
+	if sig.Price <= 0 || math.IsNaN(sig.Price) || math.IsInf(sig.Price, 0) {
 		return fmt.Errorf("risk: signal price %.4f must be positive", sig.Price)
+	}
+	if math.IsNaN(sig.Score) || math.IsInf(sig.Score, 0) {
+		return fmt.Errorf("risk: signal score must be finite")
 	}
 	if strings.TrimSpace(sig.IdempotencyKey) == "" {
 		return fmt.Errorf("risk: signal %s has no idempotency key", sig.Symbol)
+	}
+	if sig.AsOf.IsZero() {
+		return fmt.Errorf("risk: signal %s has no timestamp", sig.Symbol)
 	}
 	return nil
 }

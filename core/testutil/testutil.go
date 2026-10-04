@@ -1,10 +1,10 @@
-// Package testutil provides shared helpers for MFT unit and integration
-// tests: in-memory logger, mock broker streamer/client, and FX test app
-// utilities.
+// Package testutil provides shared helpers for MFT unit and integration tests:
+// in-memory logger, mock broker streamer/client, and FX test app utilities.
 package testutil
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,8 +24,8 @@ func NewRegistry() *prometheus.Registry {
 	return prometheus.NewRegistry()
 }
 
-// MockStreamer implements broker.Streamer, emitting a scripted sequence of
-// ticks and recording the subscribed symbols.
+// MockStreamer implements broker.Streamer, emitting a scripted sequence of ticks and
+// recording the subscribed symbols.
 type MockStreamer struct {
 	Ticks   []broker.Tick
 	Symbols []string
@@ -52,13 +52,14 @@ func Tick(symbol string, price float64, ts time.Time) broker.Tick {
 
 // MockClient implements broker.Client for testing order placement.
 type MockClient struct {
+	mu sync.Mutex
 	// Orders records every PlaceOrder call.
 	Orders []OrderCall
 	// FailErr, when non-nil, is returned by PlaceOrder.
 	FailErr error
 	// ID is returned as the order id; defaults to "mock-order".
 	ID string
-	// counter provides unique order ids per call.
+
 	counter atomic.Int64
 }
 
@@ -72,6 +73,8 @@ type OrderCall struct {
 
 // PlaceOrder records the call and returns a mock order id.
 func (m *MockClient) PlaceOrder(_ context.Context, symbol, side string, quantity int, price float64) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.FailErr != nil {
 		return "", m.FailErr
 	}
@@ -91,12 +94,14 @@ func (m *MockClient) PlaceOrder(_ context.Context, symbol, side string, quantity
 
 // Reset clears recorded orders and the id counter.
 func (m *MockClient) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Orders = nil
 	m.counter.Store(0)
 }
 
-// MetricValue gathers the current integer value of the metric named name from
-// reg after fn runs, returning 0 when the metric is absent.
+// MetricValue gathers the current integer value of the metric named name from reg after
+// fn runs, returning 0 when the metric is absent.
 func MetricValue(t *testing.T, name string, reg *prometheus.Registry, fn func()) int {
 	t.Helper()
 	if fn != nil {
