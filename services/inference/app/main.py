@@ -1,28 +1,4 @@
-"""MFT Inference Engine — FastAPI entrypoint.
-
-Three endpoints, and they are not the production path. `docs/contracts.md` §7
-says so explicitly: the production path is the internal scheduler in `loop.py`,
-which fires on each minute close, pulls context from DuckDB, runs the model and
-POSTs to execution. What lives here is liveness and two debugging surfaces.
-
-| Method | Path            | Purpose                                            |
-| :----- | :-------------- | :------------------------------------------------- |
-| GET    | `/healthz`      | Liveness plus `model_loaded`.                       |
-| GET    | `/v1/context`   | The last N feature rows for a symbol.               |
-| POST   | `/v1/predict`   | One explicit prediction for a symbol.               |
-
-Both debugging endpoints are read-only with respect to the market: neither
-places an order, and neither can lower `inference.dry_run`. A debugging
-endpoint that could trade would be a live order hidden behind a curl.
-
-Errors follow the shape `docs/contracts.md` §7 declares for the whole platform:
-`{"error": "<code>", "message": "<human readable>"}` with the HTTP status.
-
-Run it with `make run-inference`, or `uvicorn app.main:app` from
-`services/inference`. This module is imported with `services/inference` as the
-working root, which is what makes `from model import ...` resolve to C5's
-package.
-"""
+"""MFT Inference Engine — FastAPI entrypoint."""
 
 from __future__ import annotations
 
@@ -33,6 +9,7 @@ from typing import Annotated, Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from model import MAX_CONTEXT_ROWS, InvalidContextError
@@ -40,6 +17,7 @@ from model import MAX_CONTEXT_ROWS, InvalidContextError
 from .candles import Candle
 from .config import Config, ConfigError, load_config, configure_logging
 from .features import WARMUP_ROWS, FeatureError
+from .predictor import PredictorBusyError
 from .runtime import Runtime, build_runtime
 
 logger = logging.getLogger("mft.inference")
@@ -59,7 +37,7 @@ class PredictRequest(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    """Answer of `POST /v1/predict`. Exactly the contract's four fields."""
+    """Answer of `POST /v1/predict`."""
 
     symbol: str
     score: float
@@ -104,20 +82,12 @@ def _rfc3339(stamp: datetime) -> str:
 
 
 def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
-    """Build the FastAPI application around an assembled runtime.
-
-    Args:
-        runtime: The pieces. Injected rather than constructed here so a test
-            can drive the endpoints against a fake store and a fake execution
-            service, and so nothing in this module can reach a real order.
-        run_scheduler: False serves the endpoints without starting the
-            minute loop, which is what the tests want.
-    """
+    """Build the FastAPI application around an assembled runtime."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await runtime.startup(run_scheduler=run_scheduler)
         try:
+            await runtime.startup(run_scheduler=run_scheduler)
             yield
         finally:
             await runtime.shutdown()
@@ -132,13 +102,7 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def contract_error(_request: Any, exc: HTTPException) -> JSONResponse:
-        """Render errors in the platform's shape, not FastAPI's.
-
-        `docs/contracts.md` §7 fixes the body as
-        `{"error": "<code>", "message": "..."}`. FastAPI wraps a dict detail in
-        `{"detail": {...}}`, so a caller that switches services has to know
-        which convention this one uses. It does not get to.
-        """
+        """Render errors in the platform's shape, not FastAPI's."""
         if isinstance(exc.detail, dict):
             content: dict[str, Any] = exc.detail
         else:
@@ -147,13 +111,7 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
 
     @app.get("/healthz", response_model=HealthResponse)
     async def healthz() -> HealthResponse:
-        """Liveness plus whether the model can currently score.
-
-        Always 200 while the process is alive. A liveness probe that failed
-        because the weights are slow to load would restart a service that is
-        merely young; `model_loaded` is there so the caller can tell the two
-        apart.
-        """
+        """Liveness plus whether the model can currently score."""
         return HealthResponse(
             status="ok",
             model_loaded=runtime.predictor.is_loaded(),
@@ -162,19 +120,32 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
             instruments=list(runtime.inference.instruments),
         )
 
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        ready = runtime.predictor.is_loaded() and (runtime._task is None or not runtime._task.done())
+        return JSONResponse({"ready": ready}, status_code=200 if ready else 503)
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> PlainTextResponse:
+        values = [
+            "# HELP mft_inference_model_loaded Whether the model is ready.",
+            "# TYPE mft_inference_model_loaded gauge",
+            f"mft_inference_model_loaded {int(runtime.predictor.is_loaded())}",
+            "# HELP mft_inference_scheduler_ticks_total Completed scheduler passes.",
+            "# TYPE mft_inference_scheduler_ticks_total counter",
+            f"mft_inference_scheduler_ticks_total {runtime.scheduler.ticks}",
+            "# HELP mft_inference_decisions_total Decisions by outcome.",
+            "# TYPE mft_inference_decisions_total counter",
+        ]
+        values.extend(f'mft_inference_decisions_total{{outcome="{key}"}} {value}' for key, value in sorted(runtime.scheduler.outcome_counts.items()))
+        return PlainTextResponse("\n".join(values) + "\n", media_type="text/plain; version=0.0.4")
+
     @app.get("/v1/context", response_model=ContextResponse)
     async def context(
         symbol: Annotated[str, Query(min_length=1)],
         rows: Annotated[int, Query(ge=1, le=MAX_CONTEXT_ROWS)] = 20,
     ) -> ContextResponse:
-        """Return the last N feature rows for a symbol.
-
-        Warms up over the same window the loop uses and drops the warm-up rows
-        the same way, so what a caller sees here is what the model saw. A
-        window too short to warm up is a 422 rather than a shorter answer: the
-        rows that would come back are context-only zeros, and a debugging view
-        full of them is worse than an error.
-        """
+        """Return the last N feature rows for a symbol."""
         wanted = min(rows, runtime.inference.context_rows)
         candles = await _read(runtime, symbol, wanted + WARMUP_ROWS)
         if not candles:
@@ -202,12 +173,7 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
 
     @app.post("/v1/predict", response_model=PredictResponse)
     async def predict(request: PredictRequest) -> PredictResponse:
-        """Score one symbol now and return the conviction.
-
-        Does not place an order and cannot. The loop, not this endpoint, is
-        what talks to execution; that separation is what keeps a debugging curl
-        from becoming a trade.
-        """
+        """Score one symbol now and return the conviction."""
         wanted = request.context_rows or runtime.inference.context_rows
         wanted = min(wanted, MAX_CONTEXT_ROWS)
         horizon = runtime.inference.horizon_bars
@@ -234,10 +200,11 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
 
         try:
             score = await runtime.predictor.predict(context_rows, horizon)
+        except PredictorBusyError as err:
+            raise _error(503, "MODEL_BUSY", str(err)) from err
         except (InvalidContextError, ValueError) as err:
-            # C5 refuses a context it cannot use — too few rows, a missing
-            # column, a NaN. That is a client-visible 422, never a 500, and
-            # never a prediction from a repaired table.
+
+
             raise _error(422, "BAD_CONTEXT", str(err)) from err
 
         return PredictResponse(
@@ -251,15 +218,10 @@ def create_app(runtime: Runtime, *, run_scheduler: bool = True) -> FastAPI:
 
 
 async def _read(runtime: Runtime, symbol: str, limit: int) -> list[Candle]:
-    """Fetch candles, turning a store failure into a 502.
-
-    The store is the Parquet tree another process is writing to, so a read
-    failure is upstream of this service and is reported as an upstream failure
-    rather than as a bad request.
-    """
+    """Fetch candles, turning a store failure into a 502."""
     try:
         return await runtime.store.tail(symbol, limit)
-    except Exception as err:  # noqa: BLE001 - one bad read is one 502
+    except Exception as err:  # noqa: BLE001
         logger.warning("cannot read candles for %s: %s", symbol, err)
         raise _error(
             502,
@@ -269,12 +231,7 @@ async def _read(runtime: Runtime, symbol: str, limit: int) -> list[Candle]:
 
 
 def _row_time(candles: list[Candle], index: int, warmup: int) -> datetime:
-    """The candle timestamp behind context row `index`.
-
-    The context is the tail of the table, so row 0 of the context is candle
-    `warmup`. A caller comparing a context row against the store needs the
-    timestamp, and the frozen schema has no time column.
-    """
+    """The candle timestamp behind context row `index`."""
     position = warmup + index
     if position < len(candles):
         return candles[position].timestamp
@@ -282,12 +239,7 @@ def _row_time(candles: list[Candle], index: int, warmup: int) -> datetime:
 
 
 def build_app() -> FastAPI:
-    """Load the config from `MFT_CONFIG` and assemble the whole service.
-
-    Raises:
-        ConfigError: If the configuration is missing or invalid. The service
-            refuses to start rather than trade on defaults it was not given.
-    """
+    """Load the config from `MFT_CONFIG` and assemble the whole service."""
     config: Config = load_config()
     configure_logging(config.app.log_level)
     runtime = build_runtime(config)
@@ -295,12 +247,7 @@ def build_app() -> FastAPI:
 
 
 def _module_app() -> FastAPI:
-    """The ASGI app `uvicorn app.main:app` is given.
-
-    Built lazily through the module's `__getattr__` so that importing this
-    module — which the tests do — neither reads the config file nor opens a
-    DuckDB connection.
-    """
+    """The ASGI app `uvicorn app.main:app` is given."""
     try:
         return build_app()
     except (ConfigError, RuntimeError) as err:

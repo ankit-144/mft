@@ -1,16 +1,12 @@
-"""Assembling the service from configuration.
-
-One place decides what a configured inference service *is*: which model, which
-Parquet tree, which execution endpoint, and whether the scheduler runs at all.
-`main` renders it over HTTP, the tests build one with fakes, and neither has to
-know how the pieces are wired.
-"""
+"""Assembling the service from configuration."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 from model import available_models
@@ -18,7 +14,7 @@ from model import available_models
 from .candles import CandleStore, DuckDBCandleStore, candles_root
 from .config import Config, InferenceConfig
 from .execution import ExecutionClient
-from .loop import MinuteScheduler, SignalSender, staleness_guard
+from .loop import MinuteScheduler, SignalSender
 from .predictor import Predictor
 
 logger = logging.getLogger("mft.inference.runtime")
@@ -45,11 +41,12 @@ class Runtime:
 
     @property
     def dry_run(self) -> bool:
-        """Whether orders are actually placed. True by default."""
+        """Whether orders are actually placed."""
         return self.inference.dry_run
 
     async def startup(self, *, run_scheduler: bool = True) -> asyncio.Task[None] | None:
-        """Load the model, then start the loop. Returns the scheduler task."""
+        """Load the model, then start the loop."""
+        self.scheduler.claim_owner()
         await self.predictor.load()
         if not run_scheduler:
             return None
@@ -74,31 +71,20 @@ class Runtime:
                 await task
             except asyncio.CancelledError:
                 pass
-            except Exception as err:  # noqa: BLE001 - shutdown is best effort
+            except Exception as err:  # noqa: BLE001
                 logger.warning("scheduler stopped with %s: %s", type(err).__name__, err)
-        await self.sender.aclose()
+        if self.owns_sender:
+            await self.sender.aclose()
         await self.predictor.aclose()
         if self.owns_store:
             close = getattr(self.store, "aclose", None)
             if close is not None:
                 await close()
+        self.scheduler.close()
 
 
 def build_runtime(config: Config, *, root: Path | None = None) -> Runtime:
-    """Build a runtime from a validated config.
-
-    Args:
-        config: The frozen config, already through `load_config`.
-        root: Overrides the Parquet dataset root. The tests point this at a
-            temporary tree; production leaves it `None` so `storage.data_dir`
-            decides.
-
-    Raises:
-        RuntimeError: If `inference.model` names a model that is not
-            registered. C5 registers `heuristic` always and `tabfm` only when
-            the backend imports, so this is the honest failure for a venv built
-            with `--skip-model` that was never told to use the heuristic.
-    """
+    """Build a runtime from a validated config."""
     inference = config.inference
     known = ", ".join(available_models()) or "<none>"
     if inference.model not in available_models():
@@ -107,19 +93,20 @@ def build_runtime(config: Config, *, root: Path | None = None) -> Runtime:
             f"are: {known}. Install the model backend, or set inference.model: heuristic."
         )
 
+    if inference.model == "tabfm" and not inference.dry_run and not config.execution.paper_trading:
+        raise RuntimeError("TabFM weights are restricted to research; set inference.dry_run: true")
     dataset_root = candles_root(root if root is not None else config.storage.data_dir)
-    store = DuckDBCandleStore(dataset_root)
+    historical = Path(config.jobs.historical_dir) if config.jobs.historical_dir else None
+    store = DuckDBCandleStore(dataset_root, historical_root=historical)
     predictor = Predictor.from_name(inference.model)
-    sender = ExecutionClient(inference.execution_url)
+    sender = ExecutionClient(inference.execution_url, api_token=os.environ.get("MFT_EXECUTION_API_TOKEN", config.execution.api_token))
     scheduler = MinuteScheduler(
         inference,
         store,
         predictor,
         sender,
         timezone_name=config.app.timezone,
-        # Tied to the flush interval rather than fixed, so a store that
-        # publishes more often than the default is not skipped every minute.
-        max_context_age=staleness_guard(config.storage.flush_interval_seconds),
+        max_context_age=timedelta(seconds=inference.max_context_age_seconds),
     )
 
     logger.info(

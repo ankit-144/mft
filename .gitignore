@@ -7,17 +7,23 @@ vendor/
 
 # Environment / secrets
 .env
+configs/config.yaml
 
 # Generated data (parquet files, keep dirs via .gitkeep)
 data/ticks/*.parquet
 data/candles/*.parquet
 data/historical/*.parquet
+data/**/*.parquet
+data/execution/
+data/inference/
 !data/**/.gitkeep
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+**/.venv/
+**/.venv
 venv/
 *.egg-info/
 
@@ -35,3 +41,9 @@ data/*.duckdb.wal
 .idea/
 .vscode/
 .commandcode/
+docs/diagrams/svg/
+docs/diagrams/explorer.html
+docs/diagrams/explorer.py
+docs/diagrams/mermaid/*.svg
+docs/diagrams/mermaid/*.png
+.mmdcfg.json

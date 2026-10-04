@@ -1,26 +1,10 @@
-"""Configuration, read from the same YAML the Go services read.
-
-`docs/contracts.md` §8 freezes the schema and `core/config/config.go`
-implements it. This module is the Python reading of the same document: it
-declares no key that `config.go` does not, and it defaults every key exactly
-where `config.Validate` does, so a service started with an empty config file
-behaves the same as a Go one.
-
-`MFT_CONFIG` names the file, defaulting to `configs/config.yaml`, which is what
-`make dev` and `make run-inference` set.
-
-# PyYAML is a transitive dependency
-
-`requirements.txt` is frozen and does not name PyYAML; it arrives with
-`uvicorn[standard]`, which every documented way of running this service uses.
-This is a real coupling and is reported rather than worked around — the fix is
-one line in a file this component does not own.
-"""
+"""Configuration, read from the same YAML the Go services read."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Final
 
@@ -29,13 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger("mft.inference.config")
 
-#: Environment variable naming the config file. Same name the Go services read.
+
 CONFIG_ENV_VAR: Final[str] = "MFT_CONFIG"
 
-#: Used when `MFT_CONFIG` is unset. Relative to the working directory, which is
-#: the repository root for `make run-inference`... except that target `cd`s
-#: into `services/inference`, so the path is also tried relative to the
-#: directory two levels up. See `resolve_path`.
+
 DEFAULT_CONFIG_PATH: Final[str] = "configs/config.yaml"
 
 
@@ -68,8 +49,8 @@ class StorageConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     data_dir: str = "data"
-    flush_interval_seconds: int = 300
-    flush_max_rows: int = 10000
+    flush_interval_seconds: int = Field(default=60, gt=0)
+    flush_max_rows: int = Field(default=10000, gt=0)
     partition_by: str = "date"
 
     @field_validator("partition_by")
@@ -81,32 +62,29 @@ class StorageConfig(BaseModel):
 
 
 class InferenceConfig(BaseModel):
-    """`inference` — everything the loop is configured with.
-
-    `dry_run` defaults to `True` and `model` to `tabfm`, matching
-    `config.Validate`. The default is the safe one and this module will not
-    make it any other way: a signal that leaves this process becomes an order
-    at the broker.
-    """
+    """`inference` — everything the loop is configured with."""
 
     model_config = ConfigDict(extra="ignore")
 
     addr: str = ":8000"
-    model: str = "tabfm"
+    model: str = "heuristic"
     execution_url: str = "http://localhost:8080"
     context_rows: int = 100
     horizon_bars: int = 1
-    score_threshold: float = 0.55
+    score_threshold: float = 0.0
     order_quantity: int = 10
     instruments: list[str] = Field(default_factory=list)
     dry_run: bool = True
+    max_concurrency: int = Field(default=4, ge=1, le=64)
+    max_context_age_seconds: int = Field(default=120, gt=0)
+    cursor_path: str = ""
 
     @field_validator("model")
     @classmethod
     def _known_model(cls, value: str) -> str:
         name = value.strip().lower()
-        if name not in {"tabfm", "heuristic"}:
-            raise ValueError(f"inference.model {value!r} must be one of tabfm, heuristic")
+        if re.fullmatch(r"[a-z][a-z0-9_]*", name) is None:
+            raise ValueError(f"inference.model {value!r} must be a registry identifier")
         return name
 
     @field_validator("score_threshold")
@@ -158,31 +136,35 @@ class InferenceConfig(BaseModel):
         return seen
 
 
-class Config(BaseModel):
-    """The subset of the frozen schema this service reads.
+class ExecutionConfig(BaseModel):
+    """Credentials and operating mode shared with execution."""
 
-    Sections it does not read — broker, analytics, execution, jobs — are
-    `extra="ignore"` rather than absent from the file: the config is shared by
-    every service and none of them owns it.
-    """
+    model_config = ConfigDict(extra="ignore")
+    paper_trading: bool = True
+    api_token: str = Field(default="", exclude=True, repr=False)
+
+
+class JobsConfig(BaseModel):
+    """Published historical candles used by research and live warm-up."""
+
+    model_config = ConfigDict(extra="ignore")
+    historical_dir: str = ""
+
+
+class Config(BaseModel):
+    """The subset of the frozen schema this service reads."""
 
     model_config = ConfigDict(extra="ignore")
 
     app: AppConfig = Field(default_factory=AppConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    jobs: JobsConfig = Field(default_factory=JobsConfig)
 
 
 def resolve_path(path: str | os.PathLike[str] | None = None) -> Path:
-    """Locate the config file: an explicit path, else `MFT_CONFIG`, else default.
-
-    The default is looked up relative to the working directory first and then
-    relative to the repository root, because `make run-inference` runs
-    `cd services/inference && uvicorn app.main:app` while `make dev` exports
-    `MFT_CONFIG=configs/config.yaml` from the root. Without the second lookup
-    the same command finds the file or does not depending on how it was
-    invoked.
-    """
+    """Locate the config file: an explicit path, else `MFT_CONFIG`, else default."""
     if path is None:
         path = os.environ.get(CONFIG_ENV_VAR) or DEFAULT_CONFIG_PATH
     candidate = Path(path)
@@ -196,13 +178,7 @@ def resolve_path(path: str | os.PathLike[str] | None = None) -> Path:
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
-    """Read and validate the YAML config.
-
-    Raises:
-        ConfigError: If the file is missing, is not a mapping, or fails
-            validation. A misconfigured trading service must not start on
-            defaults it was not given.
-    """
+    """Read and validate the YAML config."""
     resolved = resolve_path(path)
     try:
         text = resolved.read_text()
@@ -217,10 +193,28 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     if not isinstance(document, dict):
         raise ConfigError(f"config {resolved} is not a YAML mapping")
 
+    overrides = {"model": "MFT_INFERENCE_MODEL", "execution_url": "MFT_EXECUTION_URL"}
+    inference = document.setdefault("inference", {})
+    if isinstance(inference, dict):
+        for key, env in overrides.items():
+            if value := os.environ.get(env):
+                inference[key] = value
+
     try:
         config = Config.model_validate(document)
     except ValueError as err:
         raise ConfigError(f"invalid config {resolved}: {err}") from err
+
+    base = resolved.resolve().parent
+    if base.name == "configs":
+        base = base.parent
+    config.storage.data_dir = str(_absolute(base, config.storage.data_dir))
+    cursor = config.inference.cursor_path or str(Path(config.storage.data_dir) / "inference" / "cursors.json")
+    config.inference.cursor_path = str(_absolute(base, cursor))
+    historical = config.jobs.historical_dir or str(Path(config.storage.data_dir) / "historical")
+    config.jobs.historical_dir = str(_absolute(base, historical))
+    if config.inference.horizon_bars >= config.inference.context_rows:
+        raise ConfigError("inference.horizon_bars must be below context_rows")
 
     logger.debug(
         "loaded config %s: model=%s dry_run=%s instruments=%s context_rows=%d",
@@ -233,12 +227,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     return config
 
 
-def configure_logging(level: str) -> None:
-    """Send the service's logs to stdout at `level`, in a parseable shape.
+def _absolute(base: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else base / path
 
-    `logging`, never `print`: the Go services read this stream, and a bare
-    print in a scheduler tick is indistinguishable from a successful signal.
-    """
+
+def configure_logging(level: str) -> None:
+    """Send the service's logs to stdout at `level`, in a parseable shape."""
     import logging as _logging
 
     handler = _logging.StreamHandler()
