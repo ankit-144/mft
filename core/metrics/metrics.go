@@ -1,15 +1,6 @@
-// Package metrics provides the shared Prometheus foundation for every MFT
-// service: the naming rule, constructors, build information, latency
-// histograms, and the scrape and health endpoints.
-//
-// Every metric this platform exposes carries the "mft_" prefix. That single
-// rule is what lets one Prometheus instance, one Grafana dashboard and one
-// alert set cover all four services without two of them shadowing each other.
-// The constructors here enforce it at registration time, so a violation panics
-// at startup rather than scraping under a foreign name.
-//
-// The helpers are opt-in. A component that prefers promauto.With(reg) keeps
-// working; only the name it registers is subject to review.
+// Package metrics provides the shared Prometheus foundation for every MFT service: the
+// naming rule, constructors, build information, latency histograms, and the scrape and
+// health endpoints.
 package metrics
 
 import (
@@ -27,12 +18,12 @@ import (
 	"go.uber.org/zap"
 )
 
-// shutdownTimeout bounds the graceful stop of the metrics server, so a wedged
-// scrape connection cannot hold up application shutdown.
+// shutdownTimeout bounds the graceful stop of the metrics server, so a wedged scrape
+// connection cannot hold up application shutdown.
 const shutdownTimeout = 5 * time.Second
 
-// Registry returns the shared Prometheus registry pre-loaded with Go and
-// process collectors.
+// Registry returns the shared Prometheus registry pre-loaded with Go and process
+// collectors.
 func Registry() *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -43,18 +34,12 @@ func Registry() *prometheus.Registry {
 }
 
 // Handler returns an http.Handler that serves Prometheus metrics from reg.
-// OpenMetrics is enabled so that exemplars — the correlation id attached by
-// ObserveDuration — survive the scrape.
 func Handler(reg *prometheus.Registry) http.Handler {
 	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{EnableOpenMetrics: true})
 }
 
 // Mux returns the routes the metrics server exposes: the scrape handler at
-// cfg.Metrics.Path and the health endpoints at /healthz and /readyz. The
-// health handler is the process-wide DefaultChecks set.
-//
-// A scrape path of "/" is honoured but leaves no room for the health
-// endpoints; the default is /metrics and nothing in this platform needs that.
+// cfg.Metrics.Path and the health endpoints at /healthz and /readyz.
 func Mux(cfg *config.Config, scrape http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	path := metricsPath(cfg)
@@ -73,12 +58,7 @@ func metricsPath(cfg *config.Config) string {
 	return cfg.Metrics.Path
 }
 
-// Server registers the metrics HTTP server lifecycle hook. It starts the
-// server on app start and shuts it down gracefully on app stop.
-//
-// The listener is opened during OnStart, not in a goroutine, so a port already
-// in use fails startup instead of leaving a process that looks healthy but
-// cannot be scraped.
+// Server registers the metrics HTTP server lifecycle hook.
 func Server(lc fx.Lifecycle, cfg *config.Config, handler http.Handler, log *zap.Logger) {
 	srv := &http.Server{
 		Addr:              cfg.Metrics.Addr,
@@ -108,8 +88,7 @@ func Server(lc fx.Lifecycle, cfg *config.Config, handler http.Handler, log *zap.
 		OnStop: func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 			defer cancel()
-			// Shutdown waits for in-flight scrapes to finish, so the last
-			// scrape of a stopping process still sees a consistent snapshot.
+
 			if err := srv.Shutdown(ctx); err != nil {
 				log.Error("metrics server shutdown", zap.Error(err))
 				return fmt.Errorf("shutdown metrics server: %w", err)
