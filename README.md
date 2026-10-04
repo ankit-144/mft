@@ -19,6 +19,17 @@ run** and a lightweight heuristic model.
 The Go modules are joined by `go.work`. Go reads Parquet through typed readers;
 Python uses DuckDB. Both runtimes use the same ordered 18-feature schema.
 
+## Architecture and local run guides
+
+Open [the interactive architecture map](docs/implementation/guide.html) locally
+in a browser after cloning. It explains components, responsibilities, contracts
+and data flows through a searchable, clickable tree. The page works offline;
+optional source links open the documented commit on GitHub.
+
+See [the local run guide](docs/LOCAL_RUN.md) for setup, synthetic data, Parquet
+replay, component integration tests, public candle imports and Kite paper mode.
+[Map sources and rebuild instructions](docs/implementation/README.md) are included.
+
 ## Local setup
 
 Requires Go 1.25 and Python 3.12 or later. From the repository root:
