@@ -1,88 +1,64 @@
-# AGENTS.md
+# Repository working rules
 
-Rules for any agent or human working on this repository.
+## Resource safety
 
-## ⚠️ Memory limit — read this before running anything
+This machine has 14 GB RAM. Never load TabFM weights, read the Hugging Face
+checkpoint cache, download weights, or load large assets. Do not run the full
+`model/tests` directory or `test_tabfm_model.py` weight tests. Keep generated
+data, credentials, local configuration, environments and journals outside Git.
 
-**14GB RAM machine, OOM killer is active. NEVER load TabFM weights (~6.6GB).**
+## Architecture and ownership
 
-- **NEVER** run full `pytest model/tests`. Only run `test_base.py` and
-  `test_heuristic_model.py`.
-- **NEVER** run `test_tabfm_model.py` weights tests, **NEVER** run
-  `make tabfm-weights` or any HuggingFace download. Cached weights are
-  off-limits.
+| Area | Source |
+| --- | --- |
+| Broker, storage, features, observability | `core/` |
+| Ingestion | `services/ingestion/` |
+| Order lifecycle, risk, HTTP | `services/execution/` |
+| Historical jobs | `services/jobs/` |
+| Runtime and model contracts | `services/inference/app/`, `services/inference/model/` |
+| Strategies, experiments, evaluators | `services/inference/app/research/` |
 
-`~/.cache/huggingface/hub/models--google--tabfm-1.0.0-pytorch` is off-limits
-even though it is already on disk. Do not read, copy, or load from it. If a
-test would load real weights, skip it with an explicit reason instead.
+Coordinate shared-path ownership before parallel edits. Use isolated worktrees
+for independent branches and preserve original component branches.
 
-The `TabFMModel` code path is written and unit-tested against a fake
-checkpoint. Verifying real inference is a deliberate, manual, human-run step on
-a machine with free memory — never an automated test.
+## Interface and code conventions
 
-## Read these first
+- Keep responsibility documentation at functional interfaces; remove narrative
+  or redundant inline comments.
+- Go: use `gofmt`, context-aware I/O, contextual errors, bounded queues and
+  bounded concurrency.
+- Python: use typed interfaces, injected time/storage/model dependencies,
+  logging and finite numeric validation.
+- Preserve the ordered 18-feature schema and UTC timestamps; sessions use
+  Asia/Kolkata.
+- Forecast targets are cumulative future log returns over the configured
+  horizon.
+- Register algorithms, strategies and evaluators independently; select
+  parameters using validation data only.
+- Metrics use isolated registries and the `mft_` prefix; readiness reflects
+  usable dependencies.
 
-| Document | What it gives you |
-| :--- | :--- |
-| [`Plan.md`](./Plan.md) | North star, architecture, the fluxKV decision, TabFM licensing |
-| [`docs/contracts.md`](./docs/contracts.md) | **Frozen** types, interfaces, feature schema, config keys |
+## Validation
 
-If your change is not described in `docs/contracts.md` and you are not certain
-it belongs to you, stop and ask before writing code.
-
-## Frozen files — do not edit
-
-Editing any of these creates a merge conflict with every parallel branch.
-
-- `core/config/config.go` — every key is already declared
-- `core/contracts/` — shared domain types and interfaces
-- `go.work`, `go.mod`, `go.sum` — dependencies are pre-resolved
-- `Makefile` — all targets are pre-declared
-- `opencode.json`, `AGENTS.md`, `docs/`, `Plan.md`
-
-## Ownership
-
-Each component owns an exclusive set of paths. Touch nothing else.
-
-| Component | Owns |
-| :--- | :--- |
-| C1 kite-broker | `core/broker/**` |
-| C2 storage-analytics | `core/storage/**`, `core/analytics/**` |
-| C3 features | `core/features/**` |
-| C4 ingestion | `services/ingestion/**` |
-| C5 tabfm-model | `services/inference/model/**`, `services/inference/requirements*.txt` |
-| C6 risk-engine | `services/execution/risk/**`, `services/execution/engine.go`, `core/fluxkv/**` |
-| C7 execution-api | `services/execution/http.go` |
-| C8 jobs-backfill | `services/jobs/**` |
-| C9 observability | `core/metrics/**`, `core/log/**`, `observability/**` |
-| C10 inference-api | `services/inference/app/**` |
-
-If you need a change outside your ownership, it belongs in a different
-component. Say so in your PR description instead of making the edit.
-
-## Conventions
-
-- Go 1.25, `gofmt` clean, `go vet` clean. Run `make lint` before pushing.
-- Every exported symbol has a doc comment starting with its name.
-- No comments that merely restate the code.
-- Errors are wrapped with `%w` and given context.
-- Prometheus: register every new metric through the provided `*prometheus.Registry`
-  with the `mft_` prefix, and a `Help` string.
-- Tests use `core/testutil` for mocks and metric assertions.
-- Python: type hints, `logging` not `print`, no new top-level dependencies
-  without adding them to `services/inference/requirements.txt`.
-
-## Before you push
+Run tests, builds, benchmarks or other validation only when requested. When
+requested, the available targets are:
 
 ```sh
 make lint
 make test
+make test-python
+make integration
+make benchmarks
 ```
 
-Both must pass. For Python components, also confirm the venv imports cleanly.
+Go uses two build workers by default. Python tests block real checkpoint access.
+Socket fixtures skip only permission-denied errors in restricted sandboxes;
+distinguish those skips from verified integration paths. The Python test-only
+selector heartbeat works around forbidden socketpair writes.
 
-## Safety
+## Operating defaults
 
-- `inference.dry_run` defaults to `true`. Do not change that default.
-- Never commit credentials. `.env` and `configs/config.yaml` are gitignored.
-- Never place a real order from a test.
+`inference.dry_run` and `execution.paper_trading` default to true. Live execution
+requires positive capital, an API token, reconciliation and durable state. No
+test may place a real order. No return estimate should be presented as verified
+market profitability.

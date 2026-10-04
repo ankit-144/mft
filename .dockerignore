@@ -21,3 +21,17 @@ configs/config.yaml
 **/__pycache__/
 **/*.pyc
 .venv/
+**/.venv/
+.worktrees/
+.dev/
+docs/
+**/*_test.go
+**/tests/
+**/.cache/
+**/.huggingface/
+**/*.safetensors
+**/*.pt
+**/*.pth
+_MACOS/
+_MACOSX/
+__MACOSX/

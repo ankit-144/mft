@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mft/core/contracts"
 )
@@ -42,22 +43,21 @@ func newOrderServer(t *testing.T, routes map[string]http.HandlerFunc) *orderServ
 				return
 			}
 			s.placed = append(s.placed, r.PostForm)
-			reply(w, `{"status":"success","order_id":"4412"}`)
+			reply(w, `{"status":"success","data":{"order_id":"4412"}}`)
 		case strings.HasPrefix(r.URL.Path, "/orders/regular/") && r.Method == httpDelete:
 			s.cancels = append(s.cancels, strings.TrimPrefix(r.URL.Path, "/orders/regular/"))
-			reply(w, `{"status":"success","order_id":"4412"}`)
-		case r.URL.Path == "/positions":
-			reply(w, `[
+			reply(w, `{"status":"success","data":{"order_id":"4412"}}`)
+		case r.URL.Path == "/portfolio/positions":
+			reply(w, `{"status":"success","data":{"net":[
 				{"tradingsymbol":"RELIANCE","instrument_token":738560,"exchange":"NSE","quantity":25,"average_price":2934.5,"product":"NRML"},
 				{"tradingsymbol":"TCS","instrument_token":3419705,"exchange":"NSE","quantity":-10,"average_price":4100.25,"product":"NRML"}
-			]`)
+			],"day":[]}}`)
 		default:
 			http.NotFound(w, r)
 		}
 	}
 
-	s.Server = httptest.NewServer(http.HandlerFunc(handler))
-	t.Cleanup(s.Close)
+	s.Server = localTestServer(t, http.HandlerFunc(handler))
 	return s
 }
 
@@ -90,13 +90,13 @@ func TestPlaceOrderMarket(t *testing.T) {
 
 	form := srv.placed[0]
 	for field, want := range map[string]string{
-		"tradingsymbol": "RELIANCE",
-		"exchange":      "NSE",
-		"direction":     "BUY",
-		"order_type":    "MARKET",
-		"product":       "NRML",
-		"quantity":      "10",
-		"variety":       "regular",
+		"tradingsymbol":    "RELIANCE",
+		"exchange":         "NSE",
+		"transaction_type": "BUY",
+		"order_type":       "MARKET",
+		"product":          "NRML",
+		"quantity":         "10",
+		"variety":          "regular",
 	} {
 		if got := form.Get(field); got != want {
 			t.Errorf("form %s = %q, want %q", field, got, want)
@@ -279,8 +279,8 @@ func TestGetPositions(t *testing.T) {
 
 func TestGetPositionsAcceptsWrappedPayload(t *testing.T) {
 	srv := newOrderServer(t, map[string]http.HandlerFunc{
-		"/positions": func(w http.ResponseWriter, r *http.Request) {
-			reply(w, `{"data":[{"tradingsymbol":"RELIANCE","quantity":5,"average_price":100.5}]}`)
+		"/portfolio/positions": func(w http.ResponseWriter, r *http.Request) {
+			reply(w, `{"status":"success","data":{"net":[{"tradingsymbol":"RELIANCE","quantity":5,"average_price":100.5}],"day":[]}}`)
 		},
 	})
 	k := newOrderKite(t, srv)
@@ -291,6 +291,42 @@ func TestGetPositionsAcceptsWrappedPayload(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Quantity != 5 {
 		t.Fatalf("positions = %+v, want one position of 5", got)
+	}
+}
+
+func TestDecodeKitePortfolioAndOrderResponses(t *testing.T) {
+	positions, err := decodePositions([]byte(`{"status":"success","data":{"net":[{"tradingsymbol":"RELIANCE","quantity":5,"average_price":100.5}],"day":[{"tradingsymbol":"RELIANCE","quantity":3}]}}`))
+	if err != nil || len(positions) != 1 || positions[0].Quantity != 5 {
+		t.Fatalf("decodePositions = %+v, %v; want only net position", positions, err)
+	}
+
+	orders, err := decodeOrderRows([]byte(`{"status":"success","data":[{"order_id":"abc","tag":"mftdeadbeef","status":"COMPLETE","tradingsymbol":"RELIANCE","transaction_type":"BUY","quantity":5,"price":100,"order_type":"LIMIT","filled_quantity":5,"average_price":99.5,"order_timestamp":"2026-09-29 10:31:00","exchange_update_timestamp":"2026-09-29 10:31:02"}]}`))
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("decodeOrderRows = %+v, %v", orders, err)
+	}
+	order := orders[0].contract()
+	if order.Status != OrderFilled || order.Tag != "mftdeadbeef" || order.FilledQuantity != 5 || order.AverageFillPrice != 99.5 {
+		t.Fatalf("normalized order = %+v", order)
+	}
+	if got := order.CreatedAt.Format(time.RFC3339); got != "2026-09-29T05:01:00Z" {
+		t.Fatalf("created timestamp = %s, want UTC conversion from IST", got)
+	}
+}
+
+func TestDecodeKiteLTPResponse(t *testing.T) {
+	got, err := decodeLastPrices([]byte(`{"status":"success","data":{"NSE:RELIANCE":{"last_price":2934.5}}}`))
+	if err != nil || got["RELIANCE"] != 2934.5 {
+		t.Fatalf("decodeLastPrices = %v, %v", got, err)
+	}
+	if _, err := decodeLastPrices([]byte(`{"status":"success","data":{"RELIANCE":{"last_price":0}}}`)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("invalid quote error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestKiteEndpointRoutes(t *testing.T) {
+	e := endpoints{httpBase: "https://api.kite.trade", wsBase: "wss://ws.kite.trade"}
+	if e.positionsURL() != "https://api.kite.trade/portfolio/positions" || e.ordersListURL() != "https://api.kite.trade/orders" || e.orderHistoryURL("id") != "https://api.kite.trade/orders/id" {
+		t.Fatalf("Kite REST routes: positions=%s orders=%s history=%s", e.positionsURL(), e.ordersListURL(), e.orderHistoryURL("id"))
 	}
 }
 
