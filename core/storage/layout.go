@@ -9,20 +9,17 @@ import (
 	"github.com/mft/core/config"
 )
 
-// Options configures a hive-partitioned Parquet writer. The zero value is not
-// usable; use NewWriter, NewWriterFromConfig, NewCandleWriter or
-// NewCandleWriterFromConfig, which fill in sane defaults.
+// Options configures a hive-partitioned Parquet writer.
 type Options struct {
-	// Root is the directory the dataset lives in, e.g. "data/candles".
+	// Root is the directory the dataset lives in, e.g.
 	Root string
 	// MaxRows is the number of buffered rows that triggers a flush.
 	MaxRows int
-	// FlushInterval is the background flush cadence. It must be positive.
+	// FlushInterval is the background flush cadence.
 	FlushInterval time.Duration
 }
 
-// Partition is a hive partition key: one symbol and one UTC date. The value is
-// derived from the row being written, never from configuration.
+// Partition is a hive partition key: one symbol and one UTC date.
 type Partition struct {
 	// Symbol is the instrument symbol, unescaped.
 	Symbol string
@@ -30,24 +27,18 @@ type Partition struct {
 	Date string
 }
 
-// NewPartition builds the partition for a symbol at a point in time. The
-// timestamp is converted to UTC before the date is taken, so the partition
-// boundary is unambiguous regardless of the producer's location.
+// NewPartition builds the partition for a symbol at a point in time.
 func NewPartition(symbol string, ts time.Time) Partition {
 	return Partition{Symbol: symbol, Date: ts.UTC().Format(DateLayout)}
 }
 
-// Dir returns the hive directory for the partition under root, matching the
-// layout in docs/contracts.md §3:
-//
-//	<root>/symbol=<SYMBOL>/date=<YYYY-MM-DD>
+// Dir returns the hive directory for the partition under root, matching the layout in
+// docs/contracts.md §3:
 func (p Partition) Dir(root string) string {
 	return filepath.Join(root, "symbol="+escapeHiveValue(p.Symbol), "date="+p.Date)
 }
 
 // SymbolDir returns the directory holding every date partition of a symbol:
-//
-//	<root>/symbol=<SYMBOL>
 func SymbolDir(root, symbol string) string {
 	return filepath.Join(root, "symbol="+escapeHiveValue(symbol))
 }
@@ -58,12 +49,6 @@ func (p Partition) String() string {
 }
 
 // RangePartition is the historical dataset partition from docs/contracts.md §3:
-//
-//	<root>/symbol=<SYMBOL>/from=<YYYY-MM-DD>/to=<YYYY-MM-DD>/candles.parquet
-//
-// The backfill job owns that dataset; this type exists so the path is derived
-// from one place instead of being re-spelled in services/jobs and in the
-// research queries that read it back.
 type RangePartition struct {
 	// Symbol is the instrument symbol, unescaped.
 	Symbol string
@@ -73,8 +58,7 @@ type RangePartition struct {
 	To string
 }
 
-// NewRangePartition builds the historical partition covering [from, to). Both
-// bounds are converted to UTC before the date is taken.
+// NewRangePartition builds the historical partition covering [from, to).
 func NewRangePartition(symbol string, from, to time.Time) RangePartition {
 	return RangePartition{
 		Symbol: symbol,
@@ -101,10 +85,8 @@ func (r RangePartition) String() string {
 	return "symbol=" + escapeHiveValue(r.Symbol) + "/from=" + r.From + "/to=" + r.To
 }
 
-// escapeHiveValue percent-encodes the characters that would otherwise break a
-// hive "key=value" directory name. Symbols are usually plain uppercase
-// alphanumerics, but nothing guarantees it, and a symbol containing '/' or
-// '=' would silently relocate a dataset.
+// escapeHiveValue percent-encodes the characters that would otherwise break a hive
+// "key=value" directory name.
 func escapeHiveValue(s string) string {
 	if s == "" {
 		return "%00"
@@ -157,8 +139,8 @@ func DatasetRoot(dataDir string, dataset Dataset) (string, error) {
 	return filepath.Join(dataDir, string(dataset)), nil
 }
 
-// dataDirFor returns the dataset root a config points at, defaulting data_dir
-// to "data" exactly as core/config.Validate does.
+// dataDirFor returns the dataset root a config points at, defaulting data_dir to "data"
+// exactly as core/config.Validate does.
 func dataDirFor(cfg config.StorageConfig, dataset Dataset) (string, error) {
 	dir := cfg.DataDir
 	if dir == "" {

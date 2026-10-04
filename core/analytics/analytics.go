@@ -1,33 +1,4 @@
-// Package analytics provides typed query helpers over the Parquet cold store
-// for research and backtesting.
-//
-// # Why there is no DuckDB driver in Go
-//
-// docs/contracts.md §3 sketches an `Engine` interface returning `*duckdb.Rows`.
-// This package deliberately does not implement it, and the reason is
-// operational rather than stylistic:
-//
-//   - The DuckDB Go driver is a cgo binding. Adding it makes every Go module
-//     that imports core require cgo, a C++ toolchain, and a static libduckdb on
-//     the build host. That contradicts Plan.md §2's local-first, single-binary
-//     goal and would break `CGO_ENABLED=0` builds.
-//   - The platform already has DuckDB where it earns its keep:
-//     services/inference/requirements.txt declares `duckdb>=1.0`. The Python
-//     inference service and `make backtest` query Parquet directly through
-//     DuckDB, reading the *same files* this package writes — because both sides
-//     address the store by path, not through a daemon.
-//   - Go's side of the platform needs typed, in-process reads: a few hundred
-//     bars per minute at each candle close. parquet-go covers that with no
-//     cgo, no query planner, and no second copy of the data.
-//
-// So the split is: parquet-go in Go for narrow, hot, typed reads;
-// DuckDB in Python for wide, ad-hoc SQL. What this package adds is the layer
-// that keeps ad-hoc SQL honest — Session, Returns, and ScanSQL derive their
-// globs from the same layout code the writer uses, so a research query cannot
-// silently drift from the hive partitioning on disk.
-//
-// Anything a DuckDB query cannot express goes here. Anything that wants joins,
-// window functions or ad-hoc SQL goes to the Python side via ScanSQL.
+// Package analytics provides typed queries over the Parquet candle store.
 package analytics
 
 import (
@@ -41,14 +12,12 @@ import (
 	"github.com/mft/core/storage"
 )
 
-// Store is the read side of the platform: typed queries over the candles
-// dataset. It never creates or modifies a file.
+// Store is the read side of the platform: typed queries over the candles dataset.
 type Store struct {
 	reader *storage.CandleReader
 }
 
-// New returns a Store over an explicit dataset root, typically
-// <data_dir>/candles.
+// New returns a Store over an explicit dataset root, typically <data_dir>/candles.
 func New(root string) (*Store, error) {
 	reader, err := storage.NewCandleReader(root)
 	if err != nil {
@@ -57,8 +26,8 @@ func New(root string) (*Store, error) {
 	return &Store{reader: reader}, nil
 }
 
-// NewFromConfig returns a Store rooted at <data_dir>/candles, resolved from
-// the frozen storage config.
+// NewFromConfig returns a Store rooted at <data_dir>/candles, resolved from the frozen
+// storage config.
 func NewFromConfig(cfg config.StorageConfig) (*Store, error) {
 	reader, err := storage.NewCandleReaderFromConfig(cfg)
 	if err != nil {
@@ -67,12 +36,12 @@ func NewFromConfig(cfg config.StorageConfig) (*Store, error) {
 	return &Store{reader: reader}, nil
 }
 
-// Reader exposes the underlying candle reader for callers that need the raw
-// file list or a plain tail query.
+// Reader exposes the underlying candle reader for callers that need the raw file list
+// or a plain tail query.
 func (s *Store) Reader() *storage.CandleReader { return s.reader }
 
-// Summary aggregates a candle range into the numbers a researcher asks for
-// first: extent, OHLC, volume, realised volatility and the simple return.
+// Summary aggregates a candle range into the numbers a researcher asks for first:
+// extent, OHLC, volume, realised volatility and the simple return.
 type Summary struct {
 	Symbol      string
 	Bars        int
@@ -89,9 +58,7 @@ type Summary struct {
 	MaxDrawdown float64
 }
 
-// Summary aggregates [start, end) for symbol. A range containing no candles
-// returns a zero Summary and no error: an empty market is an answer, not a
-// failure.
+// Summary aggregates [start, end) for symbol.
 func (s *Store) Summary(ctx context.Context, symbol string, start, end time.Time) (Summary, error) {
 	candles, err := s.reader.CandleRange(ctx, symbol, start, end, 0)
 	if err != nil {
@@ -168,10 +135,7 @@ type Return struct {
 	Simple    float64
 }
 
-// Returns computes per-bar returns over [start, end), oldest first. The first
-// bar has no predecessor inside the window and is therefore reported with a
-// zero return rather than being dropped, so Bar indices line up with the
-// candles slice a backtest is iterating.
+// Returns computes per-bar returns over [start, end), oldest first.
 func (s *Store) Returns(ctx context.Context, symbol string, start, end time.Time) ([]Return, error) {
 	candles, err := s.reader.CandleRange(ctx, symbol, start, end, 0)
 	if err != nil {
@@ -202,9 +166,7 @@ type Session struct {
 	Volume int64
 }
 
-// Sessions buckets candles into UTC dates, oldest first. Bucketing by UTC
-// rather than IST keeps this package free of a timezone dependency; a caller
-// that needs exchange-local sessions should pass already-bucketed ranges.
+// Sessions buckets candles into UTC dates, oldest first.
 func (s *Store) Sessions(ctx context.Context, symbol string, start, end time.Time) ([]Session, error) {
 	candles, err := s.reader.CandleRange(ctx, symbol, start, end, 0)
 	if err != nil {
@@ -232,8 +194,8 @@ func (s *Store) Sessions(ctx context.Context, symbol string, start, end time.Tim
 	return out, nil
 }
 
-// Coverage reports how much history exists for a symbol, which is what the
-// feature builder needs before it can claim the 60-bar warm-up is satisfied.
+// Coverage reports how much history exists for a symbol, which is what the feature
+// builder needs before it can claim the 60-bar warm-up is satisfied.
 type Coverage struct {
 	Symbol   string
 	Bars     int
@@ -243,8 +205,8 @@ type Coverage struct {
 	Complete bool
 }
 
-// WarmupBars is the number of context-only bars the feature schema requires
-// before any bar may be used as a prediction target (docs/contracts.md §4).
+// WarmupBars is the number of context-only bars the feature schema requires before any
+// bar may be used as a prediction target (docs/contracts.md §4).
 const WarmupBars = 60
 
 // Coverage counts the candles stored for symbol across the whole dataset.
@@ -272,12 +234,8 @@ func (s *Store) Coverage(ctx context.Context, symbol string) (Coverage, error) {
 	}, nil
 }
 
-// ScanSQL returns the DuckDB relation that reads exactly the files holding
-// symbol's candles, for handing to the Python side or `make backtest`.
-//
-// The glob is derived from the same layout the writer uses, so it stays correct
-// as the hive layout evolves. hive_partitioning=true makes DuckDB expose
-// symbol and date as columns instead of only as path segments.
+// ScanSQL returns the DuckDB relation that reads exactly the files holding symbol's
+// candles, for handing to the Python side or `make backtest`.
 func (s *Store) ScanSQL(symbol string) (string, error) {
 	if symbol == "" {
 		return "", fmt.Errorf("analytics: symbol must not be empty")
@@ -291,8 +249,7 @@ type Window struct {
 	End   time.Time
 }
 
-// Last returns the window covering the most recent duration up to end. It is
-// the shape the inference loop asks for on every minute close.
+// Last returns the window covering the most recent duration up to end.
 func Last(end time.Time, duration time.Duration) Window {
 	return Window{Start: end.Add(-duration), End: end}
 }
@@ -306,8 +263,8 @@ func (w Window) Validate() error {
 	return nil
 }
 
-// Context returns the most recent `rows` candles for symbol, ascending by
-// time — the exact shape the TabFM inference loop consumes.
+// Context returns the most recent `rows` candles for symbol, ascending by time — the
+// exact shape the TabFM inference loop consumes.
 func (s *Store) Context(ctx context.Context, symbol string, rows int) ([]contracts.Candle, error) {
 	return s.reader.Candles(ctx, symbol, rows)
 }
