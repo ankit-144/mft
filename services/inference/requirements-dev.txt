@@ -1,9 +1,0 @@
-# Inference test tooling.
-#
-# Separate from requirements.txt so the runtime image does not carry a test
-# framework. requirements.txt is FROZEN; this file is additive and is only
-# read by ./venv.sh and by CI.
-#
-#   services/inference/venv.sh --dev     installs this alongside the runtime
-
-pytest>=8.0

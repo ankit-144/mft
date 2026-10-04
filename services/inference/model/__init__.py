@@ -1,8 +1,4 @@
-"""Inference model implementations behind the `InferenceModel` protocol.
-
-`docs/contracts.md` §5. TabFM is swappable because its weights are
-non-commercial; see `Plan.md` §5 and the `tabfm_model` module docstring.
-"""
+"""Inference model implementations behind the `InferenceModel` protocol."""
 
 from __future__ import annotations
 
@@ -25,6 +21,9 @@ from .base import (
     validate_context,
 )
 from .heuristic_model import HeuristicModel
+from .algorithms import register_algorithms
+
+register_algorithms(register)
 
 __all__ = [
     "FEATURE_COLUMNS",
