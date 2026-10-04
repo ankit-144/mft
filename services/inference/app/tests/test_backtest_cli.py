@@ -198,18 +198,14 @@ def test_execution_limits_are_read_from_the_frozen_schema(config_file: Path) -> 
     assert limits.max_order_quantity == 500
 
 
-def test_the_repository_config_is_usable_as_shipped() -> None:
-    """`make backtest` has to work against the config in the repository."""
-    resolved = bt.resolve_path()
-    limits = load_execution_limits()
-    assert limits.capital > 0.0, f"{resolved} must set execution.capital"
-    assert load_config_instruments()
-
-
-def load_config_instruments() -> list[str]:
+def test_the_repository_example_config_is_usable_as_shipped() -> None:
+    """The tracked example supports backtests before local setup creates a config."""
     from app.config import load_config
 
-    return load_config().inference.instruments
+    example = Path(__file__).resolve().parents[4] / "configs" / "config.example.yaml"
+    limits = load_execution_limits(example)
+    assert limits.capital > 0.0, f"{example} must set execution.capital"
+    assert load_config(example).inference.instruments
 
 
 def test_a_missing_capital_is_refused_with_the_key_named(tmp_path: Path) -> None:

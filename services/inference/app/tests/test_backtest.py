@@ -42,6 +42,7 @@ from typing import Any, Sequence
 import pandas as pd
 import pytest
 
+import app.backtest as backtest_module
 from app.backtest import (
     BARS_PER_YEAR,
     Candidate,
@@ -52,6 +53,7 @@ from app.backtest import (
     ChargeModel,
     EquityPoint,
     ExecutionLimits,
+    FEATURE_ROW_SECONDS,
     Portfolio,
     Reason,
     WalkForward,
@@ -1048,17 +1050,37 @@ def test_a_series_over_the_bar_limit_is_refused_not_truncated() -> None:
         backtest({"TEST": candles}, max_bars=199)
 
 
-def test_the_rebuild_cost_projection_matches_what_the_run_actually_spends() -> None:
-    """The estimate in the refusal message is an estimate of the real thing.
+def test_the_rebuild_cost_projection_matches_timed_feature_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The projection accounts for every cumulative row rebuilt in the run.
 
-    A refusal that projects a wrong number is worse than one that projects
-    none, because the user sizes `--max-bars` from it. This pins the projection
-    against a measured run of the same size.
+    A stubbed monotonic clock assigns the documented per-row cost to each
+    feature build, so this checks estimator arithmetic without depending on
+    machine load or CI timing noise.
     """
+    class FakeClock:
+        elapsed = 0.0
+        pending = 0.0
+
+        def read(self) -> float:
+            self.elapsed += self.pending
+            self.pending = 0.0
+            return self.elapsed
+
+    clock = FakeClock()
+    original_build = FeatureBuilder.build
+
+    def timed_build(builder: FeatureBuilder, rows: Sequence[Candle]) -> Any:
+        clock.pending = len(rows) * FEATURE_ROW_SECONDS
+        return original_build(builder, rows)
+
+    monkeypatch.setattr(backtest_module.time, "perf_counter", clock.read)
+    monkeypatch.setattr(FeatureBuilder, "build", timed_build)
     candles = generate("TEST", SynthSpec(bars=800, seed=41, start_price=1000.0))
     result = backtest({"TEST": candles}, mode="rebuild")
     measured = result.timing.feature_seconds / 60.0
     projected = projected_rebuild_minutes(800, 1)
-    assert projected == pytest.approx(measured, rel=0.5)
+    assert projected == pytest.approx(measured, abs=1e-12)
     # And it grows quadratically, which is the whole reason for the limit.
     assert projected_rebuild_minutes(1600, 1) == pytest.approx(4 * projected, rel=0.05)

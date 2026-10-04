@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Final, Sequence
 
+from .candles import Candle
 from .backtest import (
     DEFAULT_MAX_BARS, DEFAULT_MAX_TRADES_SHOWN, DEFAULT_MODEL, DEFAULT_START_PRICE,
     WEIGHTED_MODELS, WEIGHTS_WARNING, BacktestError, BacktestResult, Config, ConfigError,

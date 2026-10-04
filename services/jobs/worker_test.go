@@ -21,10 +21,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// fixedNow anchors every segment boundary in these tests. The worker reads the
-// clock through BackfillWorker.now, so a lookback is a deterministic set of
-// date ranges rather than something that depends on when the suite ran.
-var fixedNow = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+// fixedNow is midnight at a 60-day segment boundary in India time. The worker
+// reads the clock through BackfillWorker.now, so lookbacks that are multiples
+// of 60 days produce a deterministic set of complete segments.
+var fixedNow = time.Date(2026, 1, 7, 0, 0, 0, 0, indiaTimeZone)
 
 // recordedSleeps captures the backoff schedule a retry loop asked for instead
 // of waiting it out, so a 429 test asserts on the schedule without spending
@@ -194,15 +194,15 @@ func TestRunBackfillLandsSegmentsInTheParquetStore(t *testing.T) {
 		t.Fatalf("RunBackfill() error = %v", err)
 	}
 
-	// A 120-day lookback at a 60-day chunk is two segments.
+	// A 120-day lookback ending on a 60-day boundary is two segments.
 	files := fx.landed(t)
 	if len(files) != 2 {
 		t.Fatalf("landed %d segment files, want 2: %v", len(files), files)
 	}
-	if want := fx.segmentPath("RELIANCE", "2025-11-01", "2025-12-31"); files[0] != want {
+	if want := fx.segmentPath("RELIANCE", "2025-09-09", "2025-11-08"); files[0] != want {
 		t.Errorf("first segment = %q, want %q", files[0], want)
 	}
-	if want := fx.segmentPath("RELIANCE", "2025-12-31", "2026-03-01"); files[1] != want {
+	if want := fx.segmentPath("RELIANCE", "2025-11-08", "2026-01-07"); files[1] != want {
 		t.Errorf("second segment = %q, want %q", files[1], want)
 	}
 
@@ -226,7 +226,7 @@ func TestRunBackfillLandsSegmentsInTheParquetStore(t *testing.T) {
 	}
 }
 
-func TestBackfillGrowingWindowReplacesStableEdgeBucket(t *testing.T) {
+func TestBackfillGrowingWindowKeepsStableBucketAndFetchesNewEdges(t *testing.T) {
 	fake := &fakeKite{responder: threeRowsPerRequest(t)}
 	fx := newBackfillFixture(t, fake, 120, 60, "RELIANCE")
 	if err := fx.run(context.Background()); err != nil {
@@ -241,8 +241,33 @@ func TestBackfillGrowingWindowReplacesStableEdgeBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondPaths := fx.landed(t)
-	if len(secondPaths) != 2 || secondPaths[0] != firstPaths[0] || secondPaths[1] != firstPaths[1] {
-		t.Fatalf("next-day resume paths = %v, want same two stable bucket files %v", secondPaths, firstPaths)
+	if len(secondPaths) != 3 {
+		t.Fatalf("next-day run left %d segment files, want two existing buckets and one new edge bucket: %v", len(secondPaths), secondPaths)
+	}
+	for _, path := range firstPaths {
+		found := false
+		for _, nextPath := range secondPaths {
+			if nextPath == path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("next-day run removed prior segment %q", path)
+		}
+	}
+	if got := fake.count(); got != 3 {
+		t.Errorf("next-day run made %d total requests, want 3: both existing buckets should be skipped", got)
+	}
+	if got := fx.metric(t, "mft_jobs_backfill_segments_skipped_total"); got != 2 {
+		t.Errorf("segments_skipped_total = %d, want 2", got)
+	}
+	if got := fx.metric(t, "mft_jobs_backfill_segments_total"); got != 3 {
+		t.Errorf("segments_total = %d, want 3 after landing one new edge bucket", got)
+	}
+	newEdge := fx.segmentPath("RELIANCE", "2026-01-07", "2026-03-08")
+	if _, err := os.Stat(newEdge); err != nil {
+		t.Errorf("missing next-day edge bucket at %s: %v", newEdge, err)
 	}
 }
 
@@ -474,7 +499,7 @@ func TestRunBackfillCoversEveryConfiguredInstrument(t *testing.T) {
 		t.Fatalf("landed %d segments, want one per distinct symbol (3): %v", n, fx.landed(t))
 	}
 	for _, symbol := range []string{"RELIANCE", "TCS", "INFY"} {
-		path := fx.segmentPath(symbol, "2025-12-31", "2026-03-01")
+		path := fx.segmentPath(symbol, "2025-11-08", "2026-01-07")
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("missing segment for %s at %s: %v", symbol, path, err)
 		}

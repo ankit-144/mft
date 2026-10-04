@@ -8,7 +8,18 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone, tzinfo
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .backtest import (
+        BarOutcome,
+        Candidate,
+        ChargeBreakdown,
+        ChargeModel,
+        ExecutionLimits,
+        Reason,
+        SymbolWalk,
+    )
 
 from .features import SESSION_OPEN_MINUTE
 from .signals import SIDE_BUY, SIDE_SELL, Side, rfc3339
