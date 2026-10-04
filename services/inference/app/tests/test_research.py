@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -94,8 +95,7 @@ def test_metric_evaluators_are_pluggable() -> None:
     assert "test_total_return" in available_evaluators()
 
 
-@pytest.mark.asyncio
-async def test_candidate_grid_and_custom_minimization_metric_select_on_validation_only() -> None:
+def test_candidate_grid_and_custom_minimization_metric_select_on_validation_only() -> None:
     evaluator_name = "test_minimum_candidate_trades"
 
     @register_evaluator(
@@ -117,13 +117,15 @@ async def test_candidate_grid_and_custom_minimization_metric_select_on_validatio
         selection_metric="candidate_trades",
         max_positions=1,
     )
-    result = await run_experiment(
-        {"TEST": candles()},
-        config=cfg,
-        candidates=[
-            CandidateConfig("baseline_momentum", threshold=0.0),
-            CandidateConfig("baseline_momentum", threshold=1.0),
-        ],
+    result = asyncio.run(
+        run_experiment(
+            {"TEST": candles()},
+            config=cfg,
+            candidates=[
+                CandidateConfig("baseline_momentum", threshold=0.0),
+                CandidateConfig("baseline_momentum", threshold=1.0),
+            ],
+        )
     )
     assert result.selected_candidate is not None
     assert result.selected_candidate.threshold == 1.0
@@ -295,8 +297,7 @@ def test_simultaneous_entries_recheck_drawdown_after_entry_costs() -> None:
     assert result.rejections["RISK_MAX_DRAWDOWN"] == 1
 
 
-@pytest.mark.asyncio
-async def test_feature_to_algorithm_to_split_portfolio_and_report_is_reproducible() -> None:
+def test_feature_to_algorithm_to_split_portfolio_and_report_is_reproducible() -> None:
     config = ExperimentConfig(
         horizon=2,
         context_rows=80,
@@ -307,8 +308,12 @@ async def test_feature_to_algorithm_to_split_portfolio_and_report_is_reproducibl
         max_positions=1,
     )
     data = {"TEST": candles()}
-    first = await run_experiment(data, config=config, algorithms=["baseline_momentum", "baseline_rsi"])
-    second = await run_experiment(data, config=config, algorithms=["baseline_rsi", "baseline_momentum"])
+    first = asyncio.run(
+        run_experiment(data, config=config, algorithms=["baseline_momentum", "baseline_rsi"])
+    )
+    second = asyncio.run(
+        run_experiment(data, config=config, algorithms=["baseline_rsi", "baseline_momentum"])
+    )
     document = first.to_json()
     assert document["schema"] == "mft.research.v1"
     assert document["disclaimer"].startswith("Research estimates")
@@ -325,8 +330,7 @@ async def test_feature_to_algorithm_to_split_portfolio_and_report_is_reproducibl
     assert final_timestamp >= max(trade["exit_as_of"] for trade in document["test"]["trades"])
 
 
-@pytest.mark.asyncio
-async def test_heldout_mutation_does_not_change_validation_or_model_selection() -> None:
+def test_heldout_mutation_does_not_change_validation_or_model_selection() -> None:
     source = candles()
     base_config = ExperimentConfig(
         horizon=3, context_rows=80, threshold=0.0, max_positions=1,
@@ -338,21 +342,32 @@ async def test_heldout_mutation_does_not_change_validation_or_model_selection() 
         validation_fraction=base_config.validation_fraction,
         purge_bars=base_config.purge, embargo_bars=base_config.embargo,
     )
-    a = await run_experiment({"TEST": source}, config=base_config, algorithms=["baseline_momentum", "baseline_ridge"])
+    a = asyncio.run(
+        run_experiment(
+            {"TEST": source},
+            config=base_config,
+            algorithms=["baseline_momentum", "baseline_ridge"],
+        )
+    )
     dirty = list(source)
     factor = 1.8
     for i in range(plan.test[0], len(dirty)):
         c = dirty[i]
         dirty[i] = Candle(c.symbol, c.timestamp, c.open * factor, c.high * factor,
                           c.low * factor, c.close * factor, c.volume)
-    b = await run_experiment({"TEST": dirty}, config=base_config, algorithms=["baseline_momentum", "baseline_ridge"])
+    b = asyncio.run(
+        run_experiment(
+            {"TEST": dirty},
+            config=base_config,
+            algorithms=["baseline_momentum", "baseline_ridge"],
+        )
+    )
     assert a.selected_algorithm == b.selected_algorithm
     assert [x.validation.metrics for x in a.assessments] == [x.validation.metrics for x in b.assessments]
     assert a.test.metrics != b.test.metrics
 
 
-@pytest.mark.asyncio
-async def test_store_adapter_uses_bounded_tail_protocol() -> None:
+def test_store_adapter_uses_bounded_tail_protocol() -> None:
     class Store:
         limit = 0
 
@@ -362,6 +377,10 @@ async def test_store_adapter_uses_bounded_tail_protocol() -> None:
 
     store = Store()
     cfg = ExperimentConfig(max_bars_per_symbol=700, train_fraction=0.5, validation_fraction=0.35)
-    result = await run_experiment_from_store(store, ["test"], config=cfg, algorithms=["baseline_momentum"])
+    result = asyncio.run(
+        run_experiment_from_store(
+            store, ["test"], config=cfg, algorithms=["baseline_momentum"]
+        )
+    )
     assert store.limit == 701
     assert result.test.scored_bars > 0
