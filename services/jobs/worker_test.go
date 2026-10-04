@@ -241,8 +241,8 @@ func TestBackfillGrowingWindowKeepsStableBucketAndFetchesNewEdges(t *testing.T) 
 		t.Fatal(err)
 	}
 	secondPaths := fx.landed(t)
-	if len(secondPaths) != 4 {
-		t.Fatalf("next-day run left %d segment files, want the two original edges, one stable bucket, and one new edge: %v", len(secondPaths), secondPaths)
+	if len(secondPaths) != 3 {
+		t.Fatalf("next-day run left %d segment files, want two existing buckets and one new edge bucket: %v", len(secondPaths), secondPaths)
 	}
 	for _, path := range firstPaths {
 		found := false
@@ -256,8 +256,18 @@ func TestBackfillGrowingWindowKeepsStableBucketAndFetchesNewEdges(t *testing.T) 
 			t.Errorf("next-day run removed prior segment %q", path)
 		}
 	}
-	if got := fake.count(); got != 4 {
-		t.Errorf("next-day run made %d total requests, want 4: the stable bucket should be skipped", got)
+	if got := fake.count(); got != 3 {
+		t.Errorf("next-day run made %d total requests, want 3: both existing buckets should be skipped", got)
+	}
+	if got := fx.metric(t, "mft_jobs_backfill_segments_skipped_total"); got != 2 {
+		t.Errorf("segments_skipped_total = %d, want 2", got)
+	}
+	if got := fx.metric(t, "mft_jobs_backfill_segments_total"); got != 3 {
+		t.Errorf("segments_total = %d, want 3 after landing one new edge bucket", got)
+	}
+	newEdge := fx.segmentPath("RELIANCE", "2026-01-07", "2026-03-08")
+	if _, err := os.Stat(newEdge); err != nil {
+		t.Errorf("missing next-day edge bucket at %s: %v", newEdge, err)
 	}
 }
 
