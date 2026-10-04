@@ -1,109 +1,87 @@
-# MFT Platform
+# MFT platform
 
-Medium Frequency Trading (MFT) platform V3. Go services for low-latency
-execution, Python (TabFM) inference, Parquet cold storage, and DuckDB
-analytics. See [Plan.md](./Plan.md) for the full architecture spec.
+Go ingestion, execution and historical jobs; Python inference and strategy
+research; shared Parquet data. Defaults are **paper execution**, **inference dry
+run** and a lightweight heuristic model.
 
-## Structure
+## Components
 
-```
-├── core/                    # Shared generic code (own Go module)
-│   ├── broker/              # Broker connector interfaces (Zerodha Kite Connect)
-│   ├── config/              # YAML config loading + validation
-│   ├── fluxkv/              # In-memory TTL cache + 1-min candle aggregation
-│   ├── log/                 # Shared zap logger
-│   ├── metrics/             # Prometheus registry, handler, server
-│   ├── storage/             # Parquet tick storage
-│   └── fx.go                # Core FX module wiring
-├── services/
-│   ├── ingestion/           # Service 1: tick ingestion pipeline (own module)
-│   ├── execution/           # Service 3: execution & risk engine (own module)
-│   ├── jobs/                # Service 4: background jobs & backfill (own module)
-│   └── inference/           # Service 2: Python/TabFM inference node
-├── configs/                 # YAML configs
-├── data/                    # Local data (parquet files, gitignored)
-├── go.work                  # Go workspace tying modules together
-└── Makefile                 # Build/run targets
-```
+| Path | Responsibility |
+| --- | --- |
+| `core/` | Config/contracts, Kite adapter, typed storage/features, cache, logging and metrics |
+| `services/ingestion/` | Bounded tick processing, volume deltas and closed-candle publication |
+| `services/execution/` | Durable order claims, risk reservations, reconciliation, fill accounting and HTTP |
+| `services/jobs/` | Paced/resumable historical backfill |
+| `services/inference/app/` | Canonical DuckDB reader, features, serialized model worker and minute scheduler |
+| `services/inference/model/` | Predictor contract, heuristic and mathematical baseline registry |
+| `services/inference/app/research/` | Independent strategies/evaluators, chronological selection and cost-aware simulation |
 
-Each Go microservice is its own Go module wired together by `go.work`. All
-services use [Uber FX](https://github.com/uber-go/fx) for dependency
-injection and [prometheus/client_golang](https://github.com/prometheus/client_golang)
-for metrics. Shared code lives in `core/`.
+The Go modules are joined by `go.work`. Go reads Parquet through typed readers;
+Python uses DuckDB. Both runtimes use the same ordered 18-feature schema.
 
-## Getting Started
+## Local setup
+
+Requires Go 1.25 and Python 3.12 or later. From the repository root:
 
 ```sh
-# 1. Resolve dependencies (from repo root)
-make tidy
+make setup
+services/inference/venv.sh --dev
+```
 
-# 2. Build all modules
-make build
+`make setup` builds the Go services, creates the Python environment and copies
+the example config when no local config exists. Relative data and journal paths
+resolve from the project root when the config is inside `configs/`. The runtime
+install excludes torch and checkpoint packages; optional model dependencies are
+in `services/inference/requirements-model.txt`.
 
-# 3. Run a service
-make run-ingestion
+Start individual services or the local process supervisor with:
+
+```sh
 make run-execution
-make run-jobs
+make run-inference
+make dev
+make stop
 ```
 
-Each service exposes a metrics endpoint on `:9090` by default
-(override `metrics.addr` in config).
+`make dev` supervises its own subprocesses and `make stop` stops only that
+recorded process group. Real ingestion and historical backfill require a usable
+broker session. Services consume `MFT_CONFIG`; `MFT_INFERENCE_MODEL`,
+`MFT_EXECUTION_URL`, `MFT_EXECUTION_ADDR` and `MFT_EXECUTION_API_TOKEN` override
+relevant settings. Broker credential variables are listed in `.env.example`.
 
-## Testing
+## Research
 
 ```sh
-# Run unit tests across all Go modules (core + services)
-make test
-
-# Vet all modules
-make vet
+make research ARGS='--source synthetic --symbols RELIANCE --bars 1000'
+make backtest ARGS='--synthetic --model heuristic --bars 200 --feature-mode incremental'
+make benchmarks
 ```
 
-Test helpers live in `core/testutil` (mock broker streamer/client, isolated
-Prometheus registry, metric value assertions). Coverage spans:
+Run `python -m app.research --help` from `services/inference` with the project
+virtual environment for candidate, evaluator, cost and output options.
+Algorithms, strategies and selection metrics are registered independently.
+Validation chooses the candidate; held-out timestamps evaluate the selected
+candidate afterward.
 
-- `core/fluxkv` — TTL get/set/delete, minute-candle aggregation & rollover
-- `core/config` — YAML load, defaults, error paths
-- `core/storage` — Parquet flush + read-back
-- `services/ingestion` — tick processing updates candles + queues storage
-- `services/execution` — order placement, debounce rejection/expiry, broker errors
-- `services/jobs` — backfill worker runs and bumps its metric
+Synthetic results check accounting and integration; they do not establish
+market profitability. Research assumes close-price fills with configurable
+costs, while production execution uses broker fills. The default live graph has
+no automatic horizon exit policy; callers can inject `ExitPolicy` with stable
+keys and metadata.
 
-## Docker
+## Services and containers
 
-The repo ships Dockerfiles per service plus a `docker-compose.yml` for the
-full stack. Build context is the repo root, so the Go workspace and shared
-`core` module are available to each image.
+Execution defaults to `127.0.0.1:8080`; inference defaults to
+`127.0.0.1:8000`. Live execution requires bearer authentication. Paper mode also
+checks a configured token. `/v1/health` reports execution readiness; inference
+exposes `/healthz`, `/readyz` and `/metrics`.
 
 ```sh
-# Build all images
 make docker-build
-
-# Start the stack in the background
 make docker-up
-
-# Tail logs
-make docker-logs
-
-# Stop and remove containers (data volume persists)
 make docker-down
 ```
 
-Endpoints after `docker-up`:
-
-| Service    | HTTP            | Metrics         |
-| :--------- | :-------------- | :-------------- |
-| ingestion  | —               | `:9090`         |
-| execution  | `:8080` (POST /v1/orders) | `:9091` |
-| jobs       | —               | `:9092`         |
-| inference  | `:8000` (healthz, /v1/predict) | —        |
-
-Images use the example config (empty credentials) by default — mount a
-real config or set `MFT_CONFIG` via env to connect the broker. Parquet data
-persists in the `mft_data` volume.
-
-## Configuration
-
-Copy `configs/config.example.yaml` to `configs/config.yaml` and fill in
-broker credentials. Environment variables from `.env.example` are supported
-by the broker connectors.
+Compose uses the example config, internal service URLs and a shared data volume.
+Host ports are loopback-bound. The Docker context excludes worktrees,
+environments and data.
