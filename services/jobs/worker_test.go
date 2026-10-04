@@ -87,9 +87,11 @@ func newBackfillFixtureIn(t *testing.T, fake *fakeKite, dir string, lookbackDays
 	cfg.Broker.Instruments = symbols
 
 	reg := testutil.NewRegistry()
+	store := newParquetStore(dir, "minute")
+	store.segmentLen = time.Duration(chunkDays) * day
 	worker := NewBackfillWorker(cfg,
 		newKiteHistory(cfg, masterResolver(), baseURL, testutil.NewLogger()),
-		newParquetStore(dir, "minute"),
+		store,
 		NewLimiter(1000),
 		testutil.NewLogger(), reg)
 	worker.segmentLen = time.Duration(chunkDays) * day
@@ -173,7 +175,8 @@ func threeRowsPerRequest(t *testing.T) func(*http.Request) reply {
 // with one in-range bar otherwise.
 func failsFor(t *testing.T, status int, body, symbol string) func(*http.Request) reply {
 	return func(r *http.Request) reply {
-		if strings.Contains(r.URL.Path, "/"+symbol+"/") {
+		tokenBySymbol := map[string]string{"RELIANCE": "/256265/", "TCS": "/11536/", "INFY": "/15909/"}
+		if strings.Contains(r.URL.Path, tokenBySymbol[strings.ToUpper(symbol)]) {
 			return reply{status: status, body: body}
 		}
 		from, _ := rangeOf(t, r)
@@ -220,6 +223,26 @@ func TestRunBackfillLandsSegmentsInTheParquetStore(t *testing.T) {
 	}
 	if got := fx.metric(t, "mft_jobs_backfill_last_success_timestamp_seconds"); got != int(fixedNow.Unix()) {
 		t.Errorf("last_success = %d, want %d", got, fixedNow.Unix())
+	}
+}
+
+func TestBackfillGrowingWindowReplacesStableEdgeBucket(t *testing.T) {
+	fake := &fakeKite{responder: threeRowsPerRequest(t)}
+	fx := newBackfillFixture(t, fake, 120, 60, "RELIANCE")
+	if err := fx.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	firstPaths := fx.landed(t)
+	if len(firstPaths) != 2 {
+		t.Fatalf("first run wrote %d segment files, want 2: %v", len(firstPaths), firstPaths)
+	}
+	fx.worker.now = func() time.Time { return fixedNow.Add(24 * time.Hour) }
+	if err := fx.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	secondPaths := fx.landed(t)
+	if len(secondPaths) != 2 || secondPaths[0] != firstPaths[0] || secondPaths[1] != firstPaths[1] {
+		t.Fatalf("next-day resume paths = %v, want same two stable bucket files %v", secondPaths, firstPaths)
 	}
 }
 

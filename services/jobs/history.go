@@ -20,26 +20,16 @@ import (
 
 // Kite history endpoint and limits.
 const (
-	// kiteAPIURL is Kite Connect's production base. It is a variable rather
-	// than a constant so a test can point the client at an httptest server.
 	kiteAPIURL = "https://api.kite.trade"
 
-	// historyPath is the Kite Connect historical data route. The exchange and
-	// trading symbol are path segments; the interval is a bare word.
-	historyPath = "/data/historical/%s/%s/%s/%s/%s"
+	historyPath = "/instruments/historical/%d/%s"
 
-	// historyResponseMaxBytes bounds a candle response. Kite caps a single
-	// response at a few thousand rows; the limit stops a corrupted or hostile
-	// response from exhausting memory.
 	historyResponseMaxBytes = 16 << 20
 
-	// defaultHistoryTimeout is used when broker.request_timeout_seconds is
-	// zero or negative.
 	defaultHistoryTimeout = 10 * time.Second
 )
 
-// candle fields inside a Kite historical row. Kite returns a positional array
-// rather than an object, in this fixed order.
+// candle fields inside a Kite historical row.
 const (
 	histFieldTimestamp = 0
 	histFieldOpen      = 1
@@ -50,10 +40,7 @@ const (
 	histFieldsRequired = 6
 )
 
-// historyEnvelope is the Kite historical response. On success Status is
-// "success" and Data.Candles holds the rows; on failure Status is "error" and
-// Errors carries the same envelope core/broker decodes, which is left to the
-// shared error parser.
+// historyEnvelope is the Kite historical response.
 type historyEnvelope struct {
 	Status string `json:"status"`
 	Data   struct {
@@ -70,18 +57,6 @@ type historyEnvelope struct {
 }
 
 // KiteHistory is the Kite-backed implementation of HistoricalClient.
-//
-// Kite's historical data is a REST call, and C1 scoped core/broker to the
-// WebSocket stream and the order endpoints, so the client lives here rather
-// than behind core/broker: this component owns services/jobs, and adding a
-// fourth file to another component's package would collide with its branch.
-//
-// It holds credentials rather than a *broker.Kite, because Kite's credential
-// fields are unexported by design and reading them out of the connector would
-// be a worse coupling than reading the same frozen config block. Symbol
-// resolution is delegated to the [InstrumentResolver] seam, so instrument
-// tokens still come from C1's instrument master and there is one place that
-// knows what a tradable symbol is.
 type KiteHistory struct {
 	apiKey      string
 	accessToken string
@@ -89,12 +64,10 @@ type KiteHistory struct {
 	client      *http.Client
 	resolver    InstrumentResolver
 	log         *zap.Logger
+	pacer       *broker.RESTPacer
 }
 
 // NewKiteHistory returns a historical client for the configured Kite account.
-// The resolver is C1's *broker.Kite, which supplies exchange and instrument
-// token; a nil resolver is replaced by one that resolves nothing, in which case
-// every call fails with broker.ErrInstrumentNotFound.
 func NewKiteHistory(cfg *config.Config, resolver InstrumentResolver, log *zap.Logger) *KiteHistory {
 	if log == nil {
 		log = zap.NewNop()
@@ -110,13 +83,11 @@ func NewKiteHistory(cfg *config.Config, resolver InstrumentResolver, log *zap.Lo
 		client:      &http.Client{Timeout: timeout},
 		resolver:    resolver,
 		log:         log,
+		pacer:       broker.NewRESTPacer(),
 	}
 }
 
-// newKiteHistory builds a client pointed at baseURL. The endpoint is a
-// parameter rather than a package variable so that a test can reach an
-// httptest server without mutating shared state, and so that two such clients
-// cannot interfere with each other.
+// newKiteHistory builds a client pointed at baseURL.
 func newKiteHistory(cfg *config.Config, resolver InstrumentResolver, baseURL string, log *zap.Logger) *KiteHistory {
 	k := NewKiteHistory(cfg, resolver, log)
 	k.baseURL = strings.TrimRight(baseURL, "/")
@@ -139,12 +110,7 @@ func (k *KiteHistory) logger() *zap.Logger {
 	return k.log
 }
 
-// HistoricalCandles implements HistoricalClient against
-// GET /data/historical/{exchange}/{symbol}/{interval}/{from}/{to}.
-//
-// The interval must be a bare Kite interval word ("minute", "day"); the
-// one-minute interval this platform trades at is "minute". The range is
-// [from, to], matching the segment boundaries the store writes.
+// HistoricalCandles implements HistoricalClient against Kite's token route.
 func (k *KiteHistory) HistoricalCandles(ctx context.Context, symbol string, from, to time.Time, interval string) ([]contracts.Candle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -166,23 +132,36 @@ func (k *KiteHistory) HistoricalCandles(ctx context.Context, symbol string, from
 		return nil, err
 	}
 
-	endpoint := fmt.Sprintf(historyPath,
-		url.PathEscape(inst.Exchange),
-		url.PathEscape(inst.Symbol),
-		url.PathEscape(interval),
-		from.UTC().Format(time.DateOnly),
-		to.UTC().Format(time.DateOnly),
-	)
-	query := url.Values{}
-	query.Set("instrument_token", strconv.FormatInt(inst.Token, 10))
-	query.Set("continuous", "0")
-	query.Set("include_oi", "0")
-
-	raw, err := k.get(ctx, endpoint+"?"+query.Encode())
+	requestPath := historyRequestPath(inst, from, to, interval)
+	raw, err := k.get(ctx, requestPath)
 	if err != nil {
 		return nil, fmt.Errorf("kite history: %s: %w", symbol, err)
 	}
-	return k.decode(inst.Symbol, raw)
+	candles, err := k.decode(inst.Symbol, raw)
+	if err != nil {
+		return nil, err
+	}
+	return historicalRange(candles, from, to), nil
+}
+
+func historyRequestPath(inst contracts.Instrument, from, to time.Time, interval string) string {
+	endpoint := fmt.Sprintf(historyPath, inst.Token, url.PathEscape(interval))
+	query := url.Values{}
+	query.Set("from", from.In(indiaTimeZone).Format("2006-01-02 15:04:05"))
+	query.Set("to", to.In(indiaTimeZone).Format("2006-01-02 15:04:05"))
+	query.Set("continuous", "0")
+	query.Set("oi", "0")
+	return endpoint + "?" + query.Encode()
+}
+
+func historicalRange(candles []contracts.Candle, from, to time.Time) []contracts.Candle {
+	out := candles[:0]
+	for _, candle := range candles {
+		if !candle.Timestamp.Before(from) && candle.Timestamp.Before(to) {
+			out = append(out, candle)
+		}
+	}
+	return out
 }
 
 // instrument resolves a symbol to its exchange and token via the resolver.
@@ -203,10 +182,13 @@ func (k *KiteHistory) instrument(ctx context.Context, symbol string) (contracts.
 	return contracts.Instrument{}, fmt.Errorf("kite history: %s: %w", sym, broker.ErrInstrumentNotFound)
 }
 
-// get performs the authenticated request and maps a non-2xx status onto the
-// same sentinels core/broker uses, so the fetcher can tell a 429 to back off
-// from a 401 to stop.
+// get performs the authenticated request and maps a non-2xx status onto the same
+// sentinels core/broker uses, so the fetcher can tell a 429 to back off from a 401 to
+// stop.
 func (k *KiteHistory) get(ctx context.Context, endpoint string) ([]byte, error) {
+	if err := k.pacer.Wait(ctx, broker.RESTHistorical); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.base()+endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build %s: %w", broker.ErrUnavailable, endpoint, err)
@@ -231,10 +213,7 @@ func (k *KiteHistory) get(ctx context.Context, endpoint string) ([]byte, error) 
 	return raw, nil
 }
 
-// historyStatusError maps a Kite non-2xx onto a sentinel. The mapping mirrors
-// core/broker's classifyStatus so the two clients agree on what a 429 is; a
-// JSON body is preferred when present because Kite's status line alone loses
-// the "too many requests" wording.
+// historyStatusError maps a Kite non-2xx onto a sentinel.
 func historyStatusError(status int, body []byte) error {
 	var env historyEnvelope
 	if err := json.Unmarshal(body, &env); err == nil {
@@ -247,10 +226,7 @@ func historyStatusError(status int, body []byte) error {
 		case status == http.StatusUnauthorized, status == http.StatusForbidden:
 			return fmt.Errorf("kite history: http %d: %s: %w", status, message, broker.ErrAuth)
 		case status == http.StatusNotFound:
-			// A 404 on this route means Kite does not know the exchange or
-			// symbol, not that an order is missing. ErrOrderNotFound would be
-			// a misleading sentinel here, and ErrInstrumentNotFound is what
-			// lets the job give up on the symbol instead of retrying.
+
 			return fmt.Errorf("kite history: http %d: %s: %w", status, message, broker.ErrInstrumentNotFound)
 		case status >= 500:
 			return fmt.Errorf("kite history: http %d: %s: %w", status, message, broker.ErrUnavailable)
@@ -270,8 +246,8 @@ func historyStatusError(status int, body []byte) error {
 	}
 }
 
-// firstError picks the most specific error Kite reported, preferring the
-// multi-error envelope over the legacy single-error shape.
+// firstError picks the most specific error Kite reported, preferring the multi-error
+// envelope over the legacy single-error shape.
 func (e *historyEnvelope) firstError() (code, message string) {
 	if len(e.Errors) > 0 {
 		return e.Errors[0].ErrorCode, e.Errors[0].Message
@@ -280,10 +256,6 @@ func (e *historyEnvelope) firstError() (code, message string) {
 }
 
 // decode turns a Kite historical body into candles.
-//
-// A "success" envelope is authoritative. A body that says "error" but arrived
-// with a 2xx status is mapped to a sentinel too, because Kite does that when
-// a token expires mid-session.
 func (k *KiteHistory) decode(symbol string, raw []byte) ([]contracts.Candle, error) {
 	var env historyEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -298,9 +270,7 @@ func (k *KiteHistory) decode(symbol string, raw []byte) ([]contracts.Candle, err
 	for i, row := range env.Data.Candles {
 		c, err := decodeHistoryRow(symbol, row)
 		if err != nil {
-			// One malformed row must not discard a whole segment: Kite has
-			// shipped rows with a missing volume field before, and the OHLC of
-			// the surrounding bars is still worth backfilling.
+
 			k.logger().Warn("skipping malformed historical row",
 				zap.String("symbol", symbol),
 				zap.Int("row", i),
@@ -313,9 +283,8 @@ func (k *KiteHistory) decode(symbol string, raw []byte) ([]contracts.Candle, err
 	return candles, nil
 }
 
-// statusFromError guesses the HTTP status of a body that arrived as a 2xx but
-// carries an error envelope, so the sentinel mapping has something to switch
-// on.
+// statusFromError guesses the HTTP status of a body that arrived as a 2xx but carries
+// an error envelope, so the sentinel mapping has something to switch on.
 func statusFromError(code, message string) int {
 	lower := strings.ToLower(code + " " + message)
 	switch {
@@ -335,11 +304,6 @@ func statusFromError(code, message string) int {
 }
 
 // decodeHistoryRow parses one Kite candle array:
-//
-//	["2024-01-02T09:15:00+05:30", open, high, low, close, volume]
-//
-// Kite quotes these as JSON strings, not numbers, so every field is decoded
-// leniently rather than assuming a numeric JSON type.
 func decodeHistoryRow(symbol string, row json.RawMessage) (contracts.Candle, error) {
 	var fields []json.RawMessage
 	if err := json.Unmarshal(row, &fields); err != nil {
@@ -356,7 +320,7 @@ func decodeHistoryRow(symbol string, row json.RawMessage) (contracts.Candle, err
 	if err := json.Unmarshal(fields[histFieldTimestamp], &stamp); err != nil {
 		return contracts.Candle{}, fmt.Errorf("field %d: decode timestamp: %w", histFieldTimestamp, err)
 	}
-	ts, err := time.Parse(time.RFC3339, stamp)
+	ts, err := parseKiteHistoryTime(stamp)
 	if err != nil {
 		return contracts.Candle{}, fmt.Errorf("field %d: parse timestamp %q: %w", histFieldTimestamp, stamp, err)
 	}
@@ -380,8 +344,17 @@ func decodeHistoryRow(symbol string, row json.RawMessage) (contracts.Candle, err
 	return candle, nil
 }
 
-// histFloat decodes a Kite numeric field, which is either a bare JSON number
-// or a quoted string.
+func parseKiteHistoryTime(value string) (time.Time, error) {
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05-0700"} {
+		if stamp, err := time.Parse(layout, value); err == nil {
+			return stamp.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported Kite timestamp %q", value)
+}
+
+// histFloat decodes a Kite numeric field, which is either a bare JSON number or a
+// quoted string.
 func histFloat(field json.RawMessage) (float64, error) {
 	raw := strings.Trim(strings.TrimSpace(string(field)), `"`)
 	if raw == "" || raw == "null" {

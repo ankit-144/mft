@@ -2,9 +2,10 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
+	"net/url"
 	"testing"
 	"time"
 
@@ -102,6 +103,56 @@ func TestKiteHistoryParsesCandles(t *testing.T) {
 	}
 }
 
+func TestKiteHistoryUsesHalfOpenRangeAndParsesKiteOffset(t *testing.T) {
+	fx := newHistoryFixture(t, &fakeKite{defaultReply: reply{rows: [][]any{
+		{"2024-01-02T09:14:00+0530", 1, 2, 0.5, 1.5, 1},
+		{"2024-01-02T09:15:00+0530", 1, 2, 0.5, 1.5, 2},
+		{"2024-01-02T09:16:00+0530", 1, 2, 0.5, 1.5, 3},
+		{"2024-01-02T09:17:00+0530", 1, 2, 0.5, 1.5, 4},
+	}}})
+	start := time.Date(2024, 1, 2, 3, 45, 0, 0, time.UTC)
+	end := start.Add(2 * time.Minute)
+	got, err := fx.hist.HistoricalCandles(context.Background(), "RELIANCE", start, end, "minute")
+	if err != nil {
+		t.Fatalf("HistoricalCandles() error = %v", err)
+	}
+	if len(got) != 2 || got[0].Volume != 2 || got[1].Volume != 3 {
+		t.Fatalf("candles = %+v, want the two rows in [%s,%s)", got, start, end)
+	}
+}
+
+func TestKiteHistoryProtocolRequestAndRangeAreSocketFree(t *testing.T) {
+	inst := contracts.Instrument{Token: 256265, Symbol: "RELIANCE", Exchange: "NSE"}
+	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	request, err := url.Parse(historyRequestPath(inst, start, end, "minute"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Path != "/instruments/historical/256265/minute" {
+		t.Fatalf("path = %q", request.Path)
+	}
+	query := request.Query()
+	if query.Get("from") != "2024-01-01 05:30:00" || query.Get("to") != "2024-01-02 05:30:00" || query.Get("oi") != "0" {
+		t.Fatalf("query = %v", query)
+	}
+	candles := []contracts.Candle{
+		{Timestamp: start.Add(-time.Minute)},
+		{Timestamp: start},
+		{Timestamp: end.Add(-time.Minute)},
+		{Timestamp: end},
+	}
+	filtered := historicalRange(candles, start, end)
+	if len(filtered) != 2 || !filtered[0].Timestamp.Equal(start) || !filtered[1].Timestamp.Equal(end.Add(-time.Minute)) {
+		t.Fatalf("range filter = %+v", filtered)
+	}
+	row := json.RawMessage(`[` + `"2024-01-02T09:15:00+0530",1,2,0.5,1.5,10]`)
+	candle, err := decodeHistoryRow("RELIANCE", row)
+	if err != nil || !candle.Timestamp.Equal(time.Date(2024, 1, 2, 3, 45, 0, 0, time.UTC)) {
+		t.Fatalf("decode Kite +0530 row = %+v, %v", candle, err)
+	}
+}
+
 func TestKiteHistoryBuildsTheKiteURL(t *testing.T) {
 	fx := newHistoryFixture(t, kites())
 
@@ -109,13 +160,17 @@ func TestKiteHistoryBuildsTheKiteURL(t *testing.T) {
 		t.Fatalf("HistoricalCandles() error = %v", err)
 	}
 
-	want := "/data/historical/NSE/RELIANCE/minute/2024-01-01/2024-01-08"
+	want := "/instruments/historical/256265/minute"
 	if got := fx.fake.lastPath(); got != want {
 		t.Errorf("path = %q, want %q", got, want)
 	}
-	for _, field := range []string{"instrument_token=256265", "continuous=0", "include_oi=0"} {
-		if !strings.Contains(fx.fake.lastQuery(), field) {
-			t.Errorf("query %q missing %q", fx.fake.lastQuery(), field)
+	query, err := url.ParseQuery(fx.fake.lastQuery())
+	if err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	for field, want := range map[string]string{"from": "2024-01-01 05:30:00", "to": "2024-01-08 05:30:00", "continuous": "0", "oi": "0"} {
+		if got := query.Get(field); got != want {
+			t.Errorf("query %s = %q, want %q", field, got, want)
 		}
 	}
 	if want := "token test-key:test-token"; fx.fake.lastAuth() != want {
