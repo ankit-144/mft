@@ -3,7 +3,7 @@
 	setup dev stop down status test-python \
 	run-ingestion run-execution run-jobs run-inference \
 	venv inference-deps tabfm-weights \
-	backtest research integration benchmarks review-guide current-guide diagrams diagrams-check mermaid \
+	backtest research integration benchmarks \
 	wt wt-list wt-remove wt-prune \
 	docker-build docker-up docker-down docker-logs
 
@@ -17,7 +17,6 @@ export GOMAXPROCS ?= 2
 export OMP_NUM_THREADS ?= 1
 export OPENBLAS_NUM_THREADS ?= 1
 export GOCACHE ?= /tmp/mft-go-cache
-DIAGRAMS := docs/diagrams
 
 build:
 	@for m in $(MODULES); do \
@@ -96,12 +95,6 @@ ARGS ?=
 backtest:
 	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(PY) -m app.backtest $(if $(strip $(ARGS)),$(ARGS),--synthetic --model heuristic --bars 200 --feature-mode incremental)
 
-review-guide:
-	python3 docs/review/build_guide.py
-
-current-guide:
-	python3 docs/implementation/build_guide.py
-
 integration: build
 	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(PY) -m pytest app/tests/test_platform_integration.py -q
 
@@ -134,54 +127,3 @@ docker-down:
 
 docker-logs:
 	docker compose logs -f
-
-DIAGRAM_SVG := $(DIAGRAMS)/svg
-
-diagrams:
-	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
-	@mkdir -p $(DIAGRAM_SVG)
-	@ok=0; fail=0; \
-	for f in $$(ls $(DIAGRAMS)/*.d2 2>/dev/null); do \
-		name=$$(basename "$$f" .d2); \
-		if d2 "$$f" "$(DIAGRAM_SVG)/$$name.svg" >/dev/null 2>&1; then \
-			ok=$$((ok+1)); \
-		else \
-			echo "FAILED  $$f"; d2 "$$f" "$(DIAGRAM_SVG)/$$name.svg" 2>&1 | head -5; fail=$$((fail+1)); \
-		fi; \
-	done; \
-	echo "rendered $$ok, failed $$fail -> $(DIAGRAM_SVG)/"; \
-	test $$fail -eq 0; \
-	python3 docs/diagrams/mkindex.py $(DIAGRAM_SVG)
-
-diagrams-check:
-	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
-	@tmp=$$(mktemp -d); ok=0; fail=0; \
-	for f in $$(ls $(DIAGRAMS)/*.d2 2>/dev/null); do \
-		if d2 "$$f" "$$tmp/out.svg" >/dev/null 2>&1; then \
-			ok=$$((ok+1)); \
-		else \
-			echo "SYNTAX ERROR  $$f"; d2 "$$f" "$$tmp/out.svg" 2>&1 | head -5; fail=$$((fail+1)); \
-		fi; \
-	done; \
-	rm -rf "$$tmp"; \
-	echo "parsed $$ok, failed $$fail"; \
-	test $$fail -eq 0
-
-MERMAID_DIR := docs/diagrams/mermaid
-
-mermaid:
-	@command -v mmdc >/dev/null 2>&1 || { echo "mmdc not installed (npm i -g @mermaid-js/mermaid-cli)"; exit 1; }
-	@ok=0; fail=0; \
-	for f in $$(ls $(MERMAID_DIR)/*.mmd 2>/dev/null); do \
-		name=$$(basename "$$f" .mmd); \
-		if mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.svg" \
-			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null \
-			&& mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.png" \
-			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null; then \
-			ok=$$((ok+1)); \
-		else \
-			echo "FAILED  $$f"; fail=$$((fail+1)); \
-		fi; \
-	done; \
-	echo "rendered $$ok, failed $$fail -> $(MERMAID_DIR)/"; \
-	test $$fail -eq 0

@@ -47,3 +47,19 @@ docs/diagrams/explorer.py
 docs/diagrams/mermaid/*.svg
 docs/diagrams/mermaid/*.png
 .mmdcfg.json
+
+# Local documentation and visual artifacts
+/docs/
+/Plan.md
+/opencode.json
+/photos/
+/images/
+*.d2
+*.mmd
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.pdf
