@@ -1,0 +1,6 @@
+# Optional research backend; never installed by the default setup.
+# CPU wheel selection belongs to venv.sh. No checkpoint is downloaded here.
+torch>=2.6
+scikit-learn>=1.5
+huggingface-hub>=0.23
+tabfm[pytorch]>=1.0.1

@@ -44,7 +44,7 @@ def test_defaults_match_the_go_validators() -> None:
     """
     inference = InferenceConfig()
     assert inference.addr == ":8000"
-    assert inference.model == "tabfm"
+    assert inference.model == "heuristic"
     assert inference.execution_url == "http://localhost:8080"
     assert inference.context_rows == 100
     assert inference.horizon_bars == 1
@@ -77,7 +77,7 @@ def test_the_example_config_parses() -> None:
     config = load_config(example)
 
     assert config.app.timezone == "Asia/Kolkata"
-    assert config.storage.data_dir == "data"
+    assert Path(config.storage.data_dir) == example.parent.parent / "data"
     assert config.inference.instruments == ["RELIANCE", "TCS", "INFY"]
     assert config.inference.dry_run is True
     assert config.inference.execution_url == "http://localhost:8080"
@@ -109,7 +109,7 @@ def test_unrelated_sections_are_ignored_not_refused(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("document", "match"),
     [
-        ({"inference": {"model": "xgboost"}}, "must be one of tabfm, heuristic"),
+        ({"inference": {"model": "bad-name!"}}, "registry identifier"),
         ({"inference": {"score_threshold": 1.5}}, r"outside \[0, 1\]"),
         ({"inference": {"score_threshold": -0.1}}, r"outside \[0, 1\]"),
         ({"inference": {"context_rows": 0}}, "context_rows must be positive"),
@@ -159,7 +159,7 @@ def test_an_empty_file_is_a_valid_default_config(tmp_path: Path) -> None:
     path.write_text("")
     config = load_config(path)
     assert config.inference.dry_run is True
-    assert config.inference.model == "tabfm"
+    assert config.inference.model == "heuristic"
 
 
 def test_instruments_are_normalised_and_deduplicated() -> None:

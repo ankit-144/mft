@@ -187,7 +187,7 @@ func TestChecks(t *testing.T) {
 		{
 			name:  "max_drawdown_pct is satisfied by realised gains",
 			check: DrawdownCheck{MaxPct: 5}, portfolio: contracts.Portfolio{
-				Cash: 90_000, RealisedPnL: 15_000, PeakEquity: 110_000, OpenPositions: map[string]int{},
+				Cash: 105_000, RealisedPnL: 15_000, PeakEquity: 110_000, OpenPositions: map[string]int{},
 			},
 			signal: signal(),
 		},
@@ -198,11 +198,11 @@ func TestChecks(t *testing.T) {
 			signal:    signal(),
 		},
 
-		// 4. daily_loss_limit — realised PnL >= -limit.
+		// 4. daily_loss_limit — today's realised PnL >= -limit.
 		{
 			name:  "daily_loss_limit rejects one unit past the limit",
 			check: DailyLossCheck{Limit: 25_000}, portfolio: contracts.Portfolio{
-				Cash: 75_000, RealisedPnL: -25_000.01, PeakEquity: 100_000,
+				Cash: 75_000, RealisedPnL: -25_000.01, RealisedPnLToday: -25_000.01, PeakEquity: 100_000,
 				OpenPositions: map[string]int{},
 			},
 			signal:   signal(),
@@ -211,7 +211,7 @@ func TestChecks(t *testing.T) {
 		{
 			name:  "daily_loss_limit accepts exactly the limit",
 			check: DailyLossCheck{Limit: 25_000}, portfolio: contracts.Portfolio{
-				Cash: 75_000, RealisedPnL: -25_000, PeakEquity: 100_000,
+				Cash: 75_000, RealisedPnL: -25_000, RealisedPnLToday: -25_000, PeakEquity: 100_000,
 				OpenPositions: map[string]int{},
 			},
 			signal: signal(),
@@ -412,7 +412,7 @@ func TestPolicyChainOrder(t *testing.T) {
 	// zero-quantity signal on a debounced key outside market hours. Only the
 	// first check in the chain gets a say.
 	portfolio := contracts.Portfolio{
-		Cash: 1_000, RealisedPnL: -30_000, PeakEquity: 100_000,
+		Cash: 1_000, Equity: -29_000, RealisedPnL: -30_000, PeakEquity: 100_000,
 		OpenPositions: map[string]int{"RELIANCE": 10, "TCS": 5, "INFY": 5},
 	}
 	store := newFakeStore("EXEC:RELIANCE:BUY")
@@ -465,8 +465,8 @@ func TestEquity(t *testing.T) {
 		want float64
 	}{
 		{"flat book is cash", contracts.Portfolio{Cash: 100_000}, 100_000},
-		{"realised loss reduces equity", contracts.Portfolio{Cash: 90_000, RealisedPnL: -10_000}, 80_000},
-		{"realised gain raises equity", contracts.Portfolio{Cash: 110_000, RealisedPnL: 10_000}, 120_000},
+		{"cash already includes realised loss", contracts.Portfolio{Cash: 90_000, RealisedPnL: -10_000}, 90_000},
+		{"cash already includes realised gain", contracts.Portfolio{Cash: 110_000, RealisedPnL: 10_000}, 110_000},
 		{"peak is not part of equity", contracts.Portfolio{Cash: 100_000, PeakEquity: 250_000}, 100_000},
 	}
 	for _, tc := range cases {
@@ -475,6 +475,33 @@ func TestEquity(t *testing.T) {
 				t.Fatalf("Equity() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestMaxPositionIncludesHeldAndReservedExposureAndActualCash(t *testing.T) {
+	check := MaxPositionCheck{MaxPct: 100}
+	portfolio := contracts.Portfolio{
+		Cash: 58_000, Equity: 98_000, PeakEquity: 100_000,
+		OpenPositions:  map[string]int{},
+		PositionValues: map[string]float64{},
+		ReservedCash:   5_000, ReservedValues: map[string]float64{},
+	}
+	order := contracts.Signal{Symbol: "RELIANCE", Side: contracts.SideBuy, Quantity: 60, Price: 1000}
+	if err := check.Check(context.Background(), order, portfolio); err == nil {
+		t.Fatal("order above actual free cash and aggregate position exposure passed")
+	} else {
+		var rejection *contracts.Rejection
+		if !errors.As(err, &rejection) || rejection.Code != contracts.ReasonMaxPosition {
+			t.Fatalf("error = %v", err)
+		}
+	}
+	order.Quantity = 1
+	portfolio.ReservedCash = 0
+	portfolio.PositionValues["RELIANCE"] = 94_000
+	portfolio.ReservedValues["RELIANCE"] = 5_000
+	portfolio.Cash, portfolio.ReservedCash = 100_000, 0
+	if err := check.Check(context.Background(), order, portfolio); err == nil {
+		t.Fatal("order that takes aggregate symbol exposure over the cap passed")
 	}
 }
 

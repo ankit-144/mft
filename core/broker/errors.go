@@ -7,38 +7,22 @@ import (
 	"strings"
 )
 
-// Sentinel errors returned by the broker connectors. Callers distinguish
-// failure modes with errors.Is; every error the connectors return wraps one
-// of these, so a switch on the sentinel is always exhaustive.
+// Sentinel errors returned by the broker connectors.
 var (
-	// ErrAuth means the credentials were missing, expired or rejected. The
-	// access token is short lived and must be refreshed out of band.
 	ErrAuth = errors.New("broker: authentication failed")
-	// ErrRateLimit means Kite throttled the request. Retry after a backoff;
-	// the REST API allows roughly three requests per second.
+
 	ErrRateLimit = errors.New("broker: rate limited")
-	// ErrInstrumentNotFound means a symbol could not be resolved to an
-	// instrument token, either from the instrument dump or from a live
-	// subscription.
+
 	ErrInstrumentNotFound = errors.New("broker: instrument not found")
-	// ErrInvalidOrder means the request was rejected by local validation or
-	// by Kite as malformed (bad side, non-positive quantity, bad lot size,
-	// limit order without a price).
+
 	ErrInvalidOrder = errors.New("broker: invalid order")
-	// ErrOrderNotFound means Kite does not know the referenced order id.
+
 	ErrOrderNotFound = errors.New("broker: order not found")
-	// ErrUnavailable means the transport failed or Kite returned a server
-	// side error. Retrying is reasonable.
+
 	ErrUnavailable = errors.New("broker: unavailable")
 )
 
 // kiteError is the Kite Connect error envelope:
-//
-//	{"status":"error","errors":[{"error_code":"invalid_token","message":"..."}]}
-//
-// Kite also sometimes answers with {"error":{"code":...,"message":...}}, so
-// both shapes are decoded. Unwrap maps the response onto one of the sentinel
-// errors, which is how callers tell a dead token from a throttled one.
 type kiteError struct {
 	Status  int
 	Code    string
@@ -72,8 +56,8 @@ func (e *kiteError) Error() string {
 	return b.String()
 }
 
-// Unwrap maps the HTTP status and Kite error code onto a sentinel error so
-// errors.Is works across the transport boundary.
+// Unwrap maps the HTTP status and Kite error code onto a sentinel error so errors.Is
+// works across the transport boundary.
 func (e *kiteError) Unwrap() error { return classifyStatus(e.Status, e.Code, e.Message) }
 
 // classifyStatus picks the sentinel error for a Kite failure.

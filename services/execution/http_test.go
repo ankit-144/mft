@@ -157,23 +157,22 @@ func TestOrderTypeFor(t *testing.T) {
 	}
 }
 
-// TestOutcomeFor pins the contract's promise: 202 for a market order, which
-// cannot rest, and 200 for a limit order, which can.
-func TestOutcomeFor(t *testing.T) {
+// TestResponseCode maps only actual observed order state to HTTP acceptance.
+func TestResponseCode(t *testing.T) {
 	cases := []struct {
-		orderType string
-		wantCode  int
-		wantState string
+		state    string
+		wantCode int
 	}{
-		{contracts.OrderTypeMarket, http.StatusAccepted, statusFilled},
-		{contracts.OrderTypeLimit, http.StatusOK, statusOpen},
-		{"anything else", http.StatusOK, statusOpen},
+		{contracts.OrderStatusOpen, http.StatusAccepted},
+		{contracts.OrderStatusPartial, http.StatusAccepted},
+		{contracts.OrderStatusUnknown, http.StatusServiceUnavailable},
+		{contracts.OrderStatusFilled, http.StatusOK},
+		{contracts.OrderStatusCancelled, http.StatusOK},
 	}
 	for _, tc := range cases {
-		t.Run(tc.orderType, func(t *testing.T) {
-			code, state := outcomeFor(tc.orderType)
-			if code != tc.wantCode || state != tc.wantState {
-				t.Fatalf("outcomeFor(%s) = %d %s, want %d %s", tc.orderType, code, state, tc.wantCode, tc.wantState)
+		t.Run(tc.state, func(t *testing.T) {
+			if code := responseCode(tc.state); code != tc.wantCode {
+				t.Fatalf("responseCode(%s) = %d, want %d", tc.state, code, tc.wantCode)
 			}
 		})
 	}
@@ -195,8 +194,8 @@ func TestHandlerSignalAccepted(t *testing.T) {
 	if body["order_id"] != "mock-order" {
 		t.Fatalf("order_id = %v, want mock-order", body["order_id"])
 	}
-	if body["status"] != statusOpen {
-		t.Fatalf("status = %v, want %s", body["status"], statusOpen)
+	if body["status"] != contracts.OrderStatusFilled {
+		t.Fatalf("status = %v, want %s", body["status"], contracts.OrderStatusFilled)
 	}
 	if body["score"] != 0.72 {
 		t.Fatalf("score = %v, want 0.72", body["score"])
@@ -213,6 +212,19 @@ func TestHandlerSignalAccepted(t *testing.T) {
 	}
 }
 
+func TestHandlerAcknowledgementIsNotReportedAsFill(t *testing.T) {
+	client := &countingClient{state: broker.OrderOpen}
+	h, _ := newHandlerFor(t, client, testConfig(), openTime, nil)
+	rec := post(t, h, "/v1/signals", signalJSON(t, validSignal()))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["order_id"] != "mock-order" || body["status"] != contracts.OrderStatusOpen {
+		t.Fatalf("body = %v, want OPEN", body)
+	}
+}
+
 // TestHandlerOrdersAccepted walks the shape of a direct placement: a limit
 // order is working at the exchange the moment the broker acknowledges it, so
 // the contract's answer is 200 OPEN.
@@ -223,12 +235,12 @@ func TestHandlerOrdersAccepted(t *testing.T) {
 		wantCode  int
 		wantState string
 	}{
-		{"explicit limit", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":2934.5,"type":"LIMIT"}`,
-			http.StatusOK, statusOpen},
-		{"limit inferred from the price", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":2934.5}`,
-			http.StatusOK, statusOpen},
-		{"type is not required", `{"symbol":"RELIANCE","side":"BUY","quantity":4,"price":2900}`,
-			http.StatusOK, statusOpen},
+		{"explicit limit", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":2934.5,"type":"LIMIT","idempotency_key":"http-limit-1"}`,
+			http.StatusOK, contracts.OrderStatusFilled},
+		{"limit inferred from the price", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":2934.5,"idempotency_key":"http-limit-2"}`,
+			http.StatusOK, contracts.OrderStatusFilled},
+		{"type is not required", `{"symbol":"RELIANCE","side":"BUY","quantity":4,"price":2900,"idempotency_key":"http-limit-3"}`,
+			http.StatusOK, contracts.OrderStatusFilled},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -254,39 +266,15 @@ func TestHandlerOrdersAccepted(t *testing.T) {
 	}
 }
 
-// TestHandlerOrdersMarketOrderRefused records why 202 is unreachable, as a
-// test rather than a comment: the risk chain sizes a position as quantity*price,
-// so a zero-price market order cannot be measured and the API refuses it at
-// the edge with the reason, rather than letting it reach the broker.
-//
-// When C6 can size a market order, this test fails and the 202 case moves onto
-// the real engine like every other one.
-func TestHandlerOrdersMarketOrderRefused(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-	}{
-		{"a market order", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":0,"type":"MARKET"}`},
-		{"an unpriced order", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":0}`},
-		{"a market order carrying a price", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":1000,"type":"MARKET"}`},
+func TestHandlerMarketOrderUsesCurrentMarkForRisk(t *testing.T) {
+	client := &countingClient{}
+	h, _ := newHandlerFor(t, client, testConfig(), openTime, nil)
+	rec := post(t, h, "/v1/orders", `{"symbol":"RELIANCE","side":"BUY","quantity":10,"type":"MARKET","idempotency_key":"market-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want filled 200; body %s", rec.Code, rec.Body.String())
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			client := &countingClient{}
-			h, _ := newHandlerFor(t, client, testConfig(), openTime, nil)
-
-			rec := post(t, h, "/v1/orders", tc.body)
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400; body %s", rec.Code, rec.Body.String())
-			}
-			body := decodeBody(t, rec)
-			if body["error"] != codeBadRequest {
-				t.Fatalf("error = %v, want %s", body["error"], codeBadRequest)
-			}
-			if client.count() != 0 {
-				t.Fatalf("broker was called %d times, want 0", client.count())
-			}
-		})
+	if got := placedOrders(client); len(got) != 1 || got[0].Price != 0 {
+		t.Fatalf("market order sent to broker = %+v", got)
 	}
 }
 
@@ -557,7 +545,7 @@ func TestHandlerSignalNormalisesWireForms(t *testing.T) {
 	h, _ := newHandlerFor(t, client, testConfig(), openTime, nil)
 
 	rec := post(t, h, "/v1/signals",
-		`{"symbol":" reliance ","side":"buy","quantity":10,"price":1000,"idempotency_key":" k "}`)
+		`{"symbol":" reliance ","side":"buy","quantity":10,"price":1000,"as_of":"2026-09-29T05:00:00Z","idempotency_key":" k "}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
 	}
@@ -611,7 +599,7 @@ func TestHandlerOrdersMalformed(t *testing.T) {
 func TestHandlerOrdersDuplicate(t *testing.T) {
 	client := &countingClient{}
 	h, _ := newHandlerFor(t, client, testConfig(), openTime, nil)
-	const body = `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":1000}`
+	const body = `{"symbol":"RELIANCE","side":"BUY","quantity":10,"price":1000,"idempotency_key":"same-order-key"}`
 
 	if rec := post(t, h, "/v1/orders", body); rec.Code != http.StatusOK {
 		t.Fatalf("first status = %d, want 200; body %s", rec.Code, rec.Body.String())
@@ -637,17 +625,17 @@ func TestHandlerBrokerFailure(t *testing.T) {
 	h, reg := newHandlerFor(t, client, testConfig(), openTime, nil)
 
 	rec := post(t, h, "/v1/signals", signalJSON(t, validSignal()))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502; body %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
 	}
-	if body := decodeBody(t, rec); body["error"] != codeBrokerError {
-		t.Fatalf("error = %v, want %s", body["error"], codeBrokerError)
+	if body := decodeBody(t, rec); body["error"] != codeOutcomeUnknown {
+		t.Fatalf("error = %v, want %s", body["error"], codeOutcomeUnknown)
 	}
 	if client.count() != 0 {
 		t.Fatalf("a failed placement was counted as an order: %d calls", client.count())
 	}
-	if got := labelledCounter(t, reg, "mft_execution_http_faults_total", "code", codeBrokerError); got != 1 {
-		t.Fatalf("http_faults_total{%s} = %d, want 1", codeBrokerError, got)
+	if got := labelledCounter(t, reg, "mft_execution_http_faults_total", "code", codeOutcomeUnknown); got != 1 {
+		t.Fatalf("http_faults_total{%s} = %d, want 1", codeOutcomeUnknown, got)
 	}
 }
 
@@ -701,19 +689,19 @@ func TestHandlerRecoversFromPanic(t *testing.T) {
 	h := NewHandler(engine, &healthBroker{}, reg, testutil.NewLogger())
 
 	rec := post(t, h, "/v1/signals", signalJSON(t, validSignal()))
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
 	}
 	body := decodeBody(t, rec)
-	if body["error"] != codeInternal {
-		t.Fatalf("error = %v, want %s", body["error"], codeInternal)
+	if body["error"] != codeOutcomeUnknown || body["status"] != contracts.OrderStatusUnknown {
+		t.Fatalf("error = %v / status %v, want unknown broker outcome", body["error"], body["status"])
 	}
 	// The panic value is internal detail; it is logged, never returned.
 	if strings.Contains(rec.Body.String(), "broker exploded") {
 		t.Fatalf("the panic value leaked into the response: %s", rec.Body.String())
 	}
-	if got := labelledCounter(t, reg, "mft_execution_http_faults_total", "code", codeInternal); got != 1 {
-		t.Fatalf("http_faults_total{%s} = %d, want 1", codeInternal, got)
+	if got := labelledCounter(t, reg, "mft_execution_http_faults_total", "code", codeOutcomeUnknown); got != 1 {
+		t.Fatalf("http_faults_total{%s} = %d, want 1", codeOutcomeUnknown, got)
 	}
 
 	// The process is still serving.
@@ -755,6 +743,27 @@ func TestHandlerPortfolio(t *testing.T) {
 	}
 }
 
+func TestLiveHTTPRequiresBearerToken(t *testing.T) {
+	client := &countingClient{}
+	cfg := testConfig()
+	cfg.Execution.APIToken = "local-secret"
+	policy := risk.FromConfig(cfg.Execution)
+	policy.Clock = func() time.Time { return openTime }
+	reg := testutil.NewRegistry()
+	engine := newEngine(client, fluxkv.New(), cfg, reg, testutil.NewLogger(), policy, policy.Clock)
+	h := NewHandler(engine, client, reg, testutil.NewLogger(), &cfg.Execution)
+	if rec := get(t, h, "/v1/portfolio"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated live request status = %d, want 401", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/portfolio", nil)
+	req.Header.Set("Authorization", "Bearer local-secret")
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("authenticated live request status = %d, want 200", resp.Code)
+	}
+}
+
 func TestHandlerHealth(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -785,6 +794,46 @@ func TestHandlerHealth(t *testing.T) {
 			}
 			if report.Status == "" || len(report.Checks) != 1 || report.Checks[0].Name != "broker" {
 				t.Fatalf("report = %+v, want a status and one broker check", report)
+			}
+		})
+	}
+}
+
+func TestPaperHealthSkipsBrokerAndUsesConfiguredToken(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{name: "local paper without token"},
+		{name: "token protected paper", token: "paper-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.ExecutionConfig{PaperTrading: true, APIToken: tc.token}
+			h := NewHandler(&apiStub{}, forbiddenHealthBroker{}, testutil.NewRegistry(), testutil.NewLogger(), cfg)
+			req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+			if tc.token != "" {
+				unauthorized := httptest.NewRecorder()
+				h.ServeHTTP(unauthorized, req)
+				if unauthorized.Code != http.StatusUnauthorized {
+					t.Fatalf("paper health without token = %d, want 401", unauthorized.Code)
+				}
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("paper health status = %d, want 200; body=%s", resp.Code, resp.Body.String())
+			}
+			var report struct {
+				Checks []struct {
+					Name string `json:"name"`
+				} `json:"checks"`
+			}
+			if err := json.Unmarshal(resp.Body.Bytes(), &report); err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Checks) != 0 {
+				t.Fatalf("paper health performed dependency probes: %+v", report.Checks)
 			}
 		})
 	}
@@ -881,6 +930,13 @@ func (s *apiStub) Execute(context.Context, string, string, int, float64) (string
 	return s.orderID, s.err
 }
 
+func (s *apiStub) ExecuteOrder(context.Context, contracts.OrderRequest) (string, error) {
+	return s.orderID, s.err
+}
+func (s *apiStub) OrderStatus(string) contracts.OrderResult {
+	return contracts.OrderResult{OrderID: s.orderID, Status: contracts.OrderStatusFilled, FilledQuantity: 1}
+}
+
 func (s *apiStub) Portfolio() contracts.Portfolio {
 	return contracts.Portfolio{OpenPositions: map[string]int{}}
 }
@@ -890,6 +946,18 @@ func (s *apiStub) Portfolio() contracts.Portfolio {
 // the counting client.
 type healthBroker struct {
 	err error
+}
+
+type forbiddenHealthBroker struct{}
+
+func (forbiddenHealthBroker) PlaceOrder(context.Context, contracts.OrderRequest) (string, error) {
+	panic("paper health must not place orders")
+}
+func (forbiddenHealthBroker) CancelOrder(context.Context, string) error {
+	panic("paper health must not call the broker")
+}
+func (forbiddenHealthBroker) GetPositions(context.Context) ([]contracts.Position, error) {
+	panic("paper health must not read broker positions")
 }
 
 func (b *healthBroker) PlaceOrder(context.Context, contracts.OrderRequest) (string, error) {
@@ -909,7 +977,10 @@ type panicClient struct {
 	calls atomic.Int64
 }
 
-func (p *panicClient) PlaceOrder(context.Context, string, string, int, float64) (string, error) {
+func (p *panicClient) PlaceOrder(context.Context, contracts.OrderRequest) (string, error) {
 	p.calls.Add(1)
 	panic("broker exploded")
 }
+
+func (p *panicClient) CancelOrder(context.Context, string) error                  { return nil }
+func (p *panicClient) GetPositions(context.Context) ([]contracts.Position, error) { return nil, nil }

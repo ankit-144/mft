@@ -1,0 +1,43 @@
+name: platform
+on:
+  pull_request:
+  push:
+    branches: [master, 'integration/**', 'improve/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache-dependency-path: '**/go.sum'
+      - run: make lint test build
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: services/inference/venv.sh --dev
+      - run: make test-python
+      - name: Python correctness lint
+        run: services/inference/.venv/bin/ruff check --select E9,F63,F7,F82 services/inference scripts

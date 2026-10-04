@@ -19,28 +19,15 @@ import (
 )
 
 // Module is the FX module for the jobs service.
-//
-// The interface bindings below are what make the narrow seams from
-// interfaces.go usable from a graph. fx resolves concrete types, so a
-// constructor asking for the InstrumentResolver interface cannot be satisfied
-// without one of these: NewKiteHistory and NewBackfillWorker would otherwise
-// report "missing types" and the service would not start, which is exactly
-// what happened before this binding existed. The -run-now path builds the
-// graph by hand and was unaffected, so the bug only showed up under
-// `make dev`.
 var Module = fx.Module("jobs",
 	fx.Provide(
 		NewLimiterFromConfig,
 		NewParquetStoreFromConfig,
 		NewScheduler,
 		NewBackfillWorker,
-		// *broker.Kite satisfies InstrumentResolver directly, so the binding
-		// is free and keeps C1's connector the single source of truth for
-		// symbol resolution.
+
 		func(k *broker.Kite) InstrumentResolver { return k },
-		// The concrete implementations satisfy the interfaces backfill
-		// depends on. Backfill takes interfaces so a test can substitute a
-		// fake; the graph supplies the concrete types.
+
 		func(h *KiteHistory) HistoricalClient { return h },
 		func(s *ParquetStore) SegmentStore { return s },
 		NewKiteHistory,
@@ -48,35 +35,23 @@ var Module = fx.Module("jobs",
 	fx.Invoke(StartScheduler),
 )
 
-// Defaults for the frozen jobs config block. config.Validate fills these in
-// for a config loaded from disk; they are repeated here so a zero-valued
-// config.Config in a test still yields a runnable worker.
+// Defaults for the shared jobs config block.
 const (
 	defaultRateLimitPerSecond = 3
 	defaultLookbackDays       = 730
 	defaultInterval           = "minute"
 
-	// segmentDays is the width of one historical request. Kite caps a single
-	// /data/historical call at 60 days of intraday bars, so a 730-day
-	// lookback is 13 segments per symbol. Chunking also bounds the blast
-	// radius of one bad segment: it is refetched on its own, and a segment
-	// that landed is never refetched.
 	segmentDays = 60
 
-	// maxAttempts is how many times one segment is tried before the run gives
-	// up on it. A Kite access token lives for a trading day, so exhausting
-	// the attempts on a 401 is right; exhausting them on a 429 is not, which
-	// is why an auth failure short-circuits instead of retrying.
 	maxAttempts = 4
 )
 
 // day is a calendar day, the granularity the historical API accepts.
 const day = 24 * time.Hour
 
-// backfillMetrics is the Prometheus surface of the job. Every name carries the
-// mandatory mft_ prefix; core/metrics panics on a violation at registration, so
-// a typo here stops the process at startup rather than shipping a series
-// nobody is watching.
+var indiaTimeZone = time.FixedZone("IST", 5*60*60+30*60)
+
+// backfillMetrics is the Prometheus surface of the job.
 type backfillMetrics struct {
 	runs        prometheus.Counter
 	runsFailed  prometheus.Counter
@@ -113,14 +88,8 @@ func newBackfillMetrics(reg *prometheus.Registry) *backfillMetrics {
 	}
 }
 
-// BackfillWorker fetches historical candles from the broker, respecting a
-// token-bucket rate limit and applying exponential backoff on throttling.
-//
-// A run is resumable by construction. The unit of work is a segment — one
-// bounded [From, To) request that lands in exactly one immutable Parquet file
-// — and a segment already on disk is skipped. That is what makes a 730-day
-// backfill over several instruments safe to interrupt: whatever finished is
-// durable, and the next run picks up where this one stopped.
+// BackfillWorker fetches historical candles from the broker, respecting a token-bucket
+// rate limit and applying exponential backoff on throttling.
 type BackfillWorker struct {
 	log *zap.Logger
 
@@ -134,23 +103,16 @@ type BackfillWorker struct {
 	segmentLen time.Duration
 	watchlist  []string
 
-	// sleep and now are the two seams that keep the retry and pacing tests
-	// instant. sleep is replaced by a recorder in tests; now defaults to
-	// time.Now.
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
 
 	metrics *backfillMetrics
 
-	// running serialises runs. The cron scheduler can fire while an
-	// on-demand run from the flag path is still going, and two concurrent
-	// runs would fight over the same segment files.
 	running sync.Mutex
 }
 
-// NewBackfillWorker constructs the backfill worker from the frozen jobs config
-// block, wiring the Kite history client, the Parquet segment store and the
-// rate limiter.
+// NewBackfillWorker constructs the backfill worker from the shared jobs config block,
+// wiring the Kite history client, the Parquet segment store and the rate limiter.
 func NewBackfillWorker(
 	cfg *config.Config,
 	hist HistoricalClient,
@@ -196,8 +158,8 @@ func NewBackfillWorker(
 	}
 }
 
-// NewLimiterFromConfig builds the token bucket that paces the historical API,
-// from jobs.rate_limit_per_second.
+// NewLimiterFromConfig builds the token bucket that paces the historical API, from
+// jobs.rate_limit_per_second.
 func NewLimiterFromConfig(cfg *config.Config) *Limiter {
 	rate := cfg.Jobs.RateLimitPerSecond
 	if rate <= 0 {
@@ -206,14 +168,8 @@ func NewLimiterFromConfig(cfg *config.Config) *Limiter {
 	return NewLimiter(float64(rate))
 }
 
-// RunBackfill fetches every configured segment for every configured instrument
-// and lands it in the Parquet store.
-//
-// It is safe to interrupt: a cancelled context stops the run between segments,
-// leaving every finished segment on disk. A per-symbol failure does not abort
-// the run — one delisted ticker must not cost the other two their history —
-// but a run in which nothing at all landed returns an error wrapping
-// ErrNoHistory, because a silent zero-candle week is worse than a loud one.
+// RunBackfill fetches every configured segment for every configured instrument and
+// lands it in the Parquet store.
 func (w *BackfillWorker) RunBackfill(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("backfill: %w", err)
@@ -267,8 +223,7 @@ func (w *BackfillWorker) RunBackfill(ctx context.Context) error {
 		zap.Int("failures", len(failures)),
 	)
 	if len(failures) > 0 {
-		// Partial success is not an error: the checkpoint means the failed
-		// segments are the whole of the next run's work.
+
 		w.log.Warn("backfill run finished with failures", zap.Error(errors.Join(failures...)))
 	}
 	return nil
@@ -276,9 +231,14 @@ func (w *BackfillWorker) RunBackfill(ctx context.Context) error {
 
 // runSymbol backfills one symbol and reports how many candles it wrote.
 func (w *BackfillWorker) runSymbol(ctx context.Context, symbol string) (int, error) {
-	now := w.now().UTC()
-	from := now.Add(-w.lookback)
-	segments := w.segmentsFor(symbol, from, now)
+	now := w.now().In(indiaTimeZone)
+	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, indiaTimeZone)
+	days := int(w.lookback / day)
+	if days <= 0 {
+		days = defaultLookbackDays
+	}
+	from := to.AddDate(0, 0, -days)
+	segments := w.segmentsFor(symbol, from, to)
 
 	var (
 		written  int
@@ -307,8 +267,7 @@ func (w *BackfillWorker) runSymbol(ctx context.Context, symbol string) (int, err
 		if err != nil {
 			failures = append(failures, err)
 			if isFatal(err) {
-				// A dead token or a vanished instrument will not fix itself
-				// on the next segment; stop burning rate limit on it.
+
 				break
 			}
 			continue
@@ -335,8 +294,8 @@ func (w *BackfillWorker) runSymbol(ctx context.Context, symbol string) (int, err
 	return written, nil
 }
 
-// fetchSegment fetches one segment, pacing itself on the token bucket and
-// backing off exponentially on a 429.
+// fetchSegment fetches one segment, pacing itself on the token bucket and backing off
+// exponentially on a 429.
 func (w *BackfillWorker) fetchSegment(ctx context.Context, seg Segment) ([]contracts.Candle, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -379,27 +338,37 @@ func (w *BackfillWorker) fetchSegment(ctx context.Context, seg Segment) ([]contr
 }
 
 // segments splits [from, to) into fixed-width chunks, independent of symbol.
-// It is a pure function of the date range, so the chunking rule is testable on
-// its own. The last chunk is short when the lookback is not a whole multiple
-// of the segment width.
 func (w *BackfillWorker) segments(from, to time.Time) []Segment {
 	width := w.segmentLen
 	if width <= 0 {
 		width = segmentDays * day
 	}
+	from = from.In(indiaTimeZone)
+	to = to.In(indiaTimeZone)
+	if from.IsZero() || !from.Before(to) {
+		return nil
+	}
+	widthDays := int(width / day)
+	if widthDays <= 0 {
+		widthDays = segmentDays
+	}
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, indiaTimeZone)
 	var out []Segment
-	for cursor := from; cursor.Before(to); cursor = cursor.Add(width) {
-		end := cursor.Add(width)
+	for cursor := from; cursor.Before(to); {
+		days := int(cursor.Sub(epoch) / day)
+		boundaryDay := (days/widthDays + 1) * widthDays
+		end := epoch.AddDate(0, 0, boundaryDay)
 		if end.After(to) {
 			end = to
 		}
 		out = append(out, Segment{From: cursor, To: end})
+		cursor = end
 	}
 	return out
 }
 
-// segmentsFor returns the segments a symbol still needs, with the symbol
-// stamped on each one.
+// segmentsFor returns the segments a symbol still needs, with the symbol stamped on
+// each one.
 func (w *BackfillWorker) segmentsFor(symbol string, from, to time.Time) []Segment {
 	chunks := w.segments(from, to)
 	out := make([]Segment, 0, len(chunks))
@@ -411,14 +380,12 @@ func (w *BackfillWorker) segmentsFor(symbol string, from, to time.Time) []Segmen
 }
 
 // symbols returns the deduplicated, upper-cased configured instrument list.
-// The broker watchlist is the source: those are the symbols the platform
-// trades and therefore the ones whose history the model trains on.
 func (w *BackfillWorker) symbols() []string {
 	return normaliseSymbols(w.watchlist)
 }
 
-// normaliseSymbols trims, upper-cases and deduplicates a symbol list,
-// preserving first-seen order.
+// normaliseSymbols trims, upper-cases and deduplicates a symbol list, preserving
+// first-seen order.
 func normaliseSymbols(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))
@@ -436,9 +403,8 @@ func normaliseSymbols(in []string) []string {
 	return out
 }
 
-// isFatal reports whether an error should stop the run for a symbol rather
-// than costing one attempt. Authentication and a missing instrument are
-// terminal; throttling and transport failures are not.
+// isFatal reports whether an error should stop the run for a symbol rather than costing
+// one attempt.
 func isFatal(err error) bool {
 	return errors.Is(err, broker.ErrAuth) || errors.Is(err, broker.ErrInstrumentNotFound)
 }
@@ -467,10 +433,6 @@ func (w cronLogWriter) Printf(format string, args ...any) {
 }
 
 // StartScheduler registers the weekly backfill job and starts the scheduler.
-//
-// The Recover wrapper stays outermost: a panicking job is logged and skipped,
-// never allowed to take down the process that also serves the metrics endpoint
-// a human would use to diagnose the panic.
 func StartScheduler(lc fx.Lifecycle, s *Scheduler, w *BackfillWorker, cfg *config.Config) {
 	schedule := cfg.Jobs.Schedule
 	lc.Append(fx.Hook{

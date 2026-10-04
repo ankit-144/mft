@@ -2,10 +2,13 @@ package broker
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,6 +24,23 @@ const testAccessToken = "test-access-token"
 // streamTimeout bounds every wait in these tests, so a broken streamer fails
 // the test instead of hanging the package.
 const streamTimeout = 10 * time.Second
+
+func localTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		t.Skipf("socket integration unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("listen for fixture: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	_ = server.Listener.Close()
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
+}
 
 // The tokens the instrument dump maps RELIANCE and TCS onto.
 const (
@@ -46,8 +66,7 @@ nope,NSE,MISSPELT,MISSPELT EQUITY,"",0,,0.05,1
 func newTestKite(t *testing.T, rest http.Handler) *Kite {
 	t.Helper()
 
-	restServer := httptest.NewServer(rest)
-	t.Cleanup(restServer.Close)
+	restServer := localTestServer(t, rest)
 
 	k, err := NewKiteFromConfig(config.BrokerConfig{
 		APIKey:                  "test-api-key",
@@ -102,8 +121,9 @@ type wsTestServer struct {
 
 	mu    sync.Mutex
 	dials int
-	subs  [][]string
-	pongs []string
+	subs  [][]int64
+	modes []json.RawMessage
+	pongs int
 }
 
 // attachWS starts a local WebSocket test server and points the connector's
@@ -123,7 +143,7 @@ func newWSTestServer(t *testing.T, handle wsHandler) *wsTestServer {
 	ws := &wsTestServer{}
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 
-	ws.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ws.Server = localTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("websocket upgrade: %v", err)
@@ -140,7 +160,6 @@ func newWSTestServer(t *testing.T, handle wsHandler) *wsTestServer {
 			handle(t, ws, conn, n)
 		}
 	}))
-	t.Cleanup(ws.Close)
 	return ws
 }
 
@@ -158,17 +177,22 @@ func (ws *wsTestServer) Connections() int {
 
 // Subscriptions returns the "v" list of each subscribe frame received, in
 // arrival order.
-func (ws *wsTestServer) Subscriptions() [][]string {
+func (ws *wsTestServer) Subscriptions() [][]int64 {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	return append([][]string(nil), ws.subs...)
+	return append([][]int64(nil), ws.subs...)
 }
 
-// Pongs returns the value list of each JSON pong received.
-func (ws *wsTestServer) Pongs() []string {
+func (ws *wsTestServer) Modes() []json.RawMessage {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	return append([]string(nil), ws.pongs...)
+	return append([]json.RawMessage(nil), ws.modes...)
+}
+
+func (ws *wsTestServer) Pongs() int {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.pongs
 }
 
 // note files a decoded client frame under subscribe or pong.
@@ -177,10 +201,20 @@ func (ws *wsTestServer) note(cmd wsCommand) {
 	defer ws.mu.Unlock()
 	switch cmd.Action {
 	case "subscribe":
-		ws.subs = append(ws.subs, cmd.Values)
-	case "pong":
-		ws.pongs = append(ws.pongs, cmd.Values...)
+		values, _ := json.Marshal(cmd.Values)
+		var tokens []int64
+		_ = json.Unmarshal(values, &tokens)
+		ws.subs = append(ws.subs, tokens)
+	case "mode":
+		values, _ := json.Marshal(cmd.Values)
+		ws.modes = append(ws.modes, values)
 	}
+}
+
+func (ws *wsTestServer) notePong() {
+	ws.mu.Lock()
+	ws.pongs++
+	ws.mu.Unlock()
 }
 
 // record reads one client frame and classifies it as a subscribe or a pong.
@@ -200,11 +234,14 @@ func (ws *wsTestServer) record(t *testing.T, conn *websocket.Conn) {
 		return
 	}
 	ws.note(cmd)
+	if cmd.Action == "pong" {
+		ws.notePong()
+	}
 }
 
 // readSubscribe drains the subscribe and mode frames a client sends on
 // connect and returns the subscription list it asked for.
-func (ws *wsTestServer) readSubscribe(t *testing.T, conn *websocket.Conn) []string {
+func (ws *wsTestServer) readSubscribe(t *testing.T, conn *websocket.Conn) []int64 {
 	t.Helper()
 	ws.record(t, conn)
 	ws.record(t, conn)

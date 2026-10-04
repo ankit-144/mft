@@ -3,11 +3,12 @@ package jobs
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mft/core/testutil"
 )
 
 // errorBody is a Kite error envelope served verbatim when a test does not
@@ -148,24 +149,18 @@ func writeJSON(w http.ResponseWriter, status int, body string) {
 	_, _ = w.Write([]byte(body))
 }
 
-// rangeOf extracts the [from, to) bounds a Kite historical URL carries. The
-// path is /data/historical/<exchange>/<symbol>/<interval>/<from>/<to>, so the
-// bounds are the fifth and sixth segments.
+// rangeOf extracts the requested [from, to) range from the historical query.
 func rangeOf(t *testing.T, r *http.Request) (from, to time.Time) {
 	t.Helper()
-	parts := splitPath(r.URL.Path)
-	if len(parts) != 7 {
-		t.Fatalf("path %q has %d segments, want 7", r.URL.Path, len(parts))
-	}
-	from, err := time.Parse(time.DateOnly, parts[5])
+	from, err := time.ParseInLocation("2006-01-02 15:04:05", r.URL.Query().Get("from"), indiaTimeZone)
 	if err != nil {
-		t.Fatalf("parse from %q: %v", parts[5], err)
+		t.Fatalf("parse from %q: %v", r.URL.Query().Get("from"), err)
 	}
-	to, err = time.Parse(time.DateOnly, parts[6])
+	to, err = time.ParseInLocation("2006-01-02 15:04:05", r.URL.Query().Get("to"), indiaTimeZone)
 	if err != nil {
-		t.Fatalf("parse to %q: %v", parts[6], err)
+		t.Fatalf("parse to %q: %v", r.URL.Query().Get("to"), err)
 	}
-	return from.UTC(), to.UTC()
+	return from, to
 }
 
 // splitPath splits a URL path into its non-empty segments.
@@ -184,7 +179,6 @@ func splitPath(path string) []string {
 // URL. The server is closed when the test finishes.
 func startFakeKite(t *testing.T, f *fakeKite) string {
 	t.Helper()
-	srv := httptest.NewServer(f)
-	t.Cleanup(srv.Close)
+	srv := testutil.HTTPServer(t, f)
 	return srv.URL
 }

@@ -7,15 +7,14 @@ import (
 )
 
 // DefaultBuckets covers the range of operations this platform actually has:
-// microsecond-scale cache reads, millisecond-scale order placement against the
-// broker, and second-scale backfill jobs.
+// microsecond-scale cache reads, millisecond-scale order placement against the broker,
+// and second-scale backfill jobs.
 var DefaultBuckets = []float64{
 	0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
 	0.25, 0.5, 1, 2.5, 5, 10, 30,
 }
 
 // DurationHistogram registers a latency histogram in seconds with no labels.
-// The name must end in DurationSuffix.
 func DurationHistogram(reg prometheus.Registerer, name, help string) prometheus.Histogram {
 	s, err := newDurationSpec(name, help)
 	must(err)
@@ -26,8 +25,8 @@ func DurationHistogram(reg prometheus.Registerer, name, help string) prometheus.
 	return h
 }
 
-// DurationHistogramVec registers a latency histogram in seconds, partitioned by
-// labels, using DefaultBuckets. The name must end in DurationSuffix.
+// DurationHistogramVec registers a latency histogram in seconds, partitioned by labels,
+// using DefaultBuckets.
 func DurationHistogramVec(reg prometheus.Registerer, name, help string, labels ...string) *prometheus.HistogramVec {
 	s, err := newDurationSpec(name, help)
 	must(err)
@@ -37,16 +36,8 @@ func DurationHistogramVec(reg prometheus.Registerer, name, help string, labels .
 	return h
 }
 
-// ObserveDuration records the time elapsed since start, in seconds, and returns
-// it so it can be used directly in a defer:
-//
-//	defer metrics.ObserveDuration(hist, time.Now())
-//
-// When id is non-empty and h supports exemplars, id is attached as the exemplar
-// trace id. That is the join between a metric and a log line: the OpenMetrics
-// exposition carries the id, and the log line carrying the same id is one grep
-// away. It is the only way to get a correlation id into Prometheus without
-// creating an unbounded-cardinality label.
+// ObserveDuration records the time elapsed since start, in seconds, and returns it so
+// it can be used directly in a defer:
 func ObserveDuration(h prometheus.Observer, start time.Time, id string) time.Duration {
 	d := time.Since(start)
 	if id != "" {

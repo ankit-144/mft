@@ -167,8 +167,9 @@ def test_an_idempotency_key_is_stable_on_retry_and_moves_next_minute() -> None:
 
     first = asyncio.run(scheduler.tick())[0]
     replay = asyncio.run(scheduler.tick())[0]
-    assert first.signal is not None and replay.signal is not None
-    assert first.signal.idempotency_key == replay.signal.idempotency_key
+    assert first.signal is not None
+    assert replay.outcome is Outcome.UNCHANGED
+    assert replay.signal is None
     assert first.as_of == replay.as_of
 
     store.add("RELIANCE", candles + make_candles(rows=1, start=ANCHOR + timedelta(minutes=200)))
@@ -178,7 +179,8 @@ def test_an_idempotency_key_is_stable_on_retry_and_moves_next_minute() -> None:
     assert following.signal.idempotency_key != first.signal.idempotency_key
 
     keys = [s.idempotency_key for s in sender.sent]
-    assert keys[0] == keys[1] != keys[2]
+    assert len(keys) == 2
+    assert keys[0] != keys[1]
 
 
 # --- the threshold -------------------------------------------------------

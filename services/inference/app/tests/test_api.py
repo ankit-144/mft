@@ -391,6 +391,6 @@ def test_the_staleness_guard_follows_the_flush_interval(tmp_path: Path) -> None:
     )
     runtime = build_runtime(config)
     try:
-        assert runtime.scheduler._max_context_age == timedelta(minutes=11)  # noqa: SLF001
+        assert runtime.scheduler._max_context_age == timedelta(seconds=config.inference.max_context_age_seconds)  # noqa: SLF001
     finally:
         asyncio.run(runtime.shutdown())

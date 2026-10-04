@@ -3,7 +3,7 @@
 	setup dev stop down status test-python \
 	run-ingestion run-execution run-jobs run-inference \
 	venv inference-deps tabfm-weights \
-	backtest diagrams diagrams-check \
+	backtest research integration benchmarks review-guide current-guide diagrams diagrams-check mermaid \
 	wt wt-list wt-remove wt-prune \
 	docker-build docker-up docker-down docker-logs
 
@@ -11,32 +11,28 @@ MODULES := core services/ingestion services/execution services/jobs
 VENV    := services/inference/.venv
 PY      := $(VENV)/bin/python
 PIP     := $(VENV)/bin/pip
-ROOT    := $(shell pwd)
+ROOT    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+GO_JOBS ?= 2
+export GOMAXPROCS ?= 2
+export OMP_NUM_THREADS ?= 1
+export OPENBLAS_NUM_THREADS ?= 1
+export GOCACHE ?= /tmp/mft-go-cache
 DIAGRAMS := docs/diagrams
 
-# --- build & quality -------------------------------------------------------
-
-# The repo root is not itself a Go module; go.work stitches the modules
-# together. `go build ./...` at the root therefore fails, so every module is
-# built individually.
 build:
 	@for m in $(MODULES); do \
 		echo "== build $$m =="; \
-		( cd $$m && go build ./... ) || exit 1; \
+		( cd $$m && go build -p $(GO_JOBS) ./... ) || exit 1; \
 	done
+	@mkdir -p $(ROOT)/bin
+	@for service in ingestion execution jobs; do go build -p $(GO_JOBS) -o $(ROOT)/bin/$$service ./services/$$service/cmd/server || exit 1; done
 
-# -race is not optional here. Ingestion's exactly-once bar completion and the
-# risk engine's idempotency claim are only meaningful if they hold under
-# concurrency, and a plain `go test` will not notice a data race.
 test:
 	@for m in $(MODULES); do \
 		echo "== test $$m =="; \
-		( cd $$m && go test -race ./... ) || exit 1; \
+		( cd $$m && go test -race -p $(GO_JOBS) -timeout 90s ./... ) || exit 1; \
 	done
 
-# pytest targets run only the test files that do not load model weights.
-# See AGENTS.md: this machine has 14GB and the OOM killer is active, and the
-# TabFM weights are ~6.6GB.
 PYTEST_PERMITTED := model/tests/test_base.py model/tests/test_heuristic_model.py
 
 test-python:
@@ -46,7 +42,7 @@ test-python:
 vet:
 	@for m in $(MODULES); do \
 		echo "== vet $$m =="; \
-		( cd $$m && go vet ./... ) || exit 1; \
+		( cd $$m && go vet -p $(GO_JOBS) ./... ) || exit 1; \
 	done
 
 fmt:
@@ -54,7 +50,6 @@ fmt:
 		( cd $$m && gofmt -l -w . ) || exit 1; \
 	done
 
-# lint is the gate CI and agents should run before pushing.
 lint: vet
 	@out=$$(for m in $(MODULES); do ( cd $$m && gofmt -l . ); done); \
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
@@ -66,8 +61,6 @@ tidy:
 	done
 	go work sync
 
-# --- run -------------------------------------------------------------------
-
 run-ingestion:
 	cd $(ROOT) && go run ./services/ingestion/cmd/server
 
@@ -78,99 +71,57 @@ run-jobs:
 	cd $(ROOT) && go run ./services/jobs/cmd/server
 
 run-inference:
-	cd $(ROOT)/services/inference && ../inference/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# --- python / tabfm --------------------------------------------------------
+	cd $(ROOT)/services/inference && MFT_INFERENCE_MODEL=$${MFT_INFERENCE_MODEL:-heuristic} $(ROOT)/$(PY) -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 venv:
-	@test -d $(VENV) || python3 -m venv $(VENV)
-	@$(PIP) install --upgrade pip --quiet
+	services/inference/venv.sh
 
 inference-deps: venv
-	@$(PIP) install -r services/inference/requirements.txt
-
-# TabFM weights download from Hugging Face on first use and are cached.
-# They are licensed for non-commercial use only — see Plan.md §5.
-tabfm-weights:
-	@$(PY) -c "import tabfm, sys; print('tabfm import ok')" || \
-		echo "tabfm not installed yet — run 'make inference-deps'"
 
 setup: build inference-deps
-	@cp -n configs/config.example.yaml configs/config.yaml 2>/dev/null || true
-	@echo "setup complete. Edit configs/config.yaml with your Kite credentials."
+	@test -f configs/config.yaml || cp configs/config.example.yaml configs/config.yaml
 
-# --- dev loop --------------------------------------------------------------
-
-# dev starts every service in the background with logs under .dev/.
-# It is deliberately not Docker-based: the north star is local-first.
-# Each service needs its own metrics port; they all read the same config file,
-# so MFT_METRICS_ADDR separates them.
 dev: build
-	@mkdir -p .dev
-	@echo "starting services... (logs in .dev/, stop with 'make stop')"
-	@$(MAKE) --no-print-directory stop
-	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9090 $(MAKE) --no-print-directory run-ingestion > .dev/ingestion.log 2>&1 &
-	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9091 $(MAKE) --no-print-directory run-execution > .dev/execution.log 2>&1 &
-	@MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9092 $(MAKE) --no-print-directory run-jobs      > .dev/jobs.log 2>&1 &
-	@if [ -x $(PY) ]; then \
-		MFT_CONFIG=configs/config.yaml MFT_METRICS_ADDR=:9090 $(MAKE) --no-print-directory run-inference > .dev/inference.log 2>&1 & \
-	else \
-		echo "note: no inference venv, skipping service 2 (run 'make inference-deps')"; \
-	fi
-	@sleep 4
-	@$(MAKE) --no-print-directory status
-	@echo
-	@echo "  execution api : http://localhost:8080/v1/health"
-	@echo "  inference api : http://localhost:8000/healthz"
+	python3 scripts/dev.py
 
-# The Go binaries land in the build cache as .../go-build/<hash>/server, not
-# under an exe/ directory, so matching on the service name alone misses them.
-# Match the full run path and let make's own pattern do the work.
 stop:
-	@-pkill -f 'go run ./services' 2>/dev/null || true
-	@-pkill -f 'go-build/[0-9a-f]*/server' 2>/dev/null || true
-	@-pkill -f 'uvicorn app.main:app' 2>/dev/null || true
-	@sleep 1
+	python3 scripts/dev.py --stop
 
 down: stop
 
 status:
-	@for p in 9090 8080 9091 9092 8000; do \
-		if ss -ltn 2>/dev/null | grep -q ":$$p "; then \
-			echo "  :$$p  UP"; \
-		else \
-			echo "  :$$p  down"; \
-		fi; \
-	done
+	python3 scripts/dev.py --status
 
-# backtest replays historical candles through the model without placing orders.
-# Walk-forward replay of the feature -> model -> decision chain, with no
-# broker, no credentials and no network. data/candles/ is empty on a fresh
-# checkout, so --synthetic is the default argument here; drop it once real
-# candles exist. Pass ARGS= to override.
+ARGS ?=
 backtest:
-	@test -d $(VENV) || { echo "run 'make setup' first"; exit 1; }
-	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(VENV)/bin/python -m app.backtest \
-		$(if $(ARGS),$(ARGS),--synthetic --bars 2000 --feature-mode incremental)
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(PY) -m app.backtest $(if $(strip $(ARGS)),$(ARGS),--synthetic --model heuristic --bars 200 --feature-mode incremental)
 
-# --- worktrees -------------------------------------------------------------
-# Each component is developed in an isolated worktree under .worktrees/.
-# These live inside the repo so that all file access stays within the
-# project directory.
+review-guide:
+	python3 docs/review/build_guide.py
+
+current-guide:
+	python3 docs/implementation/build_guide.py
+
+integration: build
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(PY) -m pytest app/tests/test_platform_integration.py -q
+
+benchmarks:
+	python3 scripts/benchmark_runtime.py
+
+research:
+	cd $(ROOT)/services/inference && PYTHONPATH=. $(ROOT)/$(PY) -m app.research $(if $(strip $(ARGS)),$(ARGS),--source synthetic --symbols RELIANCE --bars 1000)
 
 wt:
-	@scripts/worktree.sh add "$(NAME)" "$(BRANCH)"
+	scripts/worktree.sh add "$(NAME)" "$(BRANCH)"
 
 wt-list:
-	@git worktree list
+	git worktree list
 
 wt-remove:
-	@scripts/worktree.sh remove "$(NAME)"
+	scripts/worktree.sh remove "$(NAME)"
 
 wt-prune:
-	@scripts/worktree.sh prune
-
-# --- docker ----------------------------------------------------------------
+	scripts/worktree.sh prune
 
 docker-build:
 	docker compose build
@@ -183,12 +134,6 @@ docker-down:
 
 docker-logs:
 	docker compose logs -f
-
-# --- diagrams --------------------------------------------------------------
-# Architecture docs written in D2, rendered to SVG. d2 v0.9.0 has no --quiet or
-# --dry-run, so both targets compile for real and differ only in whether the
-# output is kept. diagrams-check is the CI form: it still proves the file
-# parses and every shape reference resolves.
 
 DIAGRAM_SVG := $(DIAGRAMS)/svg
 
@@ -205,7 +150,8 @@ diagrams:
 		fi; \
 	done; \
 	echo "rendered $$ok, failed $$fail -> $(DIAGRAM_SVG)/"; \
-	test $$fail -eq 0
+	test $$fail -eq 0; \
+	python3 docs/diagrams/mkindex.py $(DIAGRAM_SVG)
 
 diagrams-check:
 	@command -v d2 >/dev/null 2>&1 || { echo "d2 not installed (https://d2lang.com)"; exit 1; }
@@ -219,4 +165,23 @@ diagrams-check:
 	done; \
 	rm -rf "$$tmp"; \
 	echo "parsed $$ok, failed $$fail"; \
+	test $$fail -eq 0
+
+MERMAID_DIR := docs/diagrams/mermaid
+
+mermaid:
+	@command -v mmdc >/dev/null 2>&1 || { echo "mmdc not installed (npm i -g @mermaid-js/mermaid-cli)"; exit 1; }
+	@ok=0; fail=0; \
+	for f in $$(ls $(MERMAID_DIR)/*.mmd 2>/dev/null); do \
+		name=$$(basename "$$f" .mmd); \
+		if mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.svg" \
+			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null \
+			&& mmdc -i "$$f" -o "$(MERMAID_DIR)/$$name.png" \
+			-p $(MERMAID_DIR)/puppeteer.json -b white -q 2>/dev/null; then \
+			ok=$$((ok+1)); \
+		else \
+			echo "FAILED  $$f"; fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "rendered $$ok, failed $$fail -> $(MERMAID_DIR)/"; \
 	test $$fail -eq 0

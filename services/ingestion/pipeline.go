@@ -1,55 +1,10 @@
-// Package ingestion implements Service 1 of the MFT platform: the tick
-// ingestion pipeline. It is the head of the data flow (Plan.md §3). Every
-// candle the inference service ever scores is aggregated here, and every raw
-// tick the platform keeps was written here first.
-//
-// # One writer, no locks
-//
-// A single goroutine owns the tick path. It folds each tick into the fluxKV
-// one-minute candle, appends the raw tick to Parquet, and decides when a bar
-// is complete. Nothing else touches the writers, the candle map, or the open
-// bars, so the hot path carries no lock at all and candle rollover is
-// race-free by construction rather than by discipline.
-// TestConcurrentTicksSingleWriter runs that claim under -race.
-//
-// # Rollover
-//
-// A candle is complete when a tick for a later minute arrives, or when the
-// clock passes the bar's minute for a symbol that has gone quiet — an illiquid
-// scrip, or the last minute of a session, produces no further tick and would
-// otherwise never be written. Either way the bar is appended once and removed
-// from the open set in the same step, so it can never land twice, and a
-// per-symbol watermark on the last persisted minute rejects a late tick that
-// would otherwise resurrect a closed bar.
-//
-// # Overload: drop oldest
-//
-// The broker-facing queues are bounded, and the policy when they fill — which
-// means storage is blocking — is to drop the *oldest* queued tick and admit
-// the newest. Two reasons:
-//
-//   - The freshest tick is the one that matters. It sets the candle close the
-//     next inference pull will read, and a queued tick cannot become more
-//     valuable with age.
-//   - Blocking instead stalls the socket reader. A Kite reader that stops
-//     consuming stops answering the server's ping control frames, and the
-//     broker drops the session — so a storage slowdown would escalate into a
-//     reconnect storm, which is strictly worse than losing a few ticks of a
-//     bar that is already stale.
-//
-// Every drop is counted in mft_ingestion_ticks_dropped_total, so a sustained
-// non-zero rate is a visible symptom rather than a silent one.
-//
-// # Supervision
-//
-// core/broker reconnects internally with backoff, but Stream can still return:
-// a bad credential, an instrument missing from the dump, a closed ctx. The
-// pipeline supervises it and re-invokes with its own backoff, because a stream
-// that quietly returns leaves a process that looks healthy and stores nothing.
+// Package ingestion stores broker ticks and rolls them into completed one-minute
+// candles.
 package ingestion
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -66,39 +21,27 @@ import (
 	"go.uber.org/zap"
 )
 
-// Tunables with no key in the frozen config schema. See docs/contracts.md §8:
-// no component may add one, so anything the pipeline needs beyond the declared
-// keys lives here.
+// Internal pipeline limits and retry intervals.
 const (
-	// tickBufferSize is the depth of both tick queues: the one the broker
-	// writes to and the one the processor reads. A 60-second decision cadence
-	// at NSE retail tick rates is tens of ticks a second, so a thousand slots
-	// is tens of seconds of slack — long enough to ride out a flush, short
-	// enough that a genuinely wedged consumer is caught by the drop counter
-	// rather than by the process hanging.
 	tickBufferSize = 1024
 
-	// sweepInterval is how often the processor looks for bars whose minute has
-	// passed. It bounds how long a bar for a symbol that stopped trading waits
-	// before it is persisted.
-	sweepInterval = 5 * time.Second
+	sweepInterval       = 5 * time.Second
+	appendRetryInterval = 100 * time.Millisecond
 
-	// ageInterval is the cadence of the last-tick-age gauge. It runs on its
-	// own goroutine, deliberately independent of the processor: if the
-	// processor wedged, an age updated from inside it would freeze at a
-	// healthy-looking value, which is the one thing a liveness signal must
-	// never do.
 	ageInterval = time.Second
 
-	// defaultReconnectBase is the first supervisor backoff delay. It is short
-	// because core/broker has already applied its own backoff before Stream
-	// returns; this only paces the re-invocation.
 	defaultReconnectBase = time.Second
 
-	// defaultReconnectMax caps the supervisor backoff and matches the
-	// broker.reconnect_max_backoff_seconds default.
 	defaultReconnectMax = 60 * time.Second
 )
+
+var indiaLocation = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		return time.FixedZone("IST", 5*60*60+30*60)
+	}
+	return loc
+}()
 
 // Module is the FX module for the ingestion service.
 var Module = fx.Module("ingestion",
@@ -119,32 +62,20 @@ type loggableStreamer interface {
 }
 
 // AttachBrokerLogger hands the service logger to the broker connector.
-//
-// core/broker logs every reconnect and its backoff, and without this those go
-// to a no-op logger: the single most useful line during an outage is lost. The
-// type assertion keeps this module decoupled from the concrete connector — a
-// Streamer without the hook is still perfectly usable, it just does not log
-// its own reconnect attempts.
 func AttachBrokerLogger(streamer broker.Streamer, log *zap.Logger) {
 	if s, ok := streamer.(loggableStreamer); ok {
 		s.SetLogger(log)
 	}
 }
 
-// Clock reports the current time. Candle boundaries depend on wall-clock time,
-// so the pipeline reads it through a Clock rather than calling time.Now: a
-// rollover test sets the instant under test instead of waiting for the real
-// minute boundary.
+// Clock reports the current time.
 type Clock func() time.Time
 
-// SystemClock returns the current instant in UTC, the timezone every timestamp
-// in the platform is normalised to (docs/contracts.md §1).
+// SystemClock returns the current instant in UTC, the timezone every timestamp in the
+// platform is normalised to (docs/contracts.md §1).
 func SystemClock() time.Time { return time.Now().UTC() }
 
-// metrics is the Prometheus surface of the pipeline. Every name carries the
-// mandatory mft_ prefix; core/metrics validates it at registration, so a typo
-// here stops the process at startup rather than shipping a series nobody is
-// watching.
+// metrics is the Prometheus surface of the pipeline.
 type ingestionMetrics struct {
 	ticksProcessed prometheus.Counter
 	ticksDropped   prometheus.Counter
@@ -162,7 +93,7 @@ func newMetrics(reg *prometheus.Registry) *ingestionMetrics {
 		ticksProcessed: metrics.Counter(reg, "mft_ingestion_ticks_processed_total",
 			"Broker ticks folded into a candle and appended to the tick store."),
 		ticksDropped: metrics.Counter(reg, "mft_ingestion_ticks_dropped_total",
-			"Ticks discarded because the processor was behind and a queue was full. The oldest is dropped."),
+			"Ticks left unprocessed when shutdown interrupts storage backpressure."),
 		ticksLate: metrics.Counter(reg, "mft_ingestion_ticks_late_total",
 			"Ticks whose minute was already persisted, discarded rather than reopening a closed candle."),
 		candlesDone: metrics.Counter(reg, "mft_ingestion_candles_completed_total",
@@ -178,29 +109,30 @@ func newMetrics(reg *prometheus.Registry) *ingestionMetrics {
 	}
 }
 
-// Pipeline folds broker ticks into one-minute candles and persists both the
-// raw ticks and the completed candles to Parquet.
+// Pipeline folds broker ticks into one-minute candles and persists both the raw ticks
+// and the completed candles to Parquet.
 type Pipeline struct {
-	streamer broker.Streamer
-	cache    *fluxkv.KV
-	ticks    *storage.Writer
-	candles  CandleStore
-	symbols  []string
-	log      *zap.Logger
-	opts     options
+	streamer   broker.Streamer
+	cache      *fluxkv.KV
+	ticks      *storage.Writer
+	appendTick func(storage.Tick) (bool, error)
+	candles    CandleStore
+	symbols    []string
+	log        *zap.Logger
+	opts       options
 
-	// state is the processor's private, single-writer view of one symbol per
-	// entry. Only the processor goroutine reads or writes it.
-	state map[string]symbolState
+	state                map[string]symbolState
+	runCtx               context.Context
+	pendingRolloverTick  *broker.Tick
+	shutdownPendingTicks int
 
-	// lastTickNS is the Unix nanosecond timestamp of the most recent processed
-	// tick, read by the age goroutine.
 	lastTickNS atomic.Int64
 
-	// errMu guards firstErr, the earliest pipeline failure seen on any
-	// goroutine. It is returned by Err and by the fx stop hook.
-	errMu    sync.Mutex
-	firstErr error
+	errMu            sync.Mutex
+	firstErr         error
+	storageErr       error
+	tickStorageErr   error
+	tickBackpressure bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -209,45 +141,42 @@ type Pipeline struct {
 }
 
 // symbolState is what the processor remembers about one symbol between ticks.
-//
-// closed is the watermark that makes "exactly once" hold: a tick for a minute
-// at or before it is late and is dropped rather than reopening a bar that has
-// already been written.
 type symbolState struct {
-	// open is the bar still accepting ticks, or the zero Candle when the
-	// symbol has no bar open.
 	open contracts.Candle
-	// closed is the minute of the last bar persisted for this symbol, or the
-	// zero time when nothing has been persisted yet.
-	closed time.Time
+
+	closed       time.Time
+	volumeDate   time.Time
+	lastVolume   int64
+	lastVolumeAt time.Time
+	lastPrice    float64
 }
 
-// options are the seams tests drive. Zero values are not usable; see
-// defaultOptions.
+// options are the seams tests drive.
 type options struct {
-	// clock supplies the current time. Defaults to SystemClock.
 	clock Clock
-	// tickBuffer is the depth of each tick queue. Defaults to tickBufferSize.
+
 	tickBuffer int
-	// sweepEvery is the bar-sweep cadence. Defaults to sweepInterval.
-	sweepEvery time.Duration
-	// ageEvery is the last-tick-age sampling cadence. Defaults to ageInterval.
+
+	sweepEvery       time.Duration
+	appendRetryEvery time.Duration
+
 	ageEvery time.Duration
-	// reconnectBase and reconnectMax bound the supervisor backoff.
+
 	reconnectBase time.Duration
 	reconnectMax  time.Duration
 }
 
-// defaultOptions fills the seams from the frozen config, falling back to the
-// package defaults for every value a zero-valued config.Config leaves unset.
+// defaultOptions fills the seams from the shared config, falling back to the package
+// defaults for every value a zero-valued config.Config leaves unset.
 func defaultOptions(cfg *config.Config) options {
 	opts := options{
-		clock:         SystemClock,
-		tickBuffer:    tickBufferSize,
-		sweepEvery:    sweepInterval,
-		ageEvery:      ageInterval,
-		reconnectBase: defaultReconnectBase,
-		reconnectMax:  defaultReconnectMax,
+		clock:            SystemClock,
+		tickBuffer:       tickBufferSize,
+		sweepEvery:       sweepInterval,
+		appendRetryEvery: appendRetryInterval,
+		ageEvery:         ageInterval,
+		reconnectBase:    defaultReconnectBase,
+		reconnectMax:     defaultReconnectMax,
 	}
 	if max := time.Duration(cfg.Broker.ReconnectMaxBackoffSecs) * time.Second; max > 0 {
 		opts.reconnectMax = max
@@ -256,10 +185,6 @@ func defaultOptions(cfg *config.Config) options {
 }
 
 // NewPipeline builds the ingestion pipeline from the FX graph.
-//
-// The subscription list comes from cfg.Broker.Instruments: passing nil would
-// leave core/broker to fall back on its own watchlist, which is the same list
-// but by coincidence rather than by wiring, and the two can drift.
 func NewPipeline(
 	streamer broker.Streamer,
 	cache *fluxkv.KV,
@@ -272,8 +197,7 @@ func NewPipeline(
 	return newPipeline(streamer, cache, ticks, candles, cfg, reg, log, defaultOptions(cfg))
 }
 
-// newPipeline is the injectable constructor. Tests supply the clock and the
-// intervals through opts instead of waiting on real time.
+// newPipeline is the injectable constructor.
 func newPipeline(
 	streamer broker.Streamer,
 	cache *fluxkv.KV,
@@ -306,21 +230,22 @@ func newPipeline(
 		opts.reconnectMax = defaultReconnectMax
 	}
 	return &Pipeline{
-		streamer: streamer,
-		cache:    cache,
-		ticks:    ticks,
-		candles:  candles,
-		symbols:  append([]string(nil), cfg.Broker.Instruments...),
-		log:      log,
-		opts:     opts,
-		state:    make(map[string]symbolState),
-		metrics:  newMetrics(reg),
+		streamer:   streamer,
+		cache:      cache,
+		ticks:      ticks,
+		appendTick: ticks.AppendWithStatus,
+		candles:    candles,
+		symbols:    append([]string(nil), cfg.Broker.Instruments...),
+		log:        log,
+		opts:       opts,
+		state:      make(map[string]symbolState),
+		metrics:    newMetrics(reg),
 	}
 }
 
-// RegisterHealth adds the pipeline's storage check to the process readiness
-// probe set, so /readyz reports "degraded" when Parquet writes are failing
-// instead of serving a healthy process that has silently stopped storing.
+// RegisterHealth adds the pipeline's storage check to the process readiness probe set,
+// so /readyz reports "degraded" when Parquet writes are failing instead of serving a
+// healthy process that has silently stopped storing.
 func RegisterHealth(p *Pipeline) {
 	metrics.DefaultChecks().Add(metrics.Checker{
 		Name:  "ingestion-storage",
@@ -328,22 +253,43 @@ func RegisterHealth(p *Pipeline) {
 	})
 }
 
-// Check reports the earliest pipeline failure, or nil while ingestion is
-// storing everything it is given. It is the /readyz probe.
-func (p *Pipeline) Check(context.Context) error { return p.Err() }
+// Check reports latched storage failures, writer failures, or the earliest pipeline
+// error while ingestion is storing everything it is given.
+func (p *Pipeline) Check(context.Context) error {
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	if p.storageErr != nil {
+		if !errors.Is(p.storageErr, storage.ErrClosed) && p.candles.Err() == nil && p.candles.Pending() == 0 {
+			p.storageErr = nil
+		} else {
+			return p.storageErr
+		}
+	}
+	if p.tickStorageErr != nil {
+		if !p.tickBackpressure && !errors.Is(p.tickStorageErr, storage.ErrClosed) && p.ticks.Err() == nil {
+			p.tickStorageErr = nil
+		} else {
+			return p.tickStorageErr
+		}
+	}
+	if err := p.candles.Err(); err != nil {
+		return fmt.Errorf("ingestion: candle writer: %w", err)
+	}
+	if err := p.ticks.Err(); err != nil {
+		return fmt.Errorf("ingestion: tick writer: %w", err)
+	}
+	return p.firstErr
+}
 
-// Err returns the earliest error the pipeline recorded: a refused Parquet
-// append, or a writer that failed on its background flusher. It is nil until
-// something has actually gone wrong.
+// Err returns the earliest permanent pipeline error; Check also reports recoverable
+// storage failures.
 func (p *Pipeline) Err() error {
 	p.errMu.Lock()
 	defer p.errMu.Unlock()
 	return p.firstErr
 }
 
-// recordError keeps the first failure. Later errors are already visible in
-// the append-error counter and in the logs, and the first one is the one that
-// explains the rest.
+// recordError keeps the first failure.
 func (p *Pipeline) recordError(err error) {
 	if err == nil {
 		return
@@ -355,8 +301,41 @@ func (p *Pipeline) recordError(err error) {
 	}
 }
 
-// Run registers the pipeline lifecycle with fx: start the writers and the
-// worker goroutines on start, drain and close everything on stop.
+func (p *Pipeline) setStorageError(err error) {
+	p.errMu.Lock()
+	p.storageErr = err
+	p.errMu.Unlock()
+}
+
+func (p *Pipeline) clearStorageError() {
+	p.errMu.Lock()
+	p.storageErr = nil
+	p.errMu.Unlock()
+}
+
+func (p *Pipeline) setTickStorageError(err error) {
+	p.errMu.Lock()
+	p.tickStorageErr = err
+	p.tickBackpressure = false
+	p.errMu.Unlock()
+}
+
+func (p *Pipeline) setTickBackpressureError(err error) {
+	p.errMu.Lock()
+	p.tickStorageErr = err
+	p.tickBackpressure = true
+	p.errMu.Unlock()
+}
+
+func (p *Pipeline) clearTickStorageError() {
+	p.errMu.Lock()
+	p.tickStorageErr = nil
+	p.tickBackpressure = false
+	p.errMu.Unlock()
+}
+
+// Run registers the pipeline lifecycle with fx: start the writers and the worker
+// goroutines on start, drain and close everything on stop.
 func (p *Pipeline) Run(lc fx.Lifecycle) {
 	lc.Append(fx.Hook{
 		OnStart: p.Start,
@@ -364,13 +343,8 @@ func (p *Pipeline) Run(lc fx.Lifecycle) {
 	})
 }
 
-// Start brings the writers up and launches the supervisor, the relay, the
-// processor and the age sampler.
-//
-// The long-lived context is derived with context.WithoutCancel from the fx
-// start context: that context carries a start deadline and is cancelled the
-// moment OnStart returns, and both the writers' background flusher and the
-// broker stream must outlive it. Values are kept; only the deadline is not.
+// Start brings the writers up and launches the supervisor, the relay, the processor and
+// the age sampler.
 func (p *Pipeline) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 
@@ -382,14 +356,10 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		cancel()
 		return fmt.Errorf("ingestion: start candle writer: %w", err)
 	}
-	// p.cancel is assigned only once both writers are up. A failed Start
-	// leaves the previous cancel in place, so a caller that starts twice by
-	// mistake still stops the pipeline that is actually running.
-	p.cancel = cancel
 
-	// upstream is written by Stream and closed by supervise once Stream has
-	// returned, so a send can never race the close. queue is written by relay
-	// and closed by relay once upstream is closed and drained.
+	p.cancel = cancel
+	p.runCtx = runCtx
+
 	upstream := make(chan broker.Tick, p.opts.tickBuffer)
 	queue := make(chan broker.Tick, p.opts.tickBuffer)
 
@@ -418,22 +388,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop drains the pipeline and closes the writers. It is the fx OnStop hook.
-//
-// The order is fixed and each step depends on the previous one:
-//
-//  1. cancel, so core/broker's cancellable send unblocks and Stream returns;
-//  2. wait for the supervisor, which is what closes upstream — closing a
-//     channel the streamer might still be sending on would panic;
-//  3. the relay drains upstream into queue and closes queue;
-//  4. the processor drains queue and returns, having folded every tick;
-//  5. sweep once more, so a bar whose minute rolled over in the last few
-//     seconds is not lost to the sweep interval;
-//  6. flush and close both writers, then surface Err from each.
-//
-// The wait is bounded by the fx stop deadline. A streamer that ignores
-// cancellation cannot be closed safely, so the pipeline reports a timeout
-// rather than panicking on a send to a closed channel.
+// Stop cancels the stream, drains or accounts for queued ticks, and closes writers.
 func (p *Pipeline) Stop(ctx context.Context) error {
 	p.log.Info("ingestion pipeline stopping")
 	if p.cancel != nil {
@@ -456,22 +411,15 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 		return err
 	}
 
-	// The wait group has been observed, so the processor has stopped and the
-	// state map is no longer owned by another goroutine. Sweeping here closes
-	// the window in which a bar that completed just before shutdown would sit
-	// unwritten until the next sweep tick.
 	p.sweep(p.opts.clock())
+	if n := p.unpersistedCompletedBars(p.opts.clock()); n > 0 {
+		p.recordError(fmt.Errorf("ingestion: %d completed candle(s) remain unpersisted at shutdown", n))
+	}
 	if open := p.openBars(); open > 0 {
-		// A bar still inside its minute is not a complete bar. Persisting it
-		// would publish a short OHLCV that the feature pipeline cannot tell
-		// apart from a full one, so it is dropped and the raw ticks it came
-		// from are already durable in the tick store.
+
 		p.log.Info("dropping incomplete candles at shutdown", zap.Int("symbols", open))
 	}
 
-	// Only flush while the stop deadline still has time; Close flushes on a
-	// detached context regardless, so an expired deadline costs a log line
-	// rather than an unflushed buffer.
 	if ctx.Err() == nil {
 		if err := p.ticks.Flush(ctx); err != nil {
 			p.recordError(fmt.Errorf("ingestion: flush ticks: %w", err))
@@ -486,8 +434,7 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 	if err := p.candles.Close(); err != nil {
 		p.recordError(fmt.Errorf("ingestion: close candle writer: %w", err))
 	}
-	// A background flush can fail after the last explicit one, so Err is the
-	// only way to see it.
+
 	if err := p.ticks.Err(); err != nil {
 		p.recordError(fmt.Errorf("ingestion: tick writer: %w", err))
 	}
@@ -501,15 +448,8 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 }
 
 // supervise runs the broker stream in a loop.
-//
-// core/broker reconnects internally with backoff and normally blocks until its
-// context ends. It can still return — a credential rejected at start, an
-// instrument missing from the dump, a dial that never succeeds. Left alone,
-// that leaves a process that reports healthy and stores nothing, so the
-// pipeline logs the return and re-invokes on its own backoff.
 func (p *Pipeline) supervise(ctx context.Context, upstream chan broker.Tick) {
-	// Closing upstream here is what makes the drain safe: after this point no
-	// goroutine can send on it.
+
 	defer close(upstream)
 
 	for attempt := 0; ; attempt++ {
@@ -533,9 +473,6 @@ func (p *Pipeline) supervise(ctx context.Context, upstream chan broker.Tick) {
 }
 
 // backoffFor doubles reconnectBase per attempt, saturating at reconnectMax.
-// The doubling is iterative rather than a shift, so a long-lived stream that
-// has been down for hours cannot overflow the duration into a negative wait
-// and turn into a hot loop.
 func (p *Pipeline) backoffFor(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
@@ -553,8 +490,8 @@ func (p *Pipeline) backoffFor(attempt int) time.Duration {
 	return delay
 }
 
-// wait sleeps for d and reports whether it slept to completion rather than
-// being cancelled.
+// wait sleeps for d and reports whether it slept to completion rather than being
+// cancelled.
 func (p *Pipeline) wait(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -566,13 +503,7 @@ func (p *Pipeline) wait(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// relay moves ticks from the broker-facing channel to the processor's queue,
-// dropping the oldest entry when the queue is full.
-//
-// It takes no context on purpose: the shutdown path cancels, waits for the
-// supervisor, and only then closes upstream, so a context-aware relay could
-// abandon ticks the streamer had already handed over. Running until upstream
-// closes makes the drain complete by construction.
+// relay moves broker ticks into the bounded processor queue.
 func (p *Pipeline) relay(upstream <-chan broker.Tick, queue chan broker.Tick) {
 	defer close(queue)
 	for tick := range upstream {
@@ -580,37 +511,13 @@ func (p *Pipeline) relay(upstream <-chan broker.Tick, queue chan broker.Tick) {
 	}
 }
 
-// deliver hands one tick to the processor, evicting the oldest queued tick if
-// there is no room. It never blocks, which is the whole point: a stalled
-// consumer must not stall the socket reader.
-//
-// queue is bidirectional because dropping the oldest tick is a receive. The
-// relay is its only writer, so an eviction cannot race another producer.
+// deliver applies backpressure when the processor queue is full.
 func (p *Pipeline) deliver(tick broker.Tick, queue chan broker.Tick) {
-	select {
-	case queue <- tick:
-		p.metrics.queueDepth.Set(float64(len(queue)))
-		return
-	default:
-	}
-
-	select {
-	case <-queue:
-		p.metrics.ticksDropped.Inc()
-	default:
-	}
-	select {
-	case queue <- tick:
-		p.metrics.queueDepth.Set(float64(len(queue)))
-	default:
-		// The single reader freed and re-filled the slot between the two
-		// attempts. The tick is lost, but the counter says so.
-		p.metrics.ticksDropped.Inc()
-	}
+	queue <- tick
+	p.metrics.queueDepth.Set(float64(len(queue)))
 }
 
-// process is the single writer. It folds every tick, appends it to the tick
-// store, completes bars, and sweeps bars whose minute has passed.
+// process is the single writer.
 func (p *Pipeline) process(queue <-chan broker.Tick) {
 	sweep := time.NewTicker(p.opts.sweepEvery)
 	defer sweep.Stop()
@@ -621,21 +528,97 @@ func (p *Pipeline) process(queue <-chan broker.Tick) {
 			if !ok {
 				return
 			}
-			p.handle(tick)
+			if !p.handle(tick) {
+				if p.cancel != nil {
+					p.cancel()
+				}
+				pending := 1
+				for range queue {
+					pending++
+				}
+				p.shutdownPendingTicks += pending
+				p.metrics.ticksDropped.Add(float64(pending))
+				return
+			}
+			if p.runCtx != nil && p.runCtx.Err() != nil {
+				pending := 0
+				if p.pendingRolloverTick != nil {
+					pending++
+				}
+				for range queue {
+					pending++
+				}
+				p.shutdownPendingTicks += pending
+				if pending > 0 {
+					p.metrics.ticksDropped.Add(float64(pending))
+					p.recordError(fmt.Errorf("ingestion: shutdown left %d tick(s) unprocessed after candle storage failure", pending))
+				}
+				return
+			}
 		case <-sweep.C:
 			p.sweep(p.opts.clock())
 		}
 	}
 }
 
-// handle folds one tick. It runs only on the processor goroutine.
-func (p *Pipeline) handle(tick broker.Tick) {
-	if err := p.ticks.Append(storage.NewTick(tick)); err != nil {
+// handle folds one tick.
+func (p *Pipeline) handle(tick broker.Tick) bool {
+	row := storage.NewTick(tick)
+	ctx := p.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	interval := p.opts.appendRetryEvery
+	if interval <= 0 {
+		interval = appendRetryInterval
+	}
+	var ticker *time.Ticker
+	var retry <-chan time.Time
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	for {
+		accepted, err := p.appendTick(row)
+		if accepted {
+			if err != nil {
+				p.metrics.appendErrors.WithLabelValues("ticks").Inc()
+				err = fmt.Errorf("ingestion: append tick %s at %s: %w",
+					tick.Symbol, tick.Timestamp.UTC().Format(time.RFC3339), err)
+				p.setTickStorageError(err)
+				p.log.Error("tick append failed", zap.String("symbol", tick.Symbol), zap.Error(err))
+			} else if p.ticks.Err() == nil {
+				p.clearTickStorageError()
+			}
+			break
+		}
+		if err != nil && errors.Is(err, storage.ErrCapacity) {
+			p.setTickBackpressureError(fmt.Errorf("ingestion: raw tick buffer full: %w", err))
+			if ticker == nil {
+				ticker = time.NewTicker(interval)
+				retry = ticker.C
+			}
+			select {
+			case <-ctx.Done():
+				p.metrics.appendErrors.WithLabelValues("ticks").Inc()
+				p.recordError(fmt.Errorf("ingestion: raw tick %s at %s remained pending during storage backpressure: %w",
+					tick.Symbol, tick.Timestamp.UTC().Format(time.RFC3339), ctx.Err()))
+				return false
+			case <-retry:
+				continue
+			}
+		}
+		if err == nil {
+			err = errors.New("writer rejected tick without an error")
+		}
 		p.metrics.appendErrors.WithLabelValues("ticks").Inc()
-		err = fmt.Errorf("ingestion: append tick %s at %s: %w",
+		err = fmt.Errorf("ingestion: reject tick %s at %s: %w",
 			tick.Symbol, tick.Timestamp.UTC().Format(time.RFC3339), err)
+		p.setTickStorageError(err)
 		p.recordError(err)
 		p.log.Error("tick append failed", zap.String("symbol", tick.Symbol), zap.Error(err))
+		return false
 	}
 
 	p.fold(tick)
@@ -643,15 +626,10 @@ func (p *Pipeline) handle(tick broker.Tick) {
 	p.metrics.ticksProcessed.Inc()
 	p.lastTickNS.Store(tick.Timestamp.UnixNano())
 	p.metrics.lastTickAge.Set(p.opts.clock().Sub(tick.Timestamp).Seconds())
+	return true
 }
 
-// fold updates the live candle and persists the bar the tick just closed.
-//
-// A tick whose minute is at or before the symbol's last persisted minute is
-// late — a clock skew, a reordered frame, a reconnect replaying the tail of
-// the session. Folding it would rebuild a bar that is already on disk and
-// write it twice, so it is counted and dropped. The raw tick is still
-// appended, so nothing is lost from the tick store.
+// fold rejects stale ticks, updates the open candle, and closes prior minutes.
 func (p *Pipeline) fold(tick broker.Tick) {
 	minute := tick.Timestamp.Truncate(time.Minute)
 	st := p.state[tick.Symbol]
@@ -664,26 +642,92 @@ func (p *Pipeline) fold(tick broker.Tick) {
 		)
 		return
 	}
-
-	if st.open.Symbol != "" && !st.open.Timestamp.Equal(minute) {
-		p.complete(st.open)
+	if st.open.Symbol != "" {
+		openMinute := st.open.Timestamp
+		if minute.Before(openMinute) || tick.Timestamp.Before(st.lastVolumeAt) {
+			p.metrics.ticksLate.Inc()
+			return
+		}
+		if tick.Timestamp.Equal(st.lastVolumeAt) && tick.Price == st.lastPrice && tick.Volume == st.lastVolume {
+			return
+		}
+		if tick.Timestamp.Equal(st.lastVolumeAt) && tick.Volume < st.lastVolume {
+			p.metrics.ticksLate.Inc()
+			return
+		}
 	}
 
-	// complete may have advanced the watermark, so the state is re-read
-	// rather than reused.
+	if st.open.Symbol != "" && !st.open.Timestamp.Equal(minute) {
+		if !p.completeUntilAccepted(st.open, tick) {
+			return
+		}
+	}
+
 	st = p.state[tick.Symbol]
-	st.open = toContract(p.cache.UpdateCandle(tick.Symbol, tick.Timestamp, tick.Price, tick.Volume))
+	delta := p.volumeDelta(&st, tick)
+	st.open = toContract(p.cache.UpdateCandle(tick.Symbol, tick.Timestamp, tick.Price, delta))
+	st.lastPrice = tick.Price
 	p.state[tick.Symbol] = st
 }
 
-// sweep persists bars whose minute has passed, for symbols that have stopped
-// trading. Without it the last bar of a quiet scrip, or of a session, would
-// never be written — there is no later tick to trigger the rollover.
-//
-// It runs on the processor goroutine, so the same goroutine owns the state a
-// rollover-driven complete would touch. It is also called from Stop, which is
-// safe because Stop observes the wait group first, so the processor has
-// already stopped and no concurrent writer is left.
+func (p *Pipeline) completeUntilAccepted(candle contracts.Candle, rollover broker.Tick) bool {
+	ctx := p.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	interval := p.opts.appendRetryEvery
+	if interval <= 0 {
+		interval = appendRetryInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if p.complete(candle) {
+			p.pendingRolloverTick = nil
+			return true
+		}
+		p.pendingRolloverTick = &rollover
+		select {
+		case <-ctx.Done():
+			p.recordError(fmt.Errorf("ingestion: rollover stopped with %s tick at %s pending behind candle %s %s: %w",
+				rollover.Symbol, rollover.Timestamp.UTC().Format(time.RFC3339Nano), candle.Symbol,
+				candle.Timestamp.UTC().Format(time.RFC3339), ctx.Err()))
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *Pipeline) volumeDelta(st *symbolState, tick broker.Tick) int64 {
+	if !st.lastVolumeAt.IsZero() && tick.Timestamp.Before(st.lastVolumeAt) {
+		return 0
+	}
+	if tick.Timestamp.Equal(st.lastVolumeAt) && tick.Volume < st.lastVolume {
+		return 0
+	}
+	local := tick.Timestamp.In(indiaLocation)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, indiaLocation)
+	if !st.volumeDate.Equal(day) {
+		st.volumeDate = day
+		st.lastVolume = tick.Volume
+		st.lastVolumeAt = tick.Timestamp
+		if local.Hour() == 9 && local.Minute() == 15 {
+			return max(tick.Volume, 0)
+		}
+		return 0
+	}
+	delta := tick.Volume - st.lastVolume
+	if delta < 0 {
+		st.lastVolume = tick.Volume
+		st.lastVolumeAt = tick.Timestamp
+		return 0
+	}
+	st.lastVolume = tick.Volume
+	st.lastVolumeAt = tick.Timestamp
+	return delta
+}
+
+// sweep persists bars whose minute has passed, for symbols that have stopped trading.
 func (p *Pipeline) sweep(now time.Time) {
 	minute := now.UTC().Truncate(time.Minute)
 	for _, st := range p.state {
@@ -694,8 +738,7 @@ func (p *Pipeline) sweep(now time.Time) {
 	}
 }
 
-// openBars returns how many symbols still have an incomplete bar open. It is
-// a shutdown diagnostic.
+// openBars returns how many symbols still have an incomplete bar open.
 func (p *Pipeline) openBars() int {
 	n := 0
 	for _, st := range p.state {
@@ -706,23 +749,46 @@ func (p *Pipeline) openBars() int {
 	return n
 }
 
-// complete appends one finished bar to the candle store and retires it: the
-// open bar is cleared and the watermark advances to its minute, in the same
-// step, on the single goroutine that owns the state. That is what makes
-// "written exactly once" hold rather than merely being likely.
-func (p *Pipeline) complete(candle contracts.Candle) {
+func (p *Pipeline) unpersistedCompletedBars(now time.Time) int {
+	minute := now.UTC().Truncate(time.Minute)
+	n := 0
+	for _, st := range p.state {
+		if st.open.Symbol != "" && st.open.Timestamp.Before(minute) {
+			n++
+		}
+	}
+	return n
+}
+
+// complete appends a finished bar and advances its watermark after acceptance.
+func (p *Pipeline) complete(candle contracts.Candle) bool {
+	row := storage.NewCandle(candle)
+	accepted, err := p.candles.AppendWithStatus(row)
+	if !accepted {
+		if err != nil {
+			p.metrics.appendErrors.WithLabelValues("candles").Inc()
+			p.setStorageError(fmt.Errorf("ingestion: reject completed candle %s %s: %w", candle.Symbol, candle.Timestamp, err))
+		}
+		return false
+	}
 	st := p.state[candle.Symbol]
 	st.open = contracts.Candle{}
 	st.closed = candle.Timestamp
 	p.state[candle.Symbol] = st
-
-	if err := p.candles.Append(storage.NewCandle(candle)); err != nil {
+	if err != nil {
 		p.metrics.appendErrors.WithLabelValues("candles").Inc()
-		err = fmt.Errorf("ingestion: append candle %s %s: %w",
-			candle.Symbol, candle.Timestamp.UTC().Format(time.RFC3339), err)
-		p.recordError(err)
-		p.log.Error("candle append failed", zap.String("symbol", candle.Symbol), zap.Error(err))
-		return
+		p.setStorageError(fmt.Errorf("ingestion: append completed candle %s %s: %w", candle.Symbol, candle.Timestamp, err))
+		p.log.Warn("candle retained after append flush failure", zap.String("symbol", candle.Symbol), zap.Error(err))
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	flushErr := p.candles.Flush(flushCtx)
+	cancel()
+	if flushErr != nil {
+		p.metrics.appendErrors.WithLabelValues("candles").Inc()
+		p.setStorageError(fmt.Errorf("ingestion: flush completed candle %s %s: %w", candle.Symbol, candle.Timestamp, flushErr))
+		p.log.Error("completed candle flush failed", zap.String("symbol", candle.Symbol), zap.Error(flushErr))
+	} else {
+		p.clearStorageError()
 	}
 	p.metrics.candlesDone.Inc()
 	p.log.Debug("candle completed",
@@ -730,13 +796,10 @@ func (p *Pipeline) complete(candle contracts.Candle) {
 		zap.Time("minute", candle.Timestamp),
 		zap.Float64("close", candle.Close),
 	)
+	return true
 }
 
 // sampleAge keeps the last-tick-age gauge current.
-//
-// It runs on its own goroutine, and that is deliberate: an age gauge updated
-// from the processor would freeze at whatever it last managed to record if the
-// processor wedged, which is precisely the case the gauge exists to reveal.
 func (p *Pipeline) sampleAge(ctx context.Context) {
 	ticker := time.NewTicker(p.opts.ageEvery)
 	defer ticker.Stop()
@@ -747,8 +810,7 @@ func (p *Pipeline) sampleAge(ctx context.Context) {
 		case <-ticker.C:
 			last := p.lastTickNS.Load()
 			if last == 0 {
-				// No tick has arrived yet. Zero is the honest reading: not
-				// stale, just empty.
+
 				p.metrics.lastTickAge.Set(0)
 				continue
 			}
@@ -757,8 +819,7 @@ func (p *Pipeline) sampleAge(ctx context.Context) {
 	}
 }
 
-// toContract converts a fluxKV candle snapshot into the frozen domain type.
-// C6 hands back a copy, so the result shares no state with the cache.
+// toContract converts a fluxKV candle snapshot into the shared domain type.
 func toContract(c *fluxkv.Candle) contracts.Candle {
 	if c == nil {
 		return contracts.Candle{}

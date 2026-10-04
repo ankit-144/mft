@@ -14,9 +14,7 @@ import (
 	"github.com/mft/core/contracts"
 )
 
-// Column names in the Kite instrument dump. The dump is a CSV with a header
-// row; the same field names are used by /instruments and by the historical
-// data API.
+// Column names in the Kite instrument dump.
 const (
 	colInstrumentToken = "instrument_token"
 	colExchange        = "exchange"
@@ -26,14 +24,8 @@ const (
 	colLotSize         = "lot_size"
 )
 
-// Instruments returns the instrument master for the symbols declared in
-// broker config, resolved to their Kite instrument tokens.
-//
-// The CSV dump is downloaded at most once per TTL window and cached in
-// memory; the cache is process-local and starts empty, so the first call pays
-// for the download. A symbol that is absent from the dump is an error rather
-// than a silent omission, because the watchlist comes from config and a typo
-// there would otherwise produce a stream that silently never ticks.
+// Instruments returns the instrument master for the symbols declared in broker config,
+// resolved to their Kite instrument tokens.
 func (k *Kite) Instruments(ctx context.Context) ([]contracts.Instrument, error) {
 	if err := k.checkAuth(); err != nil {
 		return nil, err
@@ -84,8 +76,8 @@ func (k *Kite) wantedSymbols() []string {
 	return out
 }
 
-// Instrument returns the resolved instrument for a single symbol, serving it
-// from the cached master when possible.
+// Instrument returns the resolved instrument for a single symbol, serving it from the
+// cached master when possible.
 func (k *Kite) Instrument(ctx context.Context, symbol string) (contracts.Instrument, error) {
 	all, err := k.Instruments(ctx)
 	if err != nil {
@@ -111,10 +103,7 @@ func lookupToken(all []contracts.Instrument, symbol string) (contracts.Instrumen
 	return contracts.Instrument{}, fmt.Errorf("kite: symbol %q: %w", symbol, ErrInstrumentNotFound)
 }
 
-// parseInstrumentDump maps the CSV instrument dump onto the configured
-// symbols. Fills that carry an option type or an expiry are skipped:
-// contracts.Instrument models a cash instrument and has nowhere to put a
-// strike, so a future or option leg must not shadow the equity row.
+// parseInstrumentDump maps the CSV instrument dump onto the configured symbols.
 func parseInstrumentDump(body []byte, want []string) ([]contracts.Instrument, error) {
 	r := csv.NewReader(bytes.NewReader(body))
 	r.FieldsPerRecord = -1
@@ -160,10 +149,6 @@ func parseInstrumentDump(body []byte, want []string) ([]contracts.Instrument, er
 			continue
 		}
 
-		// A row whose token or lot size will not parse cannot be traded.
-		// The dump is large and one bad row must not fail symbol resolution
-		// for every other symbol, so it is skipped and the symbol surfaces
-		// in the missing list below with a far more useful message.
 		inst, err := instrumentFromRecord(record, col)
 		if err != nil {
 			continue
@@ -191,8 +176,8 @@ func parseInstrumentDump(body []byte, want []string) ([]contracts.Instrument, er
 	return out, nil
 }
 
-// derivative reports whether an instrument dump row is a future or option
-// leg rather than a cash instrument.
+// derivative reports whether an instrument dump row is a future or option leg rather
+// than a cash instrument.
 func derivative(record []string, col map[string]int) bool {
 	if i, ok := col[colOptionType]; ok && i < len(record) {
 		if strings.TrimSpace(record[i]) != "" {
@@ -241,9 +226,8 @@ func instrumentFromRecord(record []string, col map[string]int) (contracts.Instru
 	}, nil
 }
 
-// instrumentRank orders candidate rows for one symbol so that mapping is
-// deterministic when a symbol is listed on more than one exchange. NSE
-// equities win, because that is the venue the platform trades by default.
+// instrumentRank orders candidate rows for one symbol so that mapping is deterministic
+// when a symbol is listed on more than one exchange.
 func instrumentRank(exchange string) int {
 	switch exchange {
 	case "NSE":

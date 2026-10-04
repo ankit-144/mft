@@ -2,157 +2,236 @@ package risk
 
 import (
 	"fmt"
+	"math"
 	"sync"
+	"time"
 
 	"github.com/mft/core/contracts"
 )
 
-// Book is the risk engine's running exposure state: the contracts.Portfolio
-// handed to every check, plus the per-symbol cost basis that the frozen
-// Portfolio has no field for.
-//
-// # Cash is total account cash
-//
-// Snapshot reports Cash as the account's whole cash balance — free cash plus
-// the notional still deployed in open positions — because that is the only
-// reading under which the frozen Portfolio can express equity. Equity is
-// Cash + RealisedPnL, and cash that is sitting in an open position has not
-// left the account. Reporting free cash alone would make every buy look like a
-// drawdown the instant it filled, and the drawdown check would refuse the
-// second order of the day.
-//
-// Free cash is tracked internally, and Book.Apply refuses a buy it cannot fund
-// rather than letting cash go negative. That is the affordability backstop;
-// the exposure bound itself is the contract's own: max_position_pct against
-// equity times max_open_positions distinct symbols, which is 100% of equity
-// under the default configuration.
-//
-// # Fill accounting
-//
-//   - BUY:  free cash -= quantity*price; the position's average cost is
-//     reweighted. Equity is unchanged by the trade itself.
-//   - SELL: free cash += closedQuantity*averageCost, so the entry cost comes
-//     back; realisedPnL += (price-averageCost)*closedQuantity. The sale
-//     proceeds are split this way deliberately. Crediting cash with the full
-//     proceeds *and* booking the difference against realised PnL would
-//     double-count the profit.
-//
-// Book is safe for concurrent use; the execution engine additionally
-// serialises whole signals around it, so Apply and Snapshot are normally
-// called one at a time.
-type Book struct {
-	mu       sync.Mutex
-	cash     float64
-	realised float64
-	peak     float64
-	held     map[string]int
-	cost     map[string]float64
+// BookState is the durable accounting snapshot needed to rebuild a Book.
+type BookState struct {
+	Cash          float64              `json:"cash"`
+	RealisedPnL   float64              `json:"realised_pnl"`
+	RealisedByDay map[string]float64   `json:"realised_by_day"`
+	PeakEquity    float64              `json:"peak_equity"`
+	Held          map[string]int       `json:"held"`
+	Cost          map[string]float64   `json:"cost"`
+	Marks         map[string]float64   `json:"marks"`
+	MarksAt       map[string]time.Time `json:"marks_at"`
 }
 
-// NewBook returns an empty book funded with capital. A non-positive capital
-// starts a book with zero equity, which every exposure check refuses — the
-// engine logs a warning for that configuration rather than inventing a
-// default.
+// Book keeps actual cash, filled positions and their current marks.
+type Book struct {
+	mu          sync.RWMutex
+	cash        float64
+	realised    float64
+	realisedDay map[string]float64
+	peak        float64
+	held        map[string]int
+	cost        map[string]float64
+	marks       map[string]float64
+	marksAt     map[string]time.Time
+}
+
+// NewBook creates a flat account funded with capital.
 func NewBook(capital float64) *Book {
 	return &Book{
-		cash: capital,
-		peak: capital,
-		held: make(map[string]int),
-		cost: make(map[string]float64),
+		cash: capital, peak: capital,
+		realisedDay: make(map[string]float64),
+		held:        make(map[string]int), cost: make(map[string]float64),
+		marks: make(map[string]float64), marksAt: make(map[string]time.Time),
 	}
 }
 
-// Snapshot returns the current portfolio. Cash is total account cash, as
-// described on Book, and OpenPositions is a copy — a caller can mutate
-// neither the book's arithmetic nor its state through the result.
-func (b *Book) Snapshot() contracts.Portfolio {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	positions := make(map[string]int, len(b.held))
-	deployed := 0.0
-	for symbol, qty := range b.held {
-		if qty == 0 {
-			continue
+// RestoreBook rebuilds a book from a previously persisted snapshot.
+func RestoreBook(state BookState) (*Book, error) {
+	if !finite(state.Cash) || !finite(state.RealisedPnL) || !finite(state.PeakEquity) || state.PeakEquity < 0 {
+		return nil, fmt.Errorf("risk: invalid persisted peak equity")
+	}
+	b := &Book{
+		cash: state.Cash, realised: state.RealisedPnL, peak: state.PeakEquity,
+		realisedDay: cloneMap(state.RealisedByDay), held: cloneMap(state.Held),
+		cost: cloneMap(state.Cost), marks: cloneMap(state.Marks), marksAt: cloneMap(state.MarksAt),
+	}
+	if b.realisedDay == nil {
+		b.realisedDay = make(map[string]float64)
+	}
+	if b.held == nil {
+		b.held = make(map[string]int)
+	}
+	if b.cost == nil {
+		b.cost = make(map[string]float64)
+	}
+	if b.marks == nil {
+		b.marks = make(map[string]float64)
+	}
+	if b.marksAt == nil {
+		b.marksAt = make(map[string]time.Time)
+	}
+	for day, pnl := range b.realisedDay {
+		if day == "" || !finite(pnl) {
+			return nil, fmt.Errorf("risk: invalid persisted daily PnL")
 		}
-		positions[symbol] = qty
-		deployed += float64(qty) * b.cost[symbol]
+	}
+	for symbol, qty := range b.held {
+		if symbol == "" || qty <= 0 || b.cost[symbol] <= 0 || !finite(b.cost[symbol]) ||
+			(b.marks[symbol] != 0 && (!finite(b.marks[symbol]) || b.marks[symbol] <= 0)) {
+			return nil, fmt.Errorf("risk: invalid persisted position %q", symbol)
+		}
+		if b.marks[symbol] <= 0 {
+			b.marks[symbol] = b.cost[symbol]
+		}
+	}
+	return b, nil
+}
+
+// State returns a detached accounting snapshot for durable persistence.
+func (b *Book) State() BookState {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return BookState{
+		Cash: b.cash, RealisedPnL: b.realised, RealisedByDay: cloneMap(b.realisedDay),
+		PeakEquity: b.peak, Held: cloneMap(b.held), Cost: cloneMap(b.cost),
+		Marks: cloneMap(b.marks), MarksAt: cloneMap(b.marksAt),
+	}
+}
+
+// Snapshot returns a copied portfolio measured using current marks.
+func (b *Book) Snapshot() contracts.Portfolio { return b.SnapshotAt(time.Now()) }
+
+// SnapshotAt includes the realized PnL for the supplied IST trading date.
+func (b *Book) SnapshotAt(now time.Time) contracts.Portfolio {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	positions := cloneMap(b.held)
+	values := make(map[string]float64, len(b.held))
+	equity := b.cash
+	for symbol, qty := range b.held {
+		mark := b.marks[symbol]
+		if mark <= 0 {
+			mark = b.cost[symbol]
+		}
+		values[symbol] = float64(qty) * mark
+		equity += values[symbol]
 	}
 	return contracts.Portfolio{
-		Cash:          b.cash + deployed,
-		RealisedPnL:   b.realised,
-		PeakEquity:    b.peak,
-		OpenPositions: positions,
+		Cash: b.cash, Equity: equity, RealisedPnL: b.realised,
+		RealisedPnLToday: b.realisedDay[now.In(IST()).Format(HolidayLayout)],
+		PeakEquity:       b.peak, OpenPositions: positions, PositionValues: values,
 	}
 }
 
-// FreeCash returns the cash not committed to an open position. It is the
-// engine's affordability figure; the risk checks see total cash, because
-// contracts.Portfolio cannot carry both.
+// FreeCash returns the spendable cash after filled trades and realized PnL.
 func (b *Book) FreeCash() float64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	return b.cash
 }
 
-// Apply records a filled order against the book. It fails closed: an order it
-// cannot represent — a short, a nonsensical price, an unaffordable buy — is
-// refused with an error and the book is left untouched. Apply is called after
-// the broker has filled the order, so a silently dropped fill would corrupt
-// every subsequent limit; the engine logs that case as an error.
-func (b *Book) Apply(sig contracts.Signal) error {
-	if sig.Price <= 0 {
-		return fmt.Errorf("book: cannot apply %s %s at price %.4f", sig.Symbol, sig.Side, sig.Price)
+// Mark updates one held position's current price and mark timestamp.
+func (b *Book) Mark(symbol string, price float64, at time.Time) error {
+	if price <= 0 || symbol == "" || math.IsNaN(price) || math.IsInf(price, 0) {
+		return fmt.Errorf("risk: invalid mark for %q at %v", symbol, price)
 	}
-	if sig.Quantity < 1 {
-		return fmt.Errorf("book: cannot apply %s %s of quantity %d", sig.Symbol, sig.Side, sig.Quantity)
-	}
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	switch sig.Side {
-	case contracts.SideBuy:
-		notional := float64(sig.Quantity) * sig.Price
-		if notional > b.cash {
-			return fmt.Errorf("book: buy of %.0f exceeds free cash %.0f", notional, b.cash)
-		}
-		held := b.held[sig.Symbol]
-		b.cost[sig.Symbol] = (float64(held)*b.cost[sig.Symbol] + notional) / float64(held+sig.Quantity)
-		b.held[sig.Symbol] = held + sig.Quantity
-		b.cash -= notional
-
-	case contracts.SideSell:
-		held := b.held[sig.Symbol]
-		if sig.Quantity > held {
-			return fmt.Errorf("book: sell of %d exceeds the long position of %d in %s", sig.Quantity, held, sig.Symbol)
-		}
-		avg := b.cost[sig.Symbol]
-		closed := float64(sig.Quantity)
-		b.cash += closed * avg
-		b.realised += (sig.Price - avg) * closed
-		b.held[sig.Symbol] = held - sig.Quantity
-		if b.held[sig.Symbol] == 0 {
-			delete(b.held, sig.Symbol)
-			delete(b.cost, sig.Symbol)
-		}
-
-	default:
-		return fmt.Errorf("book: unknown side %q", sig.Side)
+	if b.held[symbol] == 0 {
+		return nil
 	}
-
-	if equity := b.cash + b.deployedLocked() + b.realised; equity > b.peak {
-		b.peak = equity
-	}
+	b.marks[symbol], b.marksAt[symbol] = price, at.UTC()
+	b.updatePeakLocked()
 	return nil
 }
 
-// deployedLocked returns the notional committed to open positions. The caller
-// must hold b.mu.
-func (b *Book) deployedLocked() float64 {
-	deployed := 0.0
-	for symbol, qty := range b.held {
-		deployed += float64(qty) * b.cost[symbol]
+// MarkAge reports the oldest mark age and whether all held symbols are marked.
+func (b *Book) MarkAge(now time.Time) (time.Duration, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	var oldest time.Duration
+	for symbol := range b.held {
+		at := b.marksAt[symbol]
+		if at.IsZero() {
+			return 0, false
+		}
+		age := now.Sub(at)
+		if age > oldest {
+			oldest = age
+		}
 	}
-	return deployed
+	return oldest, true
+}
+
+// ApplyFill accounts only the quantity and average price actually filled.
+func (b *Book) ApplyFill(sig contracts.Signal, quantity int, price float64, at time.Time) error {
+	if price <= 0 || quantity < 1 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return fmt.Errorf("risk: invalid fill %s %s x%d at %.4f", sig.Symbol, sig.Side, quantity, price)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch sig.Side {
+	case contracts.SideBuy:
+		notional := float64(quantity) * price
+		held := b.held[sig.Symbol]
+		b.cost[sig.Symbol] = (float64(held)*b.cost[sig.Symbol] + notional) / float64(held+quantity)
+		b.held[sig.Symbol] = held + quantity
+		b.cash -= notional
+		b.marks[sig.Symbol], b.marksAt[sig.Symbol] = price, at.UTC()
+	case contracts.SideSell:
+		held := b.held[sig.Symbol]
+		if quantity > held {
+			return fmt.Errorf("risk: sell of %d exceeds position %d in %s", quantity, held, sig.Symbol)
+		}
+		avg := b.cost[sig.Symbol]
+		b.cash += float64(quantity) * price
+		pnl := (price - avg) * float64(quantity)
+		b.realised += pnl
+		day := at.In(IST()).Format(HolidayLayout)
+		b.realisedDay[day] += pnl
+		b.held[sig.Symbol] = held - quantity
+		if b.held[sig.Symbol] == 0 {
+			delete(b.held, sig.Symbol)
+			delete(b.cost, sig.Symbol)
+			delete(b.marks, sig.Symbol)
+			delete(b.marksAt, sig.Symbol)
+		} else {
+			b.marks[sig.Symbol], b.marksAt[sig.Symbol] = price, at.UTC()
+		}
+	default:
+		return fmt.Errorf("risk: unknown fill side %q", sig.Side)
+	}
+	b.updatePeakLocked()
+	return nil
+}
+
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// Apply records an immediate synthetic fill at the signal reference price.
+func (b *Book) Apply(sig contracts.Signal) error {
+	return b.ApplyFill(sig, sig.Quantity, sig.Price, time.Now().UTC())
+}
+
+func (b *Book) updatePeakLocked() {
+	equity := b.cash
+	for symbol, qty := range b.held {
+		mark := b.marks[symbol]
+		if mark <= 0 {
+			mark = b.cost[symbol]
+		}
+		equity += float64(qty) * mark
+	}
+	if equity > b.peak {
+		b.peak = equity
+	}
+}
+
+func cloneMap[K comparable, V any](in map[K]V) map[K]V {
+	if in == nil {
+		return nil
+	}
+	out := make(map[K]V, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

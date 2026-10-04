@@ -1,13 +1,4 @@
-"""The `InferenceModel` protocol and the registry that backs model selection.
-
-The protocol exists so TabFM can be replaced without touching the service.
-TabFM's pretrained weights are non-commercial (see `Plan.md` §5), so the
-ability to swap the implementation is a hard requirement, not a nicety.
-
-Nothing in this module imports torch or tabfm. That is deliberate: the
-heuristic implementation and the test suite must be usable on a machine where
-the model backend failed to install.
-"""
+"""The `InferenceModel` protocol and the registry that backs model selection."""
 
 from __future__ import annotations
 
@@ -21,10 +12,7 @@ import pandas as pd
 
 logger = logging.getLogger("mft.inference.model")
 
-#: The frozen 18-column feature schema, in order. TabFM treats the column set
-#: as part of the table contract; changing it invalidates historical context
-#: rows. Mirrors `docs/contracts.md` §4. Owned by C3, mirrored here so the
-#: model can validate its input.
+
 FEATURE_COLUMNS: tuple[str, ...] = (
     "ret_1",
     "ret_5",
@@ -46,21 +34,19 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "spread_proxy",
 )
 
-#: The column the models regress on: the realised 1-bar log return.
+
 TARGET_COLUMN = "ret_1"
 
-#: Rows below this are warm-up only and are never valid prediction targets.
+
 MIN_CONTEXT_ROWS = 60
 
-#: TabFM's practical in-context row budget. Attention is roughly linear in
-#: table size, so feeding more than this costs CPU time for no extra signal.
+
 MAX_CONTEXT_ROWS = 100
 
-#: TabFM's feature budget. The frozen schema is 18 columns, far below this.
+
 MAX_NUM_FEATURES = 500
 
-#: Smallest volatility we will normalise by, so a dead-flat tape cannot
-#: produce a division by zero or an unbounded score.
+
 MIN_RETURN_VOLATILITY = 1e-6
 
 
@@ -73,12 +59,7 @@ class ModelNotLoadedError(InferenceModelError):
 
 
 class ModelUnavailableError(InferenceModelError):
-    """Raised when a model cannot be loaded, e.g. missing weights.
-
-    The service treats this as "fall back to the heuristic model" rather than
-    as a crash: a research-grade backend going missing must not take the
-    process down.
-    """
+    """Raised when a model cannot be loaded, e.g."""
 
 
 class InvalidContextError(InferenceModelError):
@@ -87,41 +68,19 @@ class InvalidContextError(InferenceModelError):
 
 @runtime_checkable
 class InferenceModel(Protocol):
-    """What the inference service needs from any model implementation.
-
-    Matches `docs/contracts.md` §5 exactly.
-    """
+    """What the inference service needs from any model implementation."""
 
     @property
     def name(self) -> str:
-        """Identifier of the loaded weights, e.g. ``"tabfm-v1.0.0"``.
-
-        Reported in every signal, so it must distinguish weight versions.
-        """
+        """Identifier of the loaded weights, e.g."""
         ...
 
     async def load(self) -> None:
-        """Acquire weights and make the model ready for `predict`.
-
-        Must be safe to call more than once. Must raise `ModelUnavailableError`
-        rather than panicking when the backend cannot be loaded.
-        """
+        """Acquire weights and make the model ready for `predict`."""
         ...
 
     def predict(self, context: pd.DataFrame, horizon: int) -> float:
-        """Return the expected return for the bar `horizon` bars ahead.
-
-        Args:
-            context: Rows x 18 features, oldest first, newest last.
-            horizon: Bars ahead to predict, 1 for minute-close inference.
-
-        Returns:
-            Expected return, scaled to [-1, 1].
-
-        Raises:
-            ModelNotLoadedError: If `load` has not completed.
-            InvalidContextError: If `context` is not a usable prompt table.
-        """
+        """Return the expected return for the bar `horizon` bars ahead."""
         ...
 
     def is_loaded(self) -> bool:
@@ -130,12 +89,7 @@ class InferenceModel(Protocol):
 
 
 class BaseInferenceModel(ABC):
-    """Abstract base sharing the contract every implementation must honour.
-
-    Subclasses implement `_load`, `_predict_raw` and `_name`. The public
-    methods here add the parts that must behave identically everywhere: the
-    loaded-state guard, the second-call-safe `load`, and the range clamp.
-    """
+    """Abstract base sharing the contract every implementation must honour."""
 
     @property
     def name(self) -> str:
@@ -147,7 +101,7 @@ class BaseInferenceModel(ABC):
         return self._loaded
 
     async def load(self) -> None:
-        """Load the model. Safe to call repeatedly; loads at most once."""
+        """Load the model."""
         if self._loaded:
             logger.debug("%s already loaded, skipping", self._name)
             return
@@ -170,7 +124,7 @@ class BaseInferenceModel(ABC):
 
     @abstractmethod
     async def _load(self) -> None:
-        """Acquire weights. Must raise `ModelUnavailableError` on failure."""
+        """Acquire weights."""
 
     @abstractmethod
     def _predict_raw(self, context: pd.DataFrame, horizon: int) -> float:
@@ -178,20 +132,7 @@ class BaseInferenceModel(ABC):
 
 
 def validate_context(context: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    """Check a context table and return it in newest-last form.
-
-    Every model shares this so that a malformed prompt fails the same way
-    regardless of backend.
-
-    A context containing NaN in the frozen feature columns is rejected rather
-    than repaired. A raw `features.Builder` table does have NaN in its
-    rolling columns across the warm-up window, so the service is expected to
-    hand the model already-warmed rows; silently dropping rows here would
-    change what the model sees in a way nothing downstream could observe.
-
-    Raises:
-        InvalidContextError: If the table is not a usable prompt.
-    """
+    """Check a context table and return it in newest-last form."""
     if horizon < 1:
         raise InvalidContextError(f"horizon must be >= 1, got {horizon}")
     if not isinstance(context, pd.DataFrame):
@@ -203,8 +144,10 @@ def validate_context(context: pd.DataFrame, horizon: int) -> pd.DataFrame:
             f"context is missing {len(missing)} frozen feature column(s): {missing}"
         )
 
-    # A model predicting h bars ahead needs h realised rows after the query
-    # row, so the usable prompt is one bar shorter than the table.
+    if tuple(context.columns) != FEATURE_COLUMNS:
+        raise InvalidContextError("context must contain exactly the ordered 18 feature columns")
+
+
     usable = len(context) - horizon
     if usable < MIN_CONTEXT_ROWS:
         raise InvalidContextError(
@@ -212,19 +155,18 @@ def validate_context(context: pd.DataFrame, horizon: int) -> pd.DataFrame:
             f"ahead, got {len(context)}"
         )
 
-    if context.loc[:, FEATURE_COLUMNS].isna().to_numpy().any():
-        raise InvalidContextError("context contains NaN in the frozen feature columns")
+    try:
+        values = context.to_numpy(dtype=float)
+    except (ValueError, TypeError) as err:
+        raise InvalidContextError("context features must be numeric") from err
+    if not np.isfinite(values).all():
+        raise InvalidContextError("context contains NaN or infinity in the feature columns")
 
     return context.reset_index(drop=True)
 
 
 def take_recent(context: pd.DataFrame, limit: int = MAX_CONTEXT_ROWS) -> pd.DataFrame:
-    """Truncate a context table to its `limit` most recent rows.
-
-    Deliberate truncation rather than sampling: in-context learning attends
-    over the whole prompt, and a stale regime at the head of the table is
-    worse than no data at all. The caller has already validated the table.
-    """
+    """Truncate a context table to its `limit` most recent rows."""
     if limit <= 0:
         raise InvalidContextError(f"limit must be > 0, got {limit}")
     if len(context) <= limit:
@@ -239,16 +181,7 @@ def returns_volatility(targets: np.ndarray) -> float:
 
 
 def scale_to_unit(value: float, softness: float = 1.0) -> float:
-    """Map a volatility-normalised return onto [-1, 1].
-
-    `tanh` rather than a hard clip: a clip produces a flat region at the
-    extremes, which destroys the ranking the execution service relies on
-    when it compares several instruments against `score_threshold`.
-
-    A non-finite input returns 0.0. It has to be checked before the transform,
-    not after: `tanh(inf)` is 1.0, so a diverged model would otherwise be
-    reported as maximum conviction and traded.
-    """
+    """Map a volatility-normalised return onto [-1, 1]."""
     if not np.isfinite(value):
         logger.warning("non-finite model output %r, returning 0.0", value)
         return 0.0
@@ -258,24 +191,13 @@ def scale_to_unit(value: float, softness: float = 1.0) -> float:
     return max(-1.0, min(1.0, scaled))
 
 
-#: A factory builds a fresh, unloaded model. Stored in the registry.
 ModelFactory = Callable[[], InferenceModel]
 
 _REGISTRY: dict[str, ModelFactory] = {}
 
 
 def register(name: str) -> Callable[[ModelFactory], ModelFactory]:
-    """Register a model factory under `name` for `config.InferenceConfig.Model`.
-
-    Args:
-        name: Selector value, e.g. ``"tabfm"`` or ``"heuristic"``.
-
-    Returns:
-        A decorator that registers the class and returns it unchanged.
-
-    Raises:
-        ValueError: If `name` is already registered.
-    """
+    """Register a model factory under `name` for `config.InferenceConfig.Model`."""
     if not name:
         raise ValueError("model name must be non-empty")
 
@@ -290,16 +212,12 @@ def register(name: str) -> Callable[[ModelFactory], ModelFactory]:
 
 
 def unregister(name: str) -> None:
-    """Remove a registration. For tests that register throwaway models."""
+    """Remove a registration."""
     _REGISTRY.pop(name, None)
 
 
 def create_model(name: str) -> InferenceModel:
-    """Instantiate the model registered under `name`.
-
-    Raises:
-        ValueError: If `name` is not registered.
-    """
+    """Instantiate the model registered under `name`."""
     try:
         factory = _REGISTRY[name]
     except KeyError:
@@ -318,13 +236,7 @@ def available_models() -> tuple[str, ...]:
 
 
 def _register_builtin_models() -> None:
-    """Register the two implementations shipped with the service.
-
-    Imported here rather than at module scope so that importing
-    `services.inference.model.base` never drags in torch. A model whose
-    backend failed to install must still be selectable by name so the
-    service can fall back.
-    """
+    """Register the two implementations shipped with the service."""
     from .heuristic_model import HeuristicModel
 
     _REGISTRY.setdefault("heuristic", HeuristicModel)
@@ -333,7 +245,7 @@ def _register_builtin_models() -> None:
         from .tabfm_model import TabFMModel
 
         _REGISTRY.setdefault("tabfm", TabFMModel)
-    except ImportError:  # pragma: no cover - depends on the local install
+    except ImportError:  # pragma: no cover
         logger.warning("tabfm backend not importable; 'tabfm' is not selectable")
 
 

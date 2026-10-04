@@ -15,14 +15,11 @@ const (
 	StatusDegraded = "degraded"
 )
 
-// Checker is a named dependency probe, e.g. broker connectivity or Parquet
-// writability. A component registers one and the metrics server answers
-// /readyz from it, so an orchestrator can act on "process is up but cannot
-// trade" without parsing logs.
+// Checker is a named dependency probe, e.g.
 type Checker struct {
-	// Name identifies the dependency in the report, e.g. "broker".
+	// Name identifies the dependency in the report, e.g.
 	Name string
-	// Check reports nil when the dependency is usable. It must respect ctx.
+	// Check reports nil when the dependency is usable.
 	Check func(ctx context.Context) error
 }
 
@@ -41,8 +38,7 @@ type Report struct {
 	Checks        []CheckResult `json:"checks,omitempty"`
 }
 
-// Checks is a concurrency-safe set of dependency probes. Components add to it
-// from their constructors; the health endpoints read it on every request.
+// Checks is a concurrency-safe set of dependency probes.
 type Checks struct {
 	mu    sync.RWMutex
 	items []Checker
@@ -51,8 +47,7 @@ type Checks struct {
 // NewChecks returns an empty probe set.
 func NewChecks() *Checks { return &Checks{} }
 
-// Add appends a probe. Adding the same name twice keeps the first, so a
-// component rebuilt in a test cannot double-report a dependency.
+// Add appends a probe.
 func (c *Checks) Add(checker Checker) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -74,9 +69,7 @@ func (c *Checks) Len() int {
 	return len(c.items)
 }
 
-// Run executes every probe concurrently and returns the results. A nil *Checks
-// reports success with no dependencies, which is the correct answer for a
-// service that has nothing external to depend on.
+// Run executes every probe concurrently and returns the results.
 func (c *Checks) Run(ctx context.Context) []CheckResult {
 	if c == nil {
 		return nil
@@ -107,26 +100,19 @@ func (c *Checks) Run(ctx context.Context) []CheckResult {
 	return results
 }
 
-// defaultChecks is the process-wide probe set used by Server. It exists so
-// that a component can participate in readiness with a single call and no
-// change to the shared fx wiring in core/fx.go, which this component does not
-// own.
+// defaultChecks is the process-wide probe set used by Server.
 var (
 	defaultChecksOnce sync.Once
 	defaultChecks     *Checks
 )
 
-// DefaultChecks returns the process-wide probe set backing /readyz. Services
-// add to it during construction:
-//
-//	metrics.DefaultChecks().Add(metrics.Checker{Name: "broker", Check: c.Ping})
+// DefaultChecks returns the process-wide probe set backing /readyz.
 func DefaultChecks() *Checks {
 	defaultChecksOnce.Do(func() { defaultChecks = NewChecks() })
 	return defaultChecks
 }
 
-// Health answers liveness and readiness for one service. It is an
-// http.Handler, so it can be mounted directly on the metrics server.
+// Health answers liveness and readiness for one service.
 type Health struct {
 	service string
 	checks  *Checks
@@ -138,9 +124,7 @@ func NewHealth(service string, checks *Checks) *Health {
 	return &Health{service: service, checks: checks, started: processStart}
 }
 
-// Livez reports liveness: the process is running and able to answer. It never
-// fails, because a failing liveness probe restarts a process that is merely
-// unhealthy, which is the opposite of what you want from a trading service.
+// Livez reports liveness: the process is running and able to answer.
 func (h *Health) Livez() Report {
 	return Report{
 		Status:        StatusOK,
@@ -149,8 +133,7 @@ func (h *Health) Livez() Report {
 	}
 }
 
-// Readyz reports readiness: liveness plus every dependency probe. Callers get
-// 503 when any probe fails.
+// Readyz reports readiness: liveness plus every dependency probe.
 func (h *Health) Readyz(ctx context.Context) (Report, bool) {
 	report := h.Livez()
 	report.Checks = h.checks.Run(ctx)
@@ -163,8 +146,8 @@ func (h *Health) Readyz(ctx context.Context) (Report, bool) {
 	return report, true
 }
 
-// ServeHTTP routes /healthz to liveness and /readyz to readiness, answering
-// 404 for anything else.
+// ServeHTTP routes /healthz to liveness and /readyz to readiness, answering 404 for
+// anything else.
 func (h *Health) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/healthz":

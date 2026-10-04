@@ -1,60 +1,4 @@
-"""The production loop: pull, score, signal, once per minute close.
-
-This is the component that closes the north star, and it is deliberately not
-an HTTP endpoint. `docs/contracts.md` §7 says so explicitly: the production
-path is an internal scheduler that fires on each minute close, pulls context
-from DuckDB, runs the model and POSTs to execution.
-
-# Why pull, and what that buys
-
-Plan.md §4 chose pull over push for cross-service data. At a 60-second
-decision cadence, push latency buys nothing, and pull is what makes the rest
-of the design possible:
-
-* **Missed minutes are free.** If a tick takes too long, the next boundary
-  simply runs again and pulls whatever is now in the store. There is no queue
-  to back up and no gap in the decision record.
-* **A restart catches up.** The process comes back, reads the newest candles
-  it can find, and continues. Nothing replays a stream it missed.
-* **The service is stateless.** Nothing is pushed *at* it, so it can be
-  restarted at any minute without a handshake.
-
-# Why the loop fails closed, per symbol
-
-Every step that could produce a confidently wrong signal is a skip, and every
-skip is logged with the reason. A short window, a feature build that rejects
-its input, a context the model rejects, a model that is not loaded, a context
-older than the guard, a zero score with no direction — each is one symbol
-being skipped, never the loop and never another symbol. An exception escaping
-one symbol is contained here rather than propagated, because a single symbol's
-broker hiccup must not silence the other instruments for the rest of the
-session.
-
-The one thing that does stop the loop is `dry_run` being on. Not "stops
-sending" — it logs the signal it would have sent, with the full body, so a
-research run leaves a decision record that can be diffed against a live one.
-
-# Why the context is pulled with a warm-up margin
-
-`inference.context_rows` is the number of rows handed to the model. Features
-for the first 60 rows of any window are context-only by contract, so a window
-of exactly `context_rows` candles would spend most of its prompt on zeros. The
-loop pulls `context_rows + WARMUP_ROWS` candles, builds the table, and drops
-the warm-up rows before scoring.
-
-# Why the staleness guard is tied to the flush interval
-
-The newest *published* candle lags the clock. C2 flushes on
-`storage.flush_interval_seconds` and only then is the file renamed into the
-`part-*.parquet` glob this loop reads, so a store that is working perfectly
-still reports a context that is up to one flush interval old. A guard tighter
-than that would skip every minute of a healthy system.
-
-So the guard is derived from the flush interval rather than guessed, and
-`staleness_guard` is what the wiring calls. A deployment that flushes every
-30 seconds does not also have to remember to shorten the guard, and one that
-flushes every ten minutes is not skipped by a guard that assumed the default.
-"""
+"""The production loop: pull, score, signal, once per minute close."""
 
 from __future__ import annotations
 
@@ -72,36 +16,26 @@ from model import InvalidContextError, MAX_CONTEXT_ROWS, MIN_CONTEXT_ROWS
 
 from .candles import CandleStore
 from .config import InferenceConfig
+from .cursors import DecisionCursors
 from .features import WARMUP_ROWS, FeatureBuilder, FeatureError, FeatureTable
 from .predictor import Predictor
 from .signals import Signal
 
 logger = logging.getLogger("mft.inference.loop")
 
-#: The decision cadence. One minute is a property of the market, not a knob:
-#: the candles are 1-minute bars, so a faster tick would score the same bar
-#: twice and a slower one would skip bars outright.
+
 TICK_PERIOD = timedelta(minutes=1)
 
-#: Ceiling on the minimum sleep between ticks, so a pass that overran its
-#: window cannot spin against the boundary it just missed. See
-#: `MinuteScheduler._seconds_to_next_boundary`.
+
 MIN_SLEEP_SECONDS = 0.5
 
-#: Floor on the staleness guard, applied whatever the flush interval is.
-#: A context that has not advanced while the loop has run is a stalled store
-#: or a dead feed, and scoring it would trade a stale number.
+
 DEFAULT_MAX_CONTEXT_AGE = timedelta(minutes=5)
 
-#: Slack added to the flush interval, covering the flush that is in progress
-#: and the clock skew between the writer and this reader. A minute is ample
-#: for both processes on one machine, which is the deployment Plan.md §2
-#: describes.
+
 STALENESS_MARGIN = timedelta(minutes=1)
 
-#: Fewest rows a model may be given, independent of what was configured.
-#: `MIN_CONTEXT_ROWS` is C5's warm-up floor for the model itself; nothing below
-#: it is a usable prompt table whichever backend is selected.
+
 _MIN_USABLE_ROWS = MIN_CONTEXT_ROWS
 
 
@@ -110,7 +44,7 @@ class SignalSender(Protocol):
     """What the loop needs from the execution client."""
 
     async def submit(self, signal: Signal) -> object:
-        """Deliver a signal. Raises `ExecutionError` when it did not land."""
+        """Deliver a signal."""
         ...
 
     async def aclose(self) -> None:
@@ -119,11 +53,7 @@ class SignalSender(Protocol):
 
 
 class Outcome(str, Enum):
-    """Why a symbol did or did not produce a signal.
-
-    A `str` enum so it logs as a readable word rather than a repr, and so a
-    caller can compare it to a string from a metric label.
-    """
+    """Why a symbol did or did not produce a signal."""
 
     SENT = "sent"
     DRY_RUN = "dry_run"
@@ -135,6 +65,7 @@ class Outcome(str, Enum):
     NOT_LOADED = "not_loaded"
     SEND_FAILED = "send_failed"
     ERROR = "error"
+    UNCHANGED = "unchanged"
 
     @property
     def is_failure(self) -> bool:
@@ -174,23 +105,7 @@ class Decision:
 
 
 class MinuteScheduler:
-    """Scores every configured instrument once per minute close.
-
-    Args:
-        config: The frozen `inference` section.
-        store: Where candles are pulled from.
-        predictor: The loaded model and the single thread that may call it.
-        sender: Where signals are posted. Required even in `dry_run`, so the
-            production wiring is identical to the research wiring.
-        builder: The feature builder. One is built in `timezone_name` when
-            omitted; it holds nothing but the zone, so it is shared.
-        max_context_age: Reject a context whose newest candle is older than
-            this. `None` disables the guard; it is on by default because a
-            context that has not advanced is a stalled store, not a market.
-        tick_period: The decision cadence. Defaults to one minute; the tests
-            drive `tick` directly and never wait on this.
-        clock: Injected UTC clock, so the staleness guard is testable.
-    """
+    """Scores every configured instrument once per minute close."""
 
     def __init__(
         self,
@@ -215,11 +130,22 @@ class MinuteScheduler:
         self._clock = clock if clock is not None else _utcnow
         self._ticks = 0
         self._last_tick: datetime | None = None
+        self._cursors = DecisionCursors(config.cursor_path)
+        self._symbol_locks: dict[str, asyncio.Lock] = {}
+        self._outcomes: dict[str, int] = {}
 
     @property
     def config(self) -> InferenceConfig:
         """The `inference` section this loop runs from."""
         return self._config
+
+    def claim_owner(self) -> None:
+        """Reserve this scheduler's persistent cursor journal for its runtime."""
+        self._cursors.claim_owner()
+
+    def close(self) -> None:
+        """Release cursor ownership after all evaluations have stopped."""
+        self._cursors.close()
 
     @property
     def ticks(self) -> int:
@@ -246,15 +172,9 @@ class MinuteScheduler:
         """The feature builder shared by every symbol."""
         return self._builder
 
-    # -- the loop ---------------------------------------------------------
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
-        """Fire on every minute boundary until cancelled or `stop` is set.
-
-        The sleep is to the next boundary, not for a fixed period, so ticks
-        do not drift: a pass that takes four seconds still starts on the next
-        minute, not 64 seconds after the one before it.
-        """
+        """Fire on every minute boundary until cancelled or `stop` is set."""
         logger.info(
             "scheduler started: instruments=%s cadence=%s dry_run=%s threshold=%.3f",
             ",".join(self.instruments) or "<none>",
@@ -275,15 +195,7 @@ class MinuteScheduler:
             await self.tick()
 
     def _seconds_to_next_boundary(self, now: datetime | None = None) -> float:
-        """Seconds until the next tick boundary, floored against spinning.
-
-        Boundaries are aligned to the wall clock in UTC, which is the same
-        grid the candle timestamps are truncated to. A pass that overran its
-        window would otherwise find the next boundary in the past and tick
-        again immediately, so the wait never falls below a tenth of the period
-        — capped at half a second, which is all the protection a one-minute
-        cadence needs.
-        """
+        """Seconds until the next tick boundary, floored against spinning."""
         moment = (now or self._clock()).astimezone(timezone.utc)
         period = self._tick_period.total_seconds()
         next_boundary = (moment.timestamp() // period + 1) * period
@@ -291,30 +203,38 @@ class MinuteScheduler:
         return max(next_boundary - moment.timestamp(), floor)
 
     async def tick(self) -> list[Decision]:
-        """Score every instrument once. Never raises.
-
-        Returns one `Decision` per instrument, in configured order. An
-        exception from one symbol is contained and recorded as
-        `Outcome.ERROR` so the others still run.
-        """
+        """Score every instrument once."""
         self._ticks += 1
         self._last_tick = self._clock()
-        decisions: list[Decision] = []
-        for symbol in self.instruments:
+        async def score(symbol: str) -> Decision:
             try:
-                decisions.append(await self.evaluate(symbol))
-            except Exception as err:  # noqa: BLE001 - one symbol must not stop the rest
+                return await self.evaluate(symbol)
+            except Exception as err:  # noqa: BLE001
                 logger.exception("unhandled error scoring %s: %s", symbol, err)
-                decisions.append(
-                    Decision(
-                        symbol=symbol,
-                        outcome=Outcome.ERROR,
-                        detail=f"{type(err).__name__}: {err}",
-                    )
+                return Decision(
+                    symbol=symbol,
+                    outcome=Outcome.ERROR,
+                    detail=f"{type(err).__name__}: {err}",
                 )
+        decisions: list[Decision] = []
+        symbols = self.instruments
+        concurrency = min(
+            self._config.max_concurrency,
+            getattr(self._store, "capacity", self._config.max_concurrency),
+            getattr(self._predictor, "capacity", self._config.max_concurrency),
+        )
+        for start in range(0, len(symbols), concurrency):
+            group = symbols[start:start + concurrency]
+            decisions.extend(await asyncio.gather(*(score(symbol) for symbol in group)))
         for decision in decisions:
+            key = decision.outcome.value
+            self._outcomes[key] = self._outcomes.get(key, 0) + 1
             self._log(decision)
         return decisions
+
+    @property
+    def outcome_counts(self) -> dict[str, int]:
+        return dict(self._outcomes)
 
     def _log(self, decision: Decision) -> None:
         if decision.outcome in (Outcome.SENT, Outcome.DRY_RUN):
@@ -324,15 +244,18 @@ class MinuteScheduler:
         else:
             logger.debug("no signal %s", decision)
 
-    # -- one symbol -------------------------------------------------------
 
     async def evaluate(self, symbol: str) -> Decision:
-        """Pull, build, score, and maybe signal one symbol.
+        """Pull, build, score, and maybe signal one symbol."""
+        lock = self._symbol_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            decision = await self._evaluate(symbol)
+            completed = {Outcome.SENT, Outcome.DRY_RUN, Outcome.BELOW_THRESHOLD, Outcome.NO_DIRECTION, Outcome.SEND_FAILED}
+            if decision.outcome in completed and decision.as_of is not None:
+                await asyncio.to_thread(self._cursors.advance, symbol, decision.as_of)
+            return decision
 
-        Returns rather than raises for every expected failure, because the
-        caller iterates a list and one symbol's bad minute is not the end of
-        the session for the others.
-        """
+    async def _evaluate(self, symbol: str) -> Decision:
         if not self._predictor.is_loaded():
             return Decision(
                 symbol=symbol,
@@ -341,13 +264,12 @@ class MinuteScheduler:
             )
 
         horizon = self._config.horizon_bars
-        # Capped at the model's own row budget before the warm-up margin is
-        # added, so a `context_rows` larger than TabFM can attend to costs
-        # nothing at the store either.
+
+
         wanted = min(self._config.context_rows, MAX_CONTEXT_ROWS)
         try:
             candles = await self._store.tail(symbol, wanted + WARMUP_ROWS)
-        except Exception as err:  # noqa: BLE001 - a bad read is a skip
+        except Exception as err:  # noqa: BLE001
             logger.warning("cannot read candles for %s: %s", symbol, err)
             return Decision(
                 symbol=symbol,
@@ -371,6 +293,9 @@ class MinuteScheduler:
                 candidates=len(candles),
                 as_of=candles[-1].timestamp,
             )
+
+        if self._cursors.contains(symbol, candles[-1].timestamp):
+            return Decision(symbol=symbol, outcome=Outcome.UNCHANGED, as_of=candles[-1].timestamp)
 
         try:
             table = self._builder.build(candles)
@@ -406,7 +331,7 @@ class MinuteScheduler:
                 candidates=len(context),
                 as_of=table.as_of,
             )
-        except Exception as err:  # noqa: BLE001 - a model fault is a skip
+        except Exception as err:  # noqa: BLE001
             logger.exception("model failed for %s: %s", symbol, err)
             return Decision(
                 symbol=symbol,
@@ -431,14 +356,7 @@ class MinuteScheduler:
     def _context_for(
         self, table: FeatureTable, wanted: int, horizon: int
     ) -> pd.DataFrame:
-        """Trim the warm-up, cap the prompt, and check the model can use it.
-
-        Raises:
-            FeatureError: If fewer rows survive than the model needs. That is
-                a skip, never a shorter prompt: a model handed fewer rows than
-                its floor answers with whatever it can still attend to, which
-                is a confident number computed from too little.
-        """
+        """Trim the warm-up, cap the prompt, and check the model can use it."""
         context = table.context(wanted)
         needed = max(_MIN_USABLE_ROWS + horizon, horizon + 1)
         if len(context) < needed:
@@ -456,13 +374,7 @@ class MinuteScheduler:
         table: FeatureTable,
         last_close: float,
     ) -> Decision:
-        """Threshold, derive a side, and either log or post the signal.
-
-        `last_close` is the close of the newest candle, which is the reference
-        price in the signal. It is not the predicted value and not a feature:
-        the frozen 18-column schema carries no close, and a score in [-1, 1] is
-        not a price.
-        """
+        """Threshold, derive a side, and either log or post the signal."""
         threshold = self._config.score_threshold
         magnitude = abs(score)
         if magnitude < threshold:
@@ -485,8 +397,8 @@ class MinuteScheduler:
                 as_of=table.as_of,
             )
         except ValueError as err:
-            # A score of exactly 0 only reaches here with threshold 0, but a
-            # score outside [-1, 1] should never be traded either.
+
+
             return Decision(
                 symbol=symbol,
                 outcome=Outcome.NO_DIRECTION,
@@ -497,9 +409,8 @@ class MinuteScheduler:
             )
 
         if self._config.dry_run:
-            # The signal is built and logged in full precisely so a research
-            # run leaves a record a live run can be diffed against. Nothing
-            # leaves this process.
+
+
             logger.info(
                 "dry_run: would POST %s to %s with %s",
                 signal.idempotency_key,
@@ -518,11 +429,9 @@ class MinuteScheduler:
 
         try:
             ack = await self._sender.submit(signal)
-        except Exception as err:  # noqa: BLE001 - a failed order must not kill the loop
-            # The signal is logged with its key so the next minute's state can
-            # be reconciled, and the loop moves on. Retrying here would be
-            # wrong: the client's retries are bounded, and a decision that
-            # outlives its minute is a decision made on a stale context.
+        except Exception as err:  # noqa: BLE001
+
+
             logger.error(
                 "signal %s for %s was not delivered: %s",
                 signal.idempotency_key,
@@ -550,14 +459,13 @@ class MinuteScheduler:
             as_of=table.as_of,
         )
 
-    # -- helpers ----------------------------------------------------------
 
     def _staleness_of(self, as_of: datetime) -> timedelta | None:
         """How old the newest candle is, or `None` if that is unacceptable."""
         if self._max_context_age is None:
             return None
         age = self._clock().astimezone(timezone.utc) - as_of.astimezone(timezone.utc)
-        return age if age > self._max_context_age else None
+        return age if age > self._max_context_age or age < -TICK_PERIOD else None
 
 
 def _utcnow() -> datetime:
@@ -565,11 +473,7 @@ def _utcnow() -> datetime:
 
 
 def staleness_guard(flush_interval_seconds: int) -> timedelta:
-    """The staleness guard for a store that publishes every N seconds.
-
-    One flush interval plus a minute of slack, and never below
-    `DEFAULT_MAX_CONTEXT_AGE`.
-    """
+    """The staleness guard for a store that publishes every N seconds."""
     if flush_interval_seconds <= 0:
         return DEFAULT_MAX_CONTEXT_AGE
     return max(

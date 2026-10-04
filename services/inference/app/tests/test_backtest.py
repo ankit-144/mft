@@ -44,6 +44,7 @@ import pytest
 
 from app.backtest import (
     BARS_PER_YEAR,
+    Candidate,
     MIN_USABLE_BARS,
     BarOutcome,
     BacktestError,
@@ -668,6 +669,17 @@ def test_market_hours_accepts_the_session_and_refuses_everything_else() -> None:
     ) is False
 
 
+def test_intraday_trade_that_exits_next_session_is_refused() -> None:
+    """MIS positions must not remain open overnight to reach their label bar."""
+    candles = session_grid(376, start=START_DAY, zone=trading_zone("Asia/Kolkata"))
+    candidate = Candidate(
+        symbol="TEST", index=374, as_of=candles[374], exit_as_of=candles[375],
+        price=100.0, exit_price=101.0, score=0.9, side="BUY", quantity=10, key="once",
+    )
+    gate = Portfolio(permissive(), ChargeModel.zero(), zone=trading_zone("Asia/Kolkata"))
+    assert gate._check(candidate, 1_000_000.0) is Reason.SESSION_CROSSING  # noqa: SLF001
+
+
 def test_the_risk_gate_order_puts_the_first_failure_first() -> None:
     """`docs/contracts.md` §6: "first failure rejects the signal".
 
@@ -744,9 +756,10 @@ def test_metrics_are_correct_on_a_hand_computed_series() -> None:
     # 1072..1073, 1073..1071, ... which sum to Rs 19,325 of price.
     assert metrics.notional == pytest.approx(193_250.0)
     assert metrics.turnover == pytest.approx(0.19325)
-    # The curve is the opening capital, one point per candidate, and a closing
-    # point; nine of those eleven steps had a position open.
-    assert metrics.exposure_pct == pytest.approx(9 / 11)
+    # The curve includes every candle timestamp, not only model candidates.
+    # Nine of the 131 opening-plus-market-bar points had a position open.
+    assert metrics.steps == 131
+    assert metrics.exposure_pct == pytest.approx(9 / 131)
     assert metrics.bars_per_year == BARS_PER_YEAR
     assert metrics.position_steps == 9  # nine fills, each open for exactly one step
     assert result.curve[-1].equity == pytest.approx(1_000_010.0)

@@ -14,11 +14,6 @@ import (
 )
 
 // Parquet layout of docs/contracts.md §3 for the historical tree:
-//
-//	data/historical/symbol=<SYMBOL>/from=<date>/to=<date>/candles.parquet
-//
-// The from/to pair is the segment identity, so the path is a pure function of
-// the segment and two runs of the same backfill land on the same file.
 const (
 	segmentSymbolDir = "symbol=%s"
 	segmentFromDir   = "from=%s"
@@ -30,10 +25,6 @@ const (
 )
 
 // HistoricalCandle is the on-disk schema of a historical candle row.
-//
-// Timestamps are Unix milliseconds, as docs/contracts.md §1 requires; the
-// symbol is carried on every row so a reader that globs the whole tree does
-// not have to parse the partition path to know what a bar belongs to.
 type HistoricalCandle struct {
 	Symbol       string  `parquet:"symbol"`
 	Instrument   int64   `parquet:"instrument_token"`
@@ -48,34 +39,28 @@ type HistoricalCandle struct {
 	SegmentEnd   int64   `parquet:"segment_to"`
 }
 
-// ParquetStore writes historical segments to the hive-partitioned Parquet tree
-// that DuckDB reads natively.
-//
-// It is a local implementation of the [SegmentStore] seam rather than an
-// adapter onto core/storage: C2's Writer is tick-shaped, appends into
-// wall-clock-keyed files, and has no concept of a closed segment. See the
-// package comment.
+// ParquetStore writes historical segments to the hive-partitioned Parquet tree that
+// DuckDB reads natively.
 type ParquetStore struct {
-	dir      string
-	interval string
+	dir        string
+	interval   string
+	segmentLen time.Duration
 }
 
 // NewParquetStore returns a store that writes under the data/historical root.
 func NewParquetStore(dir string) *ParquetStore {
-	return &ParquetStore{dir: strings.TrimRight(dir, "/"), interval: defaultInterval}
+	return &ParquetStore{dir: strings.TrimRight(dir, "/"), interval: defaultInterval, segmentLen: segmentDays * day}
 }
 
-// NewParquetStoreFromConfig builds the store from the frozen config. It exists
-// so the fx graph does not have to provide a bare string, which DI cannot
-// synthesise, and so the root is read from config in exactly one place.
+// NewParquetStoreFromConfig builds the store from the shared config.
 func NewParquetStoreFromConfig(cfg *config.Config) *ParquetStore {
 	return NewParquetStore(cfg.Jobs.HistoricalDir)
 }
 
-// newParquetStore is NewParquetStore with an explicit interval recorded on
-// every row, for tests that backfill more than one interval.
+// newParquetStore is NewParquetStore with an explicit interval recorded on every row,
+// for tests that backfill more than one interval.
 func newParquetStore(dir, interval string) *ParquetStore {
-	return &ParquetStore{dir: strings.TrimRight(dir, "/"), interval: interval}
+	return &ParquetStore{dir: strings.TrimRight(dir, "/"), interval: interval, segmentLen: segmentDays * day}
 }
 
 // Root returns the historical directory the store writes into.
@@ -86,17 +71,29 @@ func (s *ParquetStore) SegmentPath(seg Segment) (string, error) {
 	if err := validSegment(seg); err != nil {
 		return "", err
 	}
+	start, end := s.segmentBucket(seg.From)
 	return filepath.Join(s.dir,
 		fmt.Sprintf(segmentSymbolDir, segmentSymbol(seg)),
-		fmt.Sprintf(segmentFromDir, seg.From.UTC().Format(time.DateOnly)),
-		fmt.Sprintf(segmentToDir, seg.To.UTC().Format(time.DateOnly)),
+		fmt.Sprintf(segmentFromDir, start.Format(time.DateOnly)),
+		fmt.Sprintf(segmentToDir, end.Format(time.DateOnly)),
 		segmentFileName,
 	), nil
 }
 
-// HasSegment implements SegmentStore. A segment counts as present only when
-// its file exists and is non-empty, so a zero-length placeholder left by an
-// earlier crash is refetched rather than trusted.
+func (s *ParquetStore) segmentBucket(at time.Time) (time.Time, time.Time) {
+	local := at.In(indiaTimeZone)
+	dayStart := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, indiaTimeZone)
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, indiaTimeZone)
+	days := int(dayStart.Sub(epoch) / day)
+	width := int(s.segmentLen / day)
+	if width <= 0 {
+		width = segmentDays
+	}
+	start := epoch.AddDate(0, 0, days/width*width)
+	return start, start.AddDate(0, 0, width)
+}
+
+// HasSegment reports whether the stable bucket already covers the requested range.
 func (s *ParquetStore) HasSegment(_ context.Context, seg Segment) (bool, error) {
 	path, err := s.SegmentPath(seg)
 	if err != nil {
@@ -109,16 +106,23 @@ func (s *ParquetStore) HasSegment(_ context.Context, seg Segment) (bool, error) 
 		}
 		return false, fmt.Errorf("stat segment %s: %w", path, err)
 	}
-	return info.Size() > 0, nil
+	if info.Size() == 0 {
+		return false, nil
+	}
+	rows, err := ReadHistoricalCandles(path)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 {
+		_, bucketEnd := s.segmentBucket(seg.From)
+		return !seg.To.Before(bucketEnd), nil
+	}
+	start := time.UnixMilli(rows[0].SegmentStart)
+	end := time.UnixMilli(rows[0].SegmentEnd)
+	return !start.After(seg.From) && !end.Before(seg.To), nil
 }
 
 // WriteSegment implements SegmentStore.
-//
-// The write is atomic: rows go to a sibling .partial file which is renamed
-// into place only after a successful close. A reader therefore never sees a
-// half-written file, and a run interrupted mid-write leaves a .partial that
-// the next run overwrites instead of a truncated candles.parquet that
-// HasSegment would mistake for a finished segment.
 func (s *ParquetStore) WriteSegment(ctx context.Context, seg Segment) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -192,9 +196,7 @@ func writeParquet(path string, rows []HistoricalCandle) error {
 	return nil
 }
 
-// ReadHistoricalCandles reads back the rows of one segment file. It exists so
-// a caller — and the test suite — can verify a landed segment without reaching
-// for DuckDB; DuckDB reads the same hive layout natively.
+// ReadHistoricalCandles reads back the rows of one segment file.
 func ReadHistoricalCandles(path string) ([]HistoricalCandle, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -213,8 +215,8 @@ func ReadHistoricalCandles(path string) ([]HistoricalCandle, error) {
 	return rows, nil
 }
 
-// String renders a segment as symbol/from..to, which is the identity a log
-// line and a metric label both want.
+// String renders a segment as symbol/from..to, which is the identity a log line and a
+// metric label both want.
 func (s Segment) String() string {
 	return fmt.Sprintf("%s %s..%s", s.Symbol, s.From.UTC().Format(time.DateOnly), s.To.UTC().Format(time.DateOnly))
 }

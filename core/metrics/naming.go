@@ -10,26 +10,20 @@ import (
 )
 
 // Prefix is the mandatory namespace for every metric this platform exposes.
-// It is what lets one Prometheus instance, one Grafana dashboard and one alert
-// set cover all four services without two of them shadowing each other.
 const Prefix = "mft_"
 
-// DurationSuffix is the mandatory suffix for a metric that measures elapsed
-// time. The unit belongs in the name, not in a comment.
+// DurationSuffix is the mandatory suffix for a metric that measures elapsed time.
 const DurationSuffix = "_seconds"
 
-// ErrMissingPrefix is the sentinel wrapped by ValidateName when a metric name
-// does not carry Prefix. Tests and linters can match it with errors.Is.
+// ErrMissingPrefix is the sentinel wrapped by ValidateName when a metric name does not
+// carry Prefix.
 var ErrMissingPrefix = errors.New("metric name must start with " + Prefix)
 
 // promNameRE is the Prometheus metric name grammar.
 var promNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
 
-// ValidateName returns an error unless name is a syntactically valid Prometheus
-// metric name that carries the mandatory Prefix. It is the single place the
-// prefix rule is enforced: every constructor in this package calls it before
-// touching a registry, so a violation panics at startup rather than scraping
-// under a foreign name.
+// ValidateName returns an error unless name is a syntactically valid Prometheus metric
+// name that carries the mandatory Prefix.
 func ValidateName(name string) error {
 	if name == "" {
 		return errors.New("metric name must not be empty")
@@ -43,8 +37,8 @@ func ValidateName(name string) error {
 	return nil
 }
 
-// ValidateDurationName returns an error unless name is valid per ValidateName
-// and ends in DurationSuffix.
+// ValidateDurationName returns an error unless name is valid per ValidateName and ends
+// in DurationSuffix.
 func ValidateDurationName(name string) error {
 	if err := ValidateName(name); err != nil {
 		return err
@@ -84,20 +78,14 @@ func newDurationSpec(name, help string) (spec, error) {
 	return spec{name: name, help: help}, nil
 }
 
-// must panics with err. Metric construction is a programmer error, not a
-// runtime condition: a name without the prefix, a missing Help, or a duplicate
-// registration must stop the process at startup instead of quietly dropping a
-// series that someone will miss at 09:31 on a Monday.
+// must panics with err.
 func must(err error) {
 	if err != nil {
 		panic(err)
 	}
 }
 
-// MustRegister registers every collector in reg, panicking on any error. It is
-// the registration path for metrics not built by the constructors in this
-// file, and it applies the same rules: the name must carry Prefix, the Help
-// must not be empty, and the name must not already be taken.
+// MustRegister registers every collector in reg, panicking on any error.
 func MustRegister(reg prometheus.Registerer, collectors ...prometheus.Collector) {
 	for _, c := range collectors {
 		if err := reg.Register(c); err != nil {
