@@ -1,8 +1,4 @@
-// Risk policy interfaces. See docs/contracts.md §6.
-//
-// These live in contracts rather than in services/execution/risk so that the
-// risk engine (which implements them) and the execution API (which calls
-// them) can be developed as independent branches.
+// Risk policy interfaces.
 package contracts
 
 import (
@@ -10,8 +6,7 @@ import (
 	"time"
 )
 
-// Checker validates a signal against risk policy. Every check must pass;
-// the first failure rejects the signal with a *Rejection.
+// Checker validates a signal against risk policy.
 type Checker interface {
 	Check(ctx context.Context, sig Signal, portfolio Portfolio) error
 }
@@ -24,8 +19,7 @@ func (f CheckerFunc) Check(ctx context.Context, sig Signal, portfolio Portfolio)
 	return f(ctx, sig, portfolio)
 }
 
-// Checks composes an ordered list of checks. Check returns on the first
-// failure, so ordering is significant — see docs/contracts.md §6.
+// Checks composes an ordered list of checks.
 type Checks []Checker
 
 // Check implements the Checker interface by running each check in order.
@@ -41,8 +35,7 @@ func (c Checks) Check(ctx context.Context, sig Signal, portfolio Portfolio) erro
 	return nil
 }
 
-// Policy is the configurable risk budget, loaded from
-// config.ExecutionConfig.
+// Policy is the configurable risk budget, loaded from config.ExecutionConfig.
 type Policy struct {
 	Capital          float64
 	MaxPositionPct   float64
