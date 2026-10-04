@@ -17,16 +17,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// Production Kite Connect endpoints. They are struct fields rather than
-// constants so that tests can point the connector at a local server.
+// Production Kite Connect endpoints.
 const (
 	defaultHTTPBaseURL = "https://api.kite.trade"
 	defaultWSBaseURL   = "wss://ws.kite.trade"
 )
 
-// Tunables that have no key in the frozen config schema. See docs/contracts.md
-// §8: no component may add one, so anything the connector needs beyond
-// request_timeout_seconds and reconnect_max_backoff_seconds lives here.
+// Tunables that have no key in the shared config schema.
 const (
 	defaultRequestTimeout = 10 * time.Second
 	defaultPongTimeout    = 90 * time.Second
@@ -37,9 +34,7 @@ const (
 	defaultProduct        = "NRML"
 )
 
-// instrumentDumpMaxBytes bounds the CSV instrument download. Kite's dump is
-// currently well under 30 MB; the cap stops a corrupted response from
-// exhausting memory.
+// instrumentDumpMaxBytes bounds the CSV instrument download.
 const instrumentDumpMaxBytes = 64 << 20
 
 // REST verbs, aliased so the call sites read as prose.
@@ -52,8 +47,7 @@ const (
 // validProducts is the set of Kite product codes the connector accepts.
 var validProducts = map[string]bool{"MIS": true, "CNC": true, "NRML": true}
 
-// endpoints holds the Kite Connect URLs. It is a struct rather than a pair of
-// constants so that tests can redirect the connector to an httptest server.
+// endpoints holds the Kite Connect URLs.
 type endpoints struct {
 	httpBase string
 	wsBase   string
@@ -64,17 +58,18 @@ func (e endpoints) ordersURL() string      { return e.httpBase + "/orders/regula
 func (e endpoints) orderURL(id string) string {
 	return e.httpBase + "/orders/regular/" + url.PathEscape(id)
 }
-func (e endpoints) positionsURL() string { return e.httpBase + "/positions" }
-func (e endpoints) streamURL(token string) string {
-	return e.wsBase + "/?access_token=" + url.QueryEscape(token)
+func (e endpoints) positionsURL() string  { return e.httpBase + "/portfolio/positions" }
+func (e endpoints) ordersListURL() string { return e.httpBase + "/orders" }
+func (e endpoints) orderHistoryURL(id string) string {
+	return e.httpBase + "/orders/" + url.PathEscape(id)
+}
+func (e endpoints) quoteURL() string { return e.httpBase + "/quote/ltp" }
+func (e endpoints) streamURL(apiKey, token string) string {
+	query := url.Values{"api_key": {apiKey}, "access_token": {token}}
+	return e.wsBase + "/?" + query.Encode()
 }
 
-// Kite is the Zerodha Kite Connect connector. It implements Streamer and
-// Client, and additionally exposes the instrument master and the two
-// contracts.md §2 order methods.
-//
-// apiSecret is carried for the session-token exchange, which this connector
-// does not perform; only apiKey and accessToken are used on the wire.
+// Kite is the Zerodha Kite Connect connector.
 type Kite struct {
 	apiKey      string
 	apiSecret   string
@@ -92,9 +87,10 @@ type Kite struct {
 	endpoints endpoints
 	client    *http.Client
 	dialer    *websocket.Dialer
+	pacer     *RESTPacer
 
-	mu         sync.Mutex // guards product
-	instMu     sync.Mutex // guards the instrument master cache
+	mu         sync.Mutex
+	instMu     sync.Mutex
 	instrument []contracts.Instrument
 	loadedAt   time.Time
 
@@ -102,22 +98,16 @@ type Kite struct {
 	reconnects atomic.Int64
 	delivered  atomic.Int64
 
-	// loggerPtr is swapped through an atomic pointer because the read loop
-	// consults the logger on every reconnect and every unrecognised frame.
 	loggerPtr atomic.Pointer[zap.Logger]
 }
 
-// NewKite returns a Kite connector with no credentials and production
-// endpoints. It is the constructor core/fx.go binds; use NewKiteFromConfig
-// wherever a BrokerConfig is available.
+// NewKite returns a Kite connector with no credentials and production endpoints.
 func NewKite() *Kite {
 	return newKite(&config.BrokerConfig{})
 }
 
-// NewKiteFromConfig returns a Kite connector configured from the frozen
-// broker config block. It fails only on values that cannot be honoured;
-// missing credentials are reported per call as ErrAuth so that a service can
-// still start in a credential-less dev environment.
+// NewKiteFromConfig returns a Kite connector configured from the shared broker config
+// block.
 func NewKiteFromConfig(cfg config.BrokerConfig) (*Kite, error) {
 	if cfg.RequestTimeoutSeconds < 0 {
 		return nil, fmt.Errorf("broker: request_timeout_seconds: %d: %w", cfg.RequestTimeoutSeconds, ErrInvalidOrder)
@@ -128,8 +118,8 @@ func NewKiteFromConfig(cfg config.BrokerConfig) (*Kite, error) {
 	return newKite(&cfg), nil
 }
 
-// newKite builds a connector from cfg, applying the defaults for every value
-// the config schema leaves at zero.
+// newKite builds a connector from cfg, applying the defaults for every value the config
+// schema leaves at zero.
 func newKite(cfg *config.BrokerConfig) *Kite {
 	k := &Kite{
 		apiKey:         cfg.APIKey,
@@ -140,6 +130,7 @@ func newKite(cfg *config.BrokerConfig) *Kite {
 		requestTimeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second,
 		maxBackoff:     time.Duration(cfg.ReconnectMaxBackoffSecs) * time.Second,
 		endpoints:      endpoints{httpBase: defaultHTTPBaseURL, wsBase: defaultWSBaseURL},
+		pacer:          NewRESTPacer(),
 	}
 	k.loggerPtr.Store(zap.NewNop())
 	if k.requestTimeout <= 0 {
@@ -157,11 +148,10 @@ func newKite(cfg *config.BrokerConfig) *Kite {
 	return k
 }
 
-// log returns the logger the connector was built with. It is never nil.
+// log returns the logger the connector was built with.
 func (k *Kite) log() *zap.Logger { return k.loggerPtr.Load() }
 
-// SetLogger attaches a logger for reconnect and frame diagnostics. A nil
-// logger restores the no-op default.
+// SetLogger attaches a logger for reconnect and frame diagnostics.
 func (k *Kite) SetLogger(l *zap.Logger) {
 	if l == nil {
 		l = zap.NewNop()
@@ -169,8 +159,7 @@ func (k *Kite) SetLogger(l *zap.Logger) {
 	k.loggerPtr.Store(l)
 }
 
-// SetProduct selects the Kite product code (MIS, CNC or NRML) used for new
-// orders. The default is NRML.
+// SetProduct selects the Kite product code (MIS, CNC or NRML) used for new orders.
 func (k *Kite) SetProduct(product string) error {
 	p := strings.ToUpper(strings.TrimSpace(product))
 	if !validProducts[p] {
@@ -182,18 +171,14 @@ func (k *Kite) SetProduct(product string) error {
 	return nil
 }
 
-// Reconnects returns the number of reconnect attempts Stream has scheduled
-// after the first connection. It is a health signal: a value that keeps
-// climbing while ticks are still arriving means a flapping socket.
+// Reconnects returns the number of reconnect attempts Stream has scheduled after the
+// first connection.
 func (k *Kite) Reconnects() int64 { return k.reconnects.Load() }
 
 // Delivered returns the number of ticks handed to the consumer channel.
 func (k *Kite) Delivered() int64 { return k.delivered.Load() }
 
-// Sequence returns the sequence number stamped on the most recently
-// delivered tick. Kite's binary tick frame carries no sequence number, so
-// the connector stamps a counter that only ever increases, including across
-// reconnects.
+// Sequence returns the sequence number stamped on the most recently delivered tick.
 func (k *Kite) Sequence() uint64 { return k.seq.Load() }
 
 // authHeader returns the Kite authorization header value.
@@ -203,6 +188,9 @@ func (k *Kite) authHeader() string {
 
 // checkAuth fails fast when the connector has no access token.
 func (k *Kite) checkAuth() error {
+	if strings.TrimSpace(k.apiKey) == "" {
+		return fmt.Errorf("kite: api_key is not configured: %w", ErrAuth)
+	}
 	if strings.TrimSpace(k.accessToken) == "" {
 		return fmt.Errorf("kite: access_token is not configured: %w", ErrAuth)
 	}
@@ -210,10 +198,14 @@ func (k *Kite) checkAuth() error {
 }
 
 // do performs an authenticated Kite REST call and returns the response body.
-// Non-2xx responses are decoded into a kiteError, which unwraps to a sentinel
-// error, so callers never have to inspect HTTP status codes.
 func (k *Kite) do(ctx context.Context, method, endpoint string, form url.Values, maxBytes int64) ([]byte, error) {
 	if err := k.checkAuth(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := k.pacer.Wait(ctx, requestCategory(endpoint)); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -250,4 +242,21 @@ func (k *Kite) do(ctx context.Context, method, endpoint string, form url.Values,
 		return nil, fmt.Errorf("kite: %s %s: %w", method, endpoint, parseKiteError(resp.StatusCode, raw))
 	}
 	return raw, nil
+}
+
+func requestCategory(endpoint string) RESTCategory {
+	path := endpoint
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.Path != "" {
+		path = parsed.Path
+	}
+	switch {
+	case strings.HasPrefix(path, "/quote/"):
+		return RESTQuote
+	case strings.HasPrefix(path, "/instruments/historical/"):
+		return RESTHistorical
+	case strings.HasPrefix(path, "/orders"):
+		return RESTOrder
+	default:
+		return RESTOther
+	}
 }

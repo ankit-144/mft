@@ -362,6 +362,94 @@ func TestThresholdFlushReportsAppendError(t *testing.T) {
 	}
 }
 
+func TestAppendWithStatusDistinguishesRetainedFlushFailure(t *testing.T) {
+	base := t.TempDir()
+	blocker := filepath.Join(base, "candles")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	w := NewCandleWriter(blocker, 2)
+	if accepted, err := w.AppendWithStatus(NewCandle(candleAt(0))); !accepted || err != nil {
+		t.Fatalf("first append = %v, %v; want accepted without flush", accepted, err)
+	}
+	accepted, err := w.AppendWithStatus(NewCandle(candleAt(1)))
+	if !accepted || err == nil {
+		t.Fatalf("threshold append = %v, %v; want accepted row and flush error", accepted, err)
+	}
+	if got := w.Pending(); got != 2 {
+		t.Fatalf("pending = %d, want both accepted rows retained", got)
+	}
+}
+
+func TestTickWriterCapacityBoundsRetainedRowsAndRecoversOnce(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "ticks")
+	w := NewWriter(root, 2)
+	flushErr := errors.New("injected flush failure")
+	w.w.encode = func(*os.File, []Tick) error { return flushErr }
+
+	rows := []Tick{{Symbol: "RELIANCE", Timestamp: 1}, {Symbol: "RELIANCE", Timestamp: 2}, {Symbol: "RELIANCE", Timestamp: 3}}
+	for i := 0; i < 2; i++ {
+		accepted, err := w.AppendWithStatus(rows[i])
+		if i == 0 && (!accepted || err != nil) {
+			t.Fatalf("append %d = %v, %v; want accepted without flush", i, accepted, err)
+		}
+		if i == 1 && (!accepted || !errors.Is(err, flushErr)) {
+			t.Fatalf("threshold append = %v, %v; want accepted with flush error", accepted, err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		accepted, err := w.AppendWithStatus(rows[2])
+		if accepted || !errors.Is(err, ErrCapacity) || !errors.Is(err, flushErr) {
+			t.Fatalf("capacity append %d = %v, %v; want rejected capacity wrapping flush failure", i, accepted, err)
+		}
+		if got := w.Pending(); got != 2 {
+			t.Fatalf("pending rows after failed capacity attempt = %d, want 2", got)
+		}
+	}
+
+	w.w.encode = parquetEncode[Tick]
+	accepted, err := w.AppendWithStatus(rows[2])
+	if !accepted || err != nil {
+		t.Fatalf("append after recovery = %v, %v; want accepted", accepted, err)
+	}
+	if err := w.Flush(context.Background()); err != nil {
+		t.Fatalf("flush after recovery: %v", err)
+	}
+	files, err := filepath.Glob(filepath.Join(root, "symbol=RELIANCE", "date=1970-01-01", "part-*.parquet"))
+	if err != nil {
+		t.Fatalf("glob tick files: %v", err)
+	}
+	got := readTicks(t, files)
+	if len(got) != len(rows) {
+		t.Fatalf("persisted rows = %v, want %d rows exactly once", got, len(rows))
+	}
+	for i := range rows {
+		if got[i] != rows[i] {
+			t.Fatalf("persisted row %d = %+v, want %+v", i, got[i], rows[i])
+		}
+	}
+}
+
+func TestPublishedRowsAreNotReplayedAfterDirectorySyncFailure(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "candles")
+	w := NewCandleWriter(root, 1)
+	w.w.syncPartitionDir = func(string, Partition) error { return errors.New("simulated directory sync failure") }
+	accepted, err := w.AppendWithStatus(NewCandle(candleAt(0)))
+	if !accepted || err == nil {
+		t.Fatalf("append = %v, %v; want published row with sync error", accepted, err)
+	}
+	if got := w.Pending(); got != 0 {
+		t.Fatalf("pending = %d, want 0 for an already published row", got)
+	}
+	if flushErr := w.Flush(context.Background()); flushErr == nil {
+		t.Fatal("Flush lost the unresolved directory sync error")
+	}
+	files := partFiles(t, root, NewPartition(testSymbol, testDay))
+	if len(files) != 1 {
+		t.Fatalf("published files = %v, want one file and no replay", files)
+	}
+}
+
 // TestFailedFlushRetainsRowsAcrossRetry asserts no row is lost or duplicated
 // when a flush fails partway and then succeeds.
 func TestFailedFlushRetainsRowsAcrossRetry(t *testing.T) {
@@ -465,6 +553,106 @@ func TestCandlesLimitReturnsTail(t *testing.T) {
 	}
 	if !got[4].Timestamp.Equal(candleAt(19).Timestamp) {
 		t.Errorf("tail ends at %s, want %s", got[4].Timestamp, candleAt(19).Timestamp)
+	}
+}
+
+func TestCandleReaderTailDoesNotDecodeOlderFilesAfterLimit(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "candles")
+	w := NewCandleWriter(root, 100)
+	for _, minute := range []int{0, 1440} {
+		if err := w.Append(NewCandle(candleAt(minute))); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files := partFiles(t, root, NewPartition(testSymbol, testDay))
+	if len(files) != 1 {
+		t.Fatalf("old partition files = %v, want 1", files)
+	}
+	if err := os.WriteFile(files[0], []byte("corrupt old file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewCandleReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Candles(context.Background(), testSymbol, 1)
+	if err != nil || len(got) != 1 || !got[0].Timestamp.Equal(candleAt(1440).Timestamp) {
+		t.Fatalf("tail = %+v, %v; want latest candle without reading older file", got, err)
+	}
+}
+
+func TestCandleTailUsesTimestampsInsteadOfFileNames(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "candles")
+	w := NewCandleWriter(root, 1)
+	newer := candleAt(2)
+	newer.Close = 202
+	older := candleAt(1)
+	older.Close = 101
+	for _, candle := range []contracts.Candle{newer, older} {
+		if err := w.Append(NewCandle(candle)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := NewCandleReader(root)
+	got, err := r.Candles(context.Background(), testSymbol, 1)
+	if err != nil || len(got) != 1 || !got[0].Timestamp.Equal(newer.Timestamp) {
+		t.Fatalf("tail = %+v, %v; want timestamp %s despite the later filename", got, err, newer.Timestamp)
+	}
+}
+
+func TestCandleTailReadsWholePartitionAndUsesLastDuplicateRow(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "candles")
+	w := NewCandleWriter(root, 100)
+	rows := []contracts.Candle{candleAt(2), candleAt(0), candleAt(2), candleAt(1)}
+	rows[2].Close = 999
+	for _, candle := range rows {
+		if err := w.Append(NewCandle(candle)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := NewCandleReader(root)
+	got, err := r.Candles(context.Background(), testSymbol, 2)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("tail = %+v, %v; want 2 rows", got, err)
+	}
+	if !got[0].Timestamp.Equal(candleAt(1).Timestamp) || !got[1].Timestamp.Equal(candleAt(2).Timestamp) || got[1].Close != 999 {
+		t.Fatalf("tail = %+v; want latest timestamps and last duplicate row", got)
+	}
+}
+
+func BenchmarkCandleReaderTail(b *testing.B) {
+	root := filepath.Join(b.TempDir(), "candles")
+	w := NewCandleWriter(root, 1000)
+	for i := 0; i < 12000; i++ {
+		if err := w.Append(NewCandle(candleAt(i))); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		b.Fatal(err)
+	}
+	r, err := NewCandleReader(root)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := r.Candles(context.Background(), testSymbol, 100); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

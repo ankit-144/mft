@@ -15,22 +15,16 @@ import (
 )
 
 const (
-	// partGlob matches every published file in a partition directory. The
-	// in-flight files this package writes start with a dot and are named
-	// ".inflight-*.parquet", so a reader never observes a partial file.
 	partGlob = "part-*.parquet"
 )
 
-// Reader queries the Parquet store. It is the interface frozen in
-// docs/contracts.md §3.
+// Reader queries the Parquet store.
 type Reader interface {
 	// Candles returns up to limit candles for symbol, ascending by time.
-	// limit <= 0 returns every candle stored for the symbol.
 	Candles(ctx context.Context, symbol string, limit int) ([]contracts.Candle, error)
 }
 
-// CandleReader is the Reader implementation over the candles dataset. It is
-// read-only by construction: it opens files, never creates them.
+// CandleReader is the Reader implementation over the candles dataset.
 type CandleReader struct {
 	root string
 }
@@ -44,8 +38,8 @@ func NewCandleReader(root string) (*CandleReader, error) {
 	return &CandleReader{root: root}, nil
 }
 
-// NewCandleReaderFromConfig returns a reader rooted at <data_dir>/candles,
-// resolved from the frozen storage config.
+// NewCandleReaderFromConfig returns a reader rooted at <data_dir>/candles, resolved
+// from the shared storage config.
 func NewCandleReaderFromConfig(cfg config.StorageConfig) (*CandleReader, error) {
 	root, err := dataDirFor(cfg, DatasetCandles)
 	if err != nil {
@@ -57,11 +51,7 @@ func NewCandleReaderFromConfig(cfg config.StorageConfig) (*CandleReader, error) 
 // Root returns the dataset directory the reader scans.
 func (r *CandleReader) Root() string { return r.root }
 
-// Candles returns the most recent limit candles for symbol, ascending by
-// time. Reading only what the caller needs is why limit is a "tail" rather
-// than a "head": the inference service pulls the last N bars at every minute
-// close, and materialising years of history to keep the last 100 would be
-// absurd. limit <= 0 returns every candle stored for the symbol.
+// Candles returns the most recent limit candles for symbol, ascending by time.
 func (r *CandleReader) Candles(ctx context.Context, symbol string, limit int) ([]contracts.Candle, error) {
 	if symbol == "" {
 		return nil, fmt.Errorf("storage: symbol must not be empty")
@@ -71,20 +61,74 @@ func (r *CandleReader) Candles(ctx context.Context, symbol string, limit int) ([
 	if err != nil {
 		return nil, err
 	}
-
+	if limit > 0 {
+		return r.tail(ctx, files, limit)
+	}
 	all, err := r.read(ctx, files)
 	if err != nil {
 		return nil, err
 	}
-	if limit > 0 && len(all) > limit {
-		all = all[len(all)-limit:]
-	}
 	return all, nil
 }
 
-// CandleRange returns candles for symbol with start <= timestamp < end,
-// ascending by time, capped at limit rows (limit <= 0 means no cap). It is the
-// query backtesting replays through: any interval, any length.
+func filesInRange(files []string, start, end time.Time) []string {
+	last := end.UTC().Add(-time.Nanosecond).Format(DateLayout)
+	first := start.UTC().Format(DateLayout)
+	out := files[:0]
+	for _, path := range files {
+		date := strings.TrimPrefix(filepath.Base(filepath.Dir(path)), "date=")
+		if date >= first && date <= last {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func (r *CandleReader) tail(ctx context.Context, files []string, limit int) ([]contracts.Candle, error) {
+	byTS := make(map[int64]contracts.Candle, limit)
+	for end := len(files); end > 0 && len(byTS) < limit; {
+		date := candleFileDate(files[end-1])
+		start := end - 1
+		for start > 0 && candleFileDate(files[start-1]) == date {
+			start--
+		}
+		partition := make(map[int64]contracts.Candle)
+		for i := start; i < end; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("storage: read candle tail: %w", err)
+			}
+			rows, err := readCandleFile(files[i])
+			if err != nil {
+				return nil, err
+			}
+			for _, row := range rows {
+				partition[row.Timestamp] = row.Contract()
+			}
+		}
+		for ts, candle := range partition {
+			if _, seen := byTS[ts]; !seen {
+				byTS[ts] = candle
+			}
+		}
+		end = start
+	}
+	out := make([]contracts.Candle, 0, len(byTS))
+	for _, candle := range byTS {
+		out = append(out, candle)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
+}
+
+func candleFileDate(path string) string {
+	return filepath.Base(filepath.Dir(path))
+}
+
+// CandleRange returns candles for symbol with start <= timestamp < end, ascending by
+// time, capped at limit rows (limit <= 0 means no cap).
 func (r *CandleReader) CandleRange(ctx context.Context, symbol string, start, end time.Time, limit int) ([]contracts.Candle, error) {
 	if symbol == "" {
 		return nil, fmt.Errorf("storage: symbol must not be empty")
@@ -98,6 +142,7 @@ func (r *CandleReader) CandleRange(ctx context.Context, symbol string, start, en
 	if err != nil {
 		return nil, err
 	}
+	files = filesInRange(files, start, end)
 
 	all, err := r.read(ctx, files)
 	if err != nil {
@@ -118,7 +163,6 @@ func (r *CandleReader) CandleRange(ctx context.Context, symbol string, start, en
 }
 
 // Files returns every published parquet file for symbol, ordered oldest first.
-// Ordering by partition date then by file timestamp keeps merges deterministic.
 func (r *CandleReader) Files(ctx context.Context, symbol string) ([]string, error) {
 	if symbol == "" {
 		return nil, fmt.Errorf("storage: symbol must not be empty")
@@ -182,18 +226,13 @@ func (r *CandleReader) Symbols(ctx context.Context) ([]string, error) {
 	return symbols, nil
 }
 
-// Glob returns the read_parquet pattern covering every published candle file
-// for symbol. It is the path expression DuckDB consumes from the Python side,
-// so a research query and the Go reader address the same files.
+// Glob returns the read_parquet pattern covering every published candle file for
+// symbol.
 func (r *CandleReader) Glob(symbol string) string {
 	return filepath.Join(SymbolDir(r.root, symbol), "date=*", partGlob)
 }
 
 // read decodes the given files and returns their candles ascending by time.
-//
-// Files are read in the order supplied, so a later file wins on a duplicate
-// timestamp: a re-flushed or backfilled candle supersedes the earlier copy.
-// That is what makes an idempotent backfill possible.
 func (r *CandleReader) read(ctx context.Context, files []string) ([]contracts.Candle, error) {
 	byTS := make(map[int64]contracts.Candle)
 	var order []int64

@@ -10,34 +10,23 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// BuildInfo describes the binary currently running. Every value becomes a
-// const label on mft_build_info, which is what lets an operator answer "which
-// commit was running when this alert fired" from a dashboard instead of from
-// tribal memory.
+// BuildInfo describes the binary currently running.
 type BuildInfo struct {
 	// Service is the emitting service: ingestion, execution, jobs, inference.
 	Service string
-	// Version is the release version, e.g. "v1.0.0".
+	// Version is the release version, e.g.
 	Version string
 	// Commit is the git SHA the binary was built from.
 	Commit string
 	// Env is the deployment environment: dev, staging or prod.
 	Env string
-	// GoVersion overrides the reported Go toolchain. Leave empty to use the
-	// toolchain that is running.
+	// GoVersion overrides the reported Go toolchain.
 	GoVersion string
 	// Branch is the source branch, when the build can report one.
 	Branch string
 }
 
 // RegisterBuildInfo registers mft_build_info and mft_uptime_seconds against reg.
-// Call it once, from the service constructor, before the metrics server starts;
-// a non-nil error means a second registration in the same process and should be
-// treated as fatal.
-//
-// Version, commit and branch come from the Go build info — the linker stamps them
-// from the VCS by default, or from -X main.version=... — and fall back to
-// "unknown", so a plain `go run` still produces a complete, honest series.
 func RegisterBuildInfo(reg prometheus.Registerer, info BuildInfo) error {
 	version, commit, branch := info.Version, info.Commit, info.Branch
 	if v, c, b, ok := readBuildStamps(); ok {
@@ -95,12 +84,12 @@ func RegisterBuildInfo(reg prometheus.Registerer, info BuildInfo) error {
 	return nil
 }
 
-// processStart is the process start time, used for the uptime gauge and the
-// health report.
+// processStart is the process start time, used for the uptime gauge and the health
+// report.
 var processStart = time.Now()
 
-// readBuildStamps pulls version, commit and branch out of the Go build info,
-// which the linker populates from -ldflags -X.
+// readBuildStamps pulls version, commit and branch out of the Go build info, which the
+// linker populates from -ldflags -X.
 func readBuildStamps() (version, commit, branch string, ok bool) {
 	bi, available := debug.ReadBuildInfo()
 	if !available {

@@ -8,24 +8,14 @@ import (
 	"github.com/mft/core/storage"
 )
 
-// CandleStore is the ingestion module's candle writer, bound under its own
-// type so the service can carry both a tick and a candle writer.
-//
-// # Why a local type
-//
-// core/fx.go provides a single *storage.Writer for the whole platform, and it
-// is the foundation's file: a change there conflicts with every parallel
-// branch. fx distinguishes constructors by result type, so declaring a
-// *storage.CandleWriter here — the type core/fx.go does not provide — binds
-// the second writer without touching it. core/fx.go would be the tidier home
-// for it; this is the change that avoids the merge conflict.
+// CandleStore is the ingestion module's candle writer, bound under its own type so the
+// service can carry both a tick and a candle writer.
 type CandleStore struct {
-	writer *storage.CandleWriter
+	writer           *storage.CandleWriter
+	appendWithStatus func(storage.Candle) (bool, error)
 }
 
-// NewCandleStore builds the candle writer from the frozen storage config.
-// Rows land under <data_dir>/candles, hive-partitioned by symbol and UTC
-// date, which is the tree the inference service reads through DuckDB.
+// NewCandleStore builds the candle writer from the shared storage config.
 func NewCandleStore(cfg *config.Config) (CandleStore, error) {
 	if cfg == nil {
 		return CandleStore{}, fmt.Errorf("ingestion: candle store needs a config")
@@ -37,8 +27,7 @@ func NewCandleStore(cfg *config.Config) (CandleStore, error) {
 	return CandleStore{writer: writer}, nil
 }
 
-// NewCandleStoreFromWriter wraps an existing candle writer. Tests use it to
-// point the pipeline at a temporary directory without a config file.
+// NewCandleStoreFromWriter wraps an existing candle writer.
 func NewCandleStoreFromWriter(writer *storage.CandleWriter) (CandleStore, error) {
 	if writer == nil {
 		return CandleStore{}, fmt.Errorf("ingestion: candle store needs a writer")
@@ -48,6 +37,15 @@ func NewCandleStoreFromWriter(writer *storage.CandleWriter) (CandleStore, error)
 
 // Append buffers one candle.
 func (c CandleStore) Append(candle storage.Candle) error { return c.writer.Append(candle) }
+
+// AppendWithStatus distinguishes rejection from an accepted candle whose writer
+// retained rows after a flush failure.
+func (c CandleStore) AppendWithStatus(candle storage.Candle) (bool, error) {
+	if c.appendWithStatus != nil {
+		return c.appendWithStatus(candle)
+	}
+	return c.writer.AppendWithStatus(candle)
+}
 
 // Start launches the candle writer's background flusher.
 func (c CandleStore) Start(ctx context.Context) error { return c.writer.Start(ctx) }

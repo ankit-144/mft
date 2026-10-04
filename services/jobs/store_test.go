@@ -28,7 +28,8 @@ func TestParquetStoreWritesTheDocumentedHiveLayout(t *testing.T) {
 		t.Fatalf("WriteSegment() error = %v", err)
 	}
 
-	want := filepath.Join(dir, "symbol=RELIANCE", "from=2024-01-01", "to=2024-03-01", "candles.parquet")
+	bucketStart, bucketEnd := store.segmentBucket(seg.From)
+	want := filepath.Join(dir, "symbol=RELIANCE", "from="+bucketStart.Format(time.DateOnly), "to="+bucketEnd.Format(time.DateOnly), "candles.parquet")
 	path, err := store.SegmentPath(seg)
 	if err != nil {
 		t.Fatalf("SegmentPath() error = %v", err)
@@ -83,6 +84,41 @@ func TestParquetStoreRoundTripsRows(t *testing.T) {
 	if got.SegmentStart != seg.From.UnixMilli() || got.SegmentEnd != seg.To.UnixMilli() {
 		t.Errorf("segment bounds = %d..%d, want %d..%d",
 			got.SegmentStart, got.SegmentEnd, seg.From.UnixMilli(), seg.To.UnixMilli())
+	}
+}
+
+func TestParquetStoreExtendsPartialBucketWithoutOverlappingFiles(t *testing.T) {
+	store := newParquetStore(t.TempDir(), "minute")
+	from := time.Date(2024, 1, 1, 0, 0, 0, 0, indiaTimeZone)
+	first := Segment{Symbol: "RELIANCE", From: from, To: from.AddDate(0, 0, 2), Candles: []contracts.Candle{
+		{Symbol: "RELIANCE", Timestamp: from.UTC(), Open: 1, High: 1, Low: 1, Close: 1, Volume: 1},
+	}}
+	path, err := store.SegmentPath(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteSegment(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	extended := Segment{Symbol: first.Symbol, From: from, To: from.AddDate(0, 0, 3), Candles: append(append([]contracts.Candle(nil), first.Candles...), contracts.Candle{
+		Symbol: "RELIANCE", Timestamp: from.AddDate(0, 0, 2).UTC(), Open: 2, High: 2, Low: 2, Close: 2, Volume: 2,
+	})}
+	if present, err := store.HasSegment(context.Background(), extended); err != nil || present {
+		t.Fatalf("extended segment before refresh = %v, %v; want absent", present, err)
+	}
+	if err := store.WriteSegment(context.Background(), extended); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.SegmentPath(extended)
+	if err != nil || updated != path {
+		t.Fatalf("updated path = %q, %v; want stable path %q", updated, err, path)
+	}
+	if present, err := store.HasSegment(context.Background(), extended); err != nil || !present {
+		t.Fatalf("extended segment after refresh = %v, %v; want present", present, err)
+	}
+	rows, err := ReadHistoricalCandles(path)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows after atomic refresh = %d, %v; want 2", len(rows), err)
 	}
 }
 

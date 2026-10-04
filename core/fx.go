@@ -1,6 +1,5 @@
-// Package core provides the shared FX module with common dependencies for
-// all MFT services: config, logger, metrics registry, fluxKV cache, and
-// storage.
+// Package core provides the shared FX module with common dependencies for all MFT
+// services: config, logger, metrics registry, fluxKV cache, and storage.
 package core
 
 import (
@@ -12,6 +11,7 @@ import (
 	"github.com/mft/core/log"
 	"github.com/mft/core/metrics"
 	"github.com/mft/core/storage"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/fx"
 )
 
@@ -19,7 +19,7 @@ import (
 var Module = fx.Module("core",
 	fx.Provide(
 		ConfigPath,
-		config.Load,
+		LoadConfig,
 		log.New,
 		metrics.Registry,
 		metrics.Handler,
@@ -30,19 +30,33 @@ var Module = fx.Module("core",
 		func(k *broker.Kite) broker.Client { return k },
 		broker.NewOrderClient,
 	),
-	fx.Invoke(metrics.Server),
+	fx.Invoke(RegisterBuildInfo, metrics.Server),
 )
 
-// NewKite builds the broker connector from config. Binding NewKite here
-// instead of the bare broker.NewKite matters: the zero-config constructor
-// leaves the connector without credentials or a watchlist, so a service
-// started through fx would fail to authenticate on every call.
+// LoadConfig applies the launcher's service identity to the shared configuration.
+func LoadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if name := os.Getenv("MFT_SERVICE_NAME"); name != "" {
+		cfg.App.Name = name
+	}
+	return cfg, nil
+}
+
+// RegisterBuildInfo exposes the current binary's identity in its metrics registry.
+func RegisterBuildInfo(reg *prometheus.Registry, cfg *config.Config) error {
+	return metrics.RegisterBuildInfo(reg, metrics.BuildInfo{Service: cfg.App.Name, Env: cfg.App.Env})
+}
+
+// NewKite builds the broker connector from config.
 func NewKite(cfg *config.Config) (*broker.Kite, error) {
 	return broker.NewKiteFromConfig(cfg.Broker)
 }
 
-// ConfigPath resolves the config file path, honoring the MFT_CONFIG
-// environment variable and defaulting to configs/config.yaml.
+// ConfigPath resolves the config file path, honoring the MFT_CONFIG environment
+// variable and defaulting to configs/config.yaml.
 func ConfigPath() string {
 	if p := os.Getenv("MFT_CONFIG"); p != "" {
 		return p
@@ -51,10 +65,6 @@ func ConfigPath() string {
 }
 
 // NewStorageWriter constructs the Parquet tick writer from config.
-//
-// The writer's lifecycle is owned by whoever consumes it: ingestion starts and
-// stops both writers itself so it can drain the tick channel first, so this
-// constructor must not Start anything.
 func NewStorageWriter(cfg *config.Config) (*storage.Writer, error) {
 	return storage.NewWriterFromConfig(cfg.Storage)
 }

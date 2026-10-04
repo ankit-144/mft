@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -198,10 +197,9 @@ func TestSetProduct(t *testing.T) {
 }
 
 func TestRequestsWithoutTokenFailAsAuth(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := localTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("no request should reach the server without an access token")
 	}))
-	t.Cleanup(srv.Close)
 
 	k := NewKite()
 	k.setEndpoints(srv.URL, "ws://unused")

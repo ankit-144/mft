@@ -14,26 +14,14 @@ import (
 )
 
 const (
-	// fileStampLayout is the timestamp embedded in "part-<timestamp>.parquet".
-	// Nanosecond precision keeps distinct flushes in distinct files.
 	fileStampLayout = "20060102T150405.000000000Z"
 
-	// inflightPrefix marks a partially written file. Readers glob
-	// "part-*.parquet" and therefore never see these.
 	inflightPrefix = ".inflight-"
 
-	// maxPartNameAttempts bounds the search for a free file name in a
-	// partition directory.
 	maxPartNameAttempts = 1024
 )
 
-// writer is the hive-partitioned Parquet core shared by Writer and
-// CandleWriter.
-//
-// All mutable state is behind mu, and mu is held for the whole of a flush —
-// from creating the directory to renaming the finished file. Two flushes
-// therefore cannot interleave, Append cannot race a flush, and no file that
-// has been closed is ever reopened.
+// writer is the hive-partitioned Parquet core shared by Writer and CandleWriter.
 type writer[T any] struct {
 	root     string
 	dataset  Dataset
@@ -41,12 +29,9 @@ type writer[T any] struct {
 	interval time.Duration
 	part     func(T) Partition
 
-	// encode serialises one partition's rows into an open file. It is a
-	// field so a test can inject a failing encoder; production always uses
-	// parquetEncode, and every error it returns is wrapped and surfaced.
-	encode func(f *os.File, rows []T) error
+	encode           func(f *os.File, rows []T) error
+	syncPartitionDir func(string, Partition) error
 
-	// mu guards rows, closed and lastErr, and serialises flushes.
 	mu      sync.Mutex
 	rows    []T
 	closed  bool
@@ -68,19 +53,18 @@ func newWriter[T any](opts Options, dataset Dataset, part func(T) Partition) *wr
 		interval = DefaultFlushInterval
 	}
 	return &writer[T]{
-		root:     opts.Root,
-		dataset:  dataset,
-		maxRows:  maxRows,
-		interval: interval,
-		part:     part,
-		encode:   parquetEncode[T],
-		rows:     make([]T, 0, maxRows),
+		root:             opts.Root,
+		dataset:          dataset,
+		maxRows:          maxRows,
+		interval:         interval,
+		part:             part,
+		encode:           parquetEncode[T],
+		syncPartitionDir: syncDir,
+		rows:             make([]T, 0, maxRows),
 	}
 }
 
-// parquetEncode writes rows to f as a complete parquet file. Both the row
-// write and the footer write are checked: a parquet file whose footer failed
-// to write is unreadable, so a silent Close would poison the dataset.
+// parquetEncode writes rows to f as a complete parquet file.
 func parquetEncode[T any](f *os.File, rows []T) error {
 	pw := parquet.NewGenericWriter[T](f)
 	if _, err := pw.Write(rows); err != nil {
@@ -92,24 +76,35 @@ func parquetEncode[T any](f *os.File, rows []T) error {
 	return nil
 }
 
-// append buffers a row and, once the buffer is full, writes the batch before
-// returning so that the caller sees the error.
+// append buffers a row and, once the buffer is full, writes the batch before returning
+// so that the caller sees the error.
 func (w *writer[T]) append(row T) error {
+	_, err := w.appendWithStatus(row)
+	return err
+}
+
+// appendWithStatus distinguishes a rejected row from an accepted row whose synchronous
+// threshold flush failed; retained rows must not be retried.
+func (w *writer[T]) appendWithStatus(row T) (bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.closed {
-		return ErrClosed
+		return false, ErrClosed
+	}
+	if len(w.rows) >= w.maxRows {
+		if err := w.flushLocked(context.Background()); err != nil {
+			return false, fmt.Errorf("%w: drain %s buffer: %w", ErrCapacity, w.dataset, err)
+		}
 	}
 	w.rows = append(w.rows, row)
 	if len(w.rows) >= w.maxRows {
-		return w.flushLocked(context.Background())
+		return true, w.flushLocked(context.Background())
 	}
-	return nil
+	return true, nil
 }
 
-// flush writes every buffered row. A cancelled context aborts before any file
-// is created; rows stay buffered.
+// flush writes every buffered row.
 func (w *writer[T]) flush(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -120,14 +115,11 @@ func (w *writer[T]) flush(ctx context.Context) error {
 	return w.flushLocked(ctx)
 }
 
-// start launches the background flusher. Starting twice is an error; starting
-// after Close returns ErrClosed.
+// start launches the background flusher.
 func (w *writer[T]) start(ctx context.Context) error {
 	w.startMu.Lock()
 	defer w.startMu.Unlock()
 
-	// closed is guarded by mu, not startMu: reading it here without mu would
-	// race a concurrent Close.
 	w.mu.Lock()
 	closed := w.closed
 	w.mu.Unlock()
@@ -146,8 +138,7 @@ func (w *writer[T]) start(ctx context.Context) error {
 	return nil
 }
 
-// close stops the background flusher and writes the remaining rows. It is
-// idempotent.
+// close stops the background flusher and writes the remaining rows.
 func (w *writer[T]) close() error {
 	w.mu.Lock()
 	w.closed = true
@@ -182,8 +173,7 @@ func (w *writer[T]) pending() int {
 	return len(w.rows)
 }
 
-// loop is the background flusher. Errors are recorded rather than returned;
-// Err is the only way to observe them.
+// loop is the background flusher.
 func (w *writer[T]) loop(ctx context.Context) {
 	defer w.wg.Done()
 
@@ -193,8 +183,7 @@ func (w *writer[T]) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Shutdown must not be cancelled half-way through a batch, so
-			// the final flush runs on a detached context.
+
 			w.mu.Lock()
 			err := w.flushLocked(context.WithoutCancel(ctx))
 			w.mu.Unlock()
@@ -219,14 +208,10 @@ func (w *writer[T]) record(err error) {
 	w.lastErr = err
 }
 
-// flushLocked writes the buffer out, one immutable file per partition. The
-// caller must hold w.mu.
-//
-// On failure the rows that were not written stay in the buffer and are retried
-// by the next flush: a filesystem error never costs data silently.
+// flushLocked writes the buffer out, one immutable file per partition.
 func (w *writer[T]) flushLocked(ctx context.Context) error {
 	if len(w.rows) == 0 {
-		return nil
+		return w.lastErr
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("storage: flush %s: %w", w.dataset, err)
@@ -240,8 +225,13 @@ func (w *writer[T]) flushLocked(ctx context.Context) error {
 			w.lastErr = err
 			return err
 		}
-		if err := w.writePartition(p, groups[p]); err != nil {
-			w.retainUnwritten(order[:i])
+		published, err := w.writePartition(p, groups[p])
+		if err != nil {
+			written := order[:i]
+			if published {
+				written = order[:i+1]
+			}
+			w.retainUnwritten(written)
 			w.lastErr = err
 			return err
 		}
@@ -252,8 +242,8 @@ func (w *writer[T]) flushLocked(ctx context.Context) error {
 	return nil
 }
 
-// groupByPartition splits the buffer into per-partition batches, preserving
-// first-seen order so that flushes are deterministic.
+// groupByPartition splits the buffer into per-partition batches, preserving first-seen
+// order so that flushes are deterministic.
 func (w *writer[T]) groupByPartition() ([]Partition, map[Partition][]T) {
 	groups := make(map[Partition][]T, 4)
 	order := make([]Partition, 0, 4)
@@ -267,9 +257,9 @@ func (w *writer[T]) groupByPartition() ([]Partition, map[Partition][]T) {
 	return order, groups
 }
 
-// retainUnwritten drops the rows belonging to partitions that were already
-// written and keeps the rest, in their original order, so that the next flush
-// retries exactly what is missing — no loss, no duplicate.
+// retainUnwritten drops the rows belonging to partitions that were already written and
+// keeps the rest, in their original order, so that the next flush retries exactly what
+// is missing — no loss, no duplicate.
 func (w *writer[T]) retainUnwritten(written []Partition) {
 	if len(written) == 0 {
 		return
@@ -288,19 +278,15 @@ func (w *writer[T]) retainUnwritten(written []Partition) {
 }
 
 // writePartition encodes one partition's rows into a new immutable file.
-//
-// The file is written to ".inflight-*" and renamed to "part-*" only after the
-// parquet writer has been closed and the bytes are on disk, so the final name
-// never refers to an incomplete file.
-func (w *writer[T]) writePartition(p Partition, rows []T) error {
+func (w *writer[T]) writePartition(p Partition, rows []T) (bool, error) {
 	dir := p.Dir(w.root)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("storage: create partition dir %s: %w", dir, err)
+		return false, fmt.Errorf("storage: create partition dir %s: %w", dir, err)
 	}
 
 	file, err := os.CreateTemp(dir, inflightPrefix+"*.parquet")
 	if err != nil {
-		return fmt.Errorf("storage: create temp parquet in %s: %w", dir, err)
+		return false, fmt.Errorf("storage: create temp parquet in %s: %w", dir, err)
 	}
 	temp := file.Name()
 
@@ -315,37 +301,35 @@ func (w *writer[T]) writePartition(p Partition, rows []T) error {
 	}
 
 	if err := w.encode(file, rows); err != nil {
-		return cleanup(fmt.Errorf("storage: %s %d rows for %s: %w", w.dataset, len(rows), p, err))
+		return false, cleanup(fmt.Errorf("storage: %s %d rows for %s: %w", w.dataset, len(rows), p, err))
 	}
 	if err := file.Sync(); err != nil {
-		return cleanup(fmt.Errorf("storage: sync %s for %s %s: %w", temp, w.dataset, p, err))
+		return false, cleanup(fmt.Errorf("storage: sync %s for %s %s: %w", temp, w.dataset, p, err))
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("storage: close %s for %s %s: %w", temp, w.dataset, p, err)
+		return false, fmt.Errorf("storage: close %s for %s %s: %w", temp, w.dataset, p, err)
 	}
 
 	final, err := freePartPath(dir, time.Now())
 	if err != nil {
 		if rerr := os.Remove(temp); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			return errors.Join(err, fmt.Errorf("storage: remove %s: %w", temp, rerr))
+			return false, errors.Join(err, fmt.Errorf("storage: remove %s: %w", temp, rerr))
 		}
-		return err
+		return false, err
 	}
 	if err := os.Rename(temp, final); err != nil {
 		if rerr := os.Remove(temp); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			return errors.Join(
+			return false, errors.Join(
 				fmt.Errorf("storage: publish %s: %w", final, err),
 				fmt.Errorf("storage: remove %s: %w", temp, rerr),
 			)
 		}
-		return fmt.Errorf("storage: publish %s: %w", final, err)
+		return false, fmt.Errorf("storage: publish %s: %w", final, err)
 	}
-	return syncDir(dir, p)
+	return true, w.syncPartitionDir(dir, p)
 }
 
-// freePartPath returns a "part-<timestamp>.parquet" path in dir that does not
-// exist. Refusing to reuse a name is what guarantees a closed file is never
-// written again.
+// freePartPath returns a "part-<timestamp>.parquet" path in dir that does not exist.
 func freePartPath(dir string, ts time.Time) (string, error) {
 	for attempt := 0; attempt < maxPartNameAttempts; attempt++ {
 		candidate := filepath.Join(dir, fmt.Sprintf("part-%s.parquet",
@@ -361,8 +345,7 @@ func freePartPath(dir string, ts time.Time) (string, error) {
 	return "", fmt.Errorf("storage: no free part file name in %s after %d attempts", dir, maxPartNameAttempts)
 }
 
-// syncDir fsyncs a directory so the rename that published a part file
-// survives a crash.
+// syncDir fsyncs a directory so the rename that published a part file survives a crash.
 func syncDir(dir string, p Partition) error {
 	d, err := os.Open(dir)
 	if err != nil {

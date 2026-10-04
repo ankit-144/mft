@@ -3,110 +3,106 @@ package broker
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
-	"math"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/mft/core/config"
+	"github.com/mft/core/contracts"
 )
 
-func symbolMap() map[int64]string {
-	return map[int64]string{relianceToken: "RELIANCE", tcsToken: "TCS"}
+func symbolMap() map[int64]contracts.Instrument {
+	return map[int64]contracts.Instrument{
+		relianceToken: {Token: relianceToken, Symbol: "RELIANCE", Exchange: "NSE"},
+		tcsToken:      {Token: tcsToken, Symbol: "TCS", Exchange: "NSE"},
+	}
 }
 
-func TestDecodeTickFrame(t *testing.T) {
-	ts := time.Date(2026, 9, 29, 10, 31, 0, 0, time.UTC)
-	frame := encodeTickFrame(relianceToken, ts, 2934.5, 7, [4]float64{2900, 2950, 2899.5, 2934.5}, 1_000_000, 1_000_000)
+// kiteFullPacketFixture lays out fields according to Kite's published packet
+// table, independently of the production decoder.
+func kiteFullPacketFixture(token int64, pricePaise int32, volume uint32, exchangeTS time.Time) []byte {
+	packet := make([]byte, 184)
+	binary.BigEndian.PutUint32(packet[0:4], uint32(token))
+	binary.BigEndian.PutUint32(packet[4:8], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[8:12], 7)
+	binary.BigEndian.PutUint32(packet[12:16], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[16:20], volume)
+	binary.BigEndian.PutUint32(packet[28:32], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[32:36], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[36:40], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[40:44], uint32(pricePaise))
+	binary.BigEndian.PutUint32(packet[lastTradeTimeOff:lastTradeTimeOff+4], uint32(exchangeTS.Unix()))
+	binary.BigEndian.PutUint32(packet[exchangeTimeOff:exchangeTimeOff+4], uint32(exchangeTS.Unix()))
+	return packet
+}
 
-	tick, err := decodeTickFrame(frame, symbolMap())
+func kiteMessageFixture(packets ...[]byte) []byte {
+	message := make([]byte, 2)
+	binary.BigEndian.PutUint16(message, uint16(len(packets)))
+	for _, packet := range packets {
+		length := []byte{byte(len(packet) >> 8), byte(len(packet))}
+		message = append(message, length...)
+		message = append(message, packet...)
+	}
+	return message
+}
+
+func TestStreamURLUsesBothKiteCredentials(t *testing.T) {
+	endpoint, err := url.Parse((endpoints{wsBase: "wss://ws.kite.trade"}).streamURL("key value", "access/token"))
 	if err != nil {
-		t.Fatalf("decodeTickFrame: %v", err)
+		t.Fatal(err)
 	}
-	want := Tick{
-		Symbol:    "RELIANCE",
-		Token:     relianceToken,
-		Price:     2934.5,
-		Volume:    1_000_000,
-		Timestamp: ts,
-	}
-	if tick != want {
-		t.Errorf("got %+v, want %+v", tick, want)
-	}
-	if tick.Timestamp.Location() != time.UTC {
-		t.Errorf("Timestamp location = %v, want UTC", tick.Timestamp.Location())
+	query := endpoint.Query()
+	if query.Get("api_key") != "key value" || query.Get("access_token") != "access/token" {
+		t.Fatalf("query = %v, want both credentials", query)
 	}
 }
 
-// TestDecodeTickFrameMatchesKiteWireLayout pins the frame layout
-// independently of encodeTickFrame, so a change to either half of the round
-// trip cannot silently agree with the other.
-func TestDecodeTickFrameMatchesKiteWireLayout(t *testing.T) {
+func TestDecodeKiteFullPacketAndMultiPacketFraming(t *testing.T) {
 	ts := time.Date(2026, 9, 29, 10, 31, 0, 0, time.UTC)
-	frame := make([]byte, 68)
-	binary.BigEndian.PutUint32(frame[0:], 3419705)
-	binary.BigEndian.PutUint32(frame[4:], uint32(ts.Unix()))
-	binary.BigEndian.PutUint64(frame[8:], math.Float64bits(4100.25))
-	binary.BigEndian.PutUint32(frame[16:], 12)
-	binary.BigEndian.PutUint64(frame[20:], math.Float64bits(4000))
-	binary.BigEndian.PutUint64(frame[28:], math.Float64bits(4110))
-	binary.BigEndian.PutUint64(frame[36:], math.Float64bits(3990))
-	binary.BigEndian.PutUint64(frame[44:], math.Float64bits(4100.25))
-	binary.BigEndian.PutUint64(frame[52:], 555)
-	binary.BigEndian.PutUint64(frame[60:], 555)
-
-	tick, err := decodeTickFrame(frame, symbolMap())
+	message := kiteMessageFixture(
+		kiteFullPacketFixture(relianceToken, 293450, 555, ts),
+		kiteFullPacketFixture(tcsToken, 410025, 42, ts.Add(time.Second)),
+	)
+	ticks, err := decodeMarketMessage(message, symbolMap(), ts.Add(2*time.Second))
 	if err != nil {
-		t.Fatalf("decodeTickFrame: %v", err)
+		t.Fatalf("decodeMarketMessage: %v", err)
 	}
-	want := Tick{Symbol: "TCS", Token: 3419705, Price: 4100.25, Volume: 555, Timestamp: ts}
-	if tick != want {
-		t.Errorf("got %+v, want %+v", tick, want)
+	want := []Tick{
+		{Symbol: "RELIANCE", Token: relianceToken, Price: 2934.5, Volume: 555, Timestamp: ts},
+		{Symbol: "TCS", Token: tcsToken, Price: 4100.25, Volume: 42, Timestamp: ts.Add(time.Second)},
+	}
+	if len(ticks) != len(want) {
+		t.Fatalf("got %d ticks, want %d: %+v", len(ticks), len(want), ticks)
+	}
+	for i := range want {
+		if ticks[i] != want[i] {
+			t.Errorf("tick %d = %+v, want %+v", i, ticks[i], want[i])
+		}
 	}
 }
 
-func TestDecodeTickFrameErrors(t *testing.T) {
-	t.Run("short frame", func(t *testing.T) {
-		if _, err := decodeTickFrame(make([]byte, 12), symbolMap()); !errors.Is(err, ErrInvalidOrder) {
-			t.Fatalf("error = %v, want ErrInvalidOrder", err)
-		}
-	})
-	t.Run("unsubscribed token", func(t *testing.T) {
-		frame := encodeTickFrame(999, time.Now(), 1, 1, [4]float64{}, 0, 0)
-		if _, err := decodeTickFrame(frame, symbolMap()); !errors.Is(err, ErrInstrumentNotFound) {
-			t.Fatalf("error = %v, want ErrInstrumentNotFound", err)
-		}
-	})
-}
-
-func TestPongReplyEchoesTimestamp(t *testing.T) {
-	got := pongReply([]byte(`{"a":["ping",1788000000]}`))
-	if got.Action != "pong" {
-		t.Errorf("Action = %q, want pong", got.Action)
+func TestDecodeKiteHeartbeatAndInvalidFraming(t *testing.T) {
+	if ticks, err := decodeMarketMessage([]byte{0}, symbolMap(), time.Now()); err != nil || len(ticks) != 0 {
+		t.Fatalf("heartbeat = %v, %v; want no ticks and no error", ticks, err)
 	}
-	if len(got.Values) != 1 || got.Values[0] != "1788000000" {
-		t.Errorf("Values = %v, want [1788000000]", got.Values)
-	}
-
-	// A ping with no timestamp must still produce a well-formed pong rather
-	// than an empty frame Kite would reject.
-	if got := pongReply([]byte(`{"a":["ping"]}`)); got.Action != "pong" || len(got.Values) != 1 {
-		t.Errorf("pongReply with no timestamp = %+v, want a single-value pong", got)
+	if _, err := decodeMarketMessage([]byte{0, 1, 0, 8}, symbolMap(), time.Now()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("truncated frame error = %v, want ErrUnavailable", err)
 	}
 }
 
 func TestStreamDeliversTicksAndSubscribes(t *testing.T) {
 	ts := time.Date(2026, 9, 29, 10, 31, 0, 0, time.UTC)
 	frames := [][]byte{
-		encodeTickFrame(relianceToken, ts, 2934.5, 7, [4]float64{}, 100, 100),
-		encodeTickFrame(tcsToken, ts.Add(time.Second), 4100.25, 3, [4]float64{}, 200, 200),
+		kiteMessageFixture(kiteFullPacketFixture(relianceToken, 293450, 100, ts)),
+		kiteMessageFixture(kiteFullPacketFixture(tcsToken, 410025, 200, ts.Add(time.Second))),
 	}
 
-	var subscribed []string
+	var subscribed []int64
 	k := newTestKite(t, instrumentHandler(t, nil))
-	attachWS(t, k, func(t *testing.T, ws *wsTestServer, conn *websocket.Conn, _ int) {
+	ws := attachWS(t, k, func(t *testing.T, ws *wsTestServer, conn *websocket.Conn, _ int) {
 		subscribed = ws.readSubscribe(t, conn)
 		for _, f := range frames {
 			if err := conn.WriteMessage(websocket.BinaryMessage, f); err != nil {
@@ -146,14 +142,17 @@ func TestStreamDeliversTicksAndSubscribes(t *testing.T) {
 		t.Errorf("tick timestamp = %v, want %v", got[0].Timestamp, ts)
 	}
 
-	want := []string{"NSE|RELIANCE|738560", "NSE|TCS|3419705"}
+	want := []int64{738560, 3419705}
 	if len(subscribed) != len(want) {
 		t.Fatalf("subscribed to %v, want %v", subscribed, want)
 	}
 	for i := range want {
 		if subscribed[i] != want[i] {
-			t.Errorf("subscription %d = %q, want %q", i, subscribed[i], want[i])
+			t.Errorf("subscription %d = %d, want %d", i, subscribed[i], want[i])
 		}
+	}
+	if modes := ws.Modes(); len(modes) != 1 || string(modes[0]) != `["full",[738560,3419705]]` {
+		t.Errorf("mode payloads = %s, want [\"full\",[738560,3419705]]", modes)
 	}
 
 	cancel()
@@ -185,7 +184,7 @@ func TestStreamGracefulShutdown(t *testing.T) {
 		defer close(handlerDone)
 		_ = ws.readSubscribe(t, conn)
 		_ = conn.WriteMessage(websocket.BinaryMessage,
-			encodeTickFrame(relianceToken, time.Now(), 2934.5, 1, [4]float64{}, 1, 1))
+			kiteMessageFixture(kiteFullPacketFixture(relianceToken, 293450, 1, time.Now())))
 		// Stay on the socket until the client hangs up.
 		ws.record(t, conn)
 	})
@@ -241,7 +240,7 @@ func TestStreamSequenceIsMonotonicAcrossReconnects(t *testing.T) {
 			<-gate
 		}
 		_ = conn.WriteMessage(websocket.BinaryMessage,
-			encodeTickFrame(relianceToken, ts.Add(time.Duration(n)*time.Second), float64(100+n), 1, [4]float64{}, int64(n), int64(n)))
+			kiteMessageFixture(kiteFullPacketFixture(relianceToken, int32((100+n)*100), uint32(n), ts.Add(time.Duration(n)*time.Second))))
 		// Returning drops the socket, which is what forces the reconnect.
 	})
 	k.reconnectBase = 10 * time.Millisecond
@@ -293,17 +292,12 @@ func TestStreamSequenceIsMonotonicAcrossReconnects(t *testing.T) {
 	}
 }
 
-func TestStreamAnswersKitePing(t *testing.T) {
-	// A control pong is dispatched to the handler during a read, so the
-	// server must keep reading after the data frame to observe it. The read
-	// loop therefore runs on its own goroutine and the handler waits on the
-	// two signals.
-	jsonPong := make(chan struct{}, 1)
+func TestStreamIgnoresTextHeartbeatAndAnswersControlPing(t *testing.T) {
 	controlPong := make(chan struct{}, 1)
-	bothAnswered := make(chan struct{})
+	serverDone := make(chan struct{})
 
 	k := newTestKite(t, instrumentHandler(t, nil))
-	ws := attachWS(t, k, func(t *testing.T, ws *wsTestServer, conn *websocket.Conn, _ int) {
+	attachWS(t, k, func(t *testing.T, ws *wsTestServer, conn *websocket.Conn, _ int) {
 		_ = ws.readSubscribe(t, conn)
 		conn.SetPongHandler(func(string) error {
 			select {
@@ -312,68 +306,26 @@ func TestStreamAnswersKitePing(t *testing.T) {
 			}
 			return nil
 		})
-
-		// The JSON keepalive Kite sends every ~30 seconds.
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"a":["ping",1788000000]}`)); err != nil {
-			t.Errorf("write json ping: %v", err)
-			return
-		}
-		// The RFC 6455 control ping. Kite does not send this, but a
-		// reconnecting client meets proxies that do.
-		if err := conn.WriteMessage(websocket.PingMessage, []byte("hb")); err != nil {
-			t.Errorf("write control ping: %v", err)
-			return
-		}
-
-		go func() {
-			defer conn.Close()
-			_ = conn.SetReadDeadline(time.Now().Add(streamTimeout))
-			for {
-				_, data, err := conn.ReadMessage()
-				if err != nil {
-					return
-				}
-				var cmd wsCommand
-				if err := json.Unmarshal(data, &cmd); err != nil {
-					continue
-				}
-				ws.note(cmd)
-				if cmd.Action == "pong" {
-					select {
-					case jsonPong <- struct{}{}:
-					default:
-					}
-				}
-			}
-		}()
-
-		for i := 0; i < 2; i++ {
-			select {
-			case <-jsonPong:
-			case <-controlPong:
-			case <-time.After(streamTimeout):
-				close(bothAnswered)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"message","data":"notice"}`))
+		_ = conn.WriteMessage(websocket.PingMessage, []byte("hb"))
+		_ = conn.SetReadDeadline(time.Now().Add(streamTimeout))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				close(serverDone)
 				return
 			}
 		}
-		close(bothAnswered)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- k.Stream(ctx, nil, make(chan Tick, 1)) }()
 
 	select {
-	case <-bothAnswered:
+	case <-controlPong:
 	case <-time.After(streamTimeout):
-		t.Fatal("the client did not answer both pings")
+		t.Fatal("WebSocket control ping was not answered")
 	}
-
-	if pongs := ws.Pongs(); len(pongs) != 1 || pongs[0] != "1788000000" {
-		t.Errorf("pongs = %v, want the ping timestamp echoed back", pongs)
-	}
-
 	cancel()
 	select {
 	case err := <-done:
@@ -381,7 +333,15 @@ func TestStreamAnswersKitePing(t *testing.T) {
 			t.Fatalf("Stream = %v, want context.Canceled", err)
 		}
 	case <-time.After(streamTimeout):
-		t.Fatal("Stream did not return after the context was cancelled")
+		t.Fatal("Stream did not stop")
+	}
+	if wsPongs := k.Delivered(); wsPongs != 0 {
+		t.Fatalf("delivered %d ticks from text heartbeat", wsPongs)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(streamTimeout):
+		t.Fatal("server did not observe client close")
 	}
 }
 

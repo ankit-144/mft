@@ -3,6 +3,7 @@ package ingestion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -118,6 +119,7 @@ func newHarness(t *testing.T, streamer broker.Streamer) *harness {
 	opts := defaultOptions(cfg)
 	opts.clock = h.clock
 	opts.sweepEvery = time.Hour
+	opts.appendRetryEvery = time.Millisecond
 	opts.ageEvery = 5 * time.Millisecond
 	opts.reconnectBase = time.Millisecond
 	opts.reconnectMax = 5 * time.Millisecond
@@ -305,10 +307,10 @@ func TestFoldBuildsCandle(t *testing.T) {
 	h := newHarness(t, idleStreamer{})
 
 	h.runProcessor(
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 5, Timestamp: base},
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 105, Volume: 3, Timestamp: base.Add(20 * time.Second)},
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 95, Volume: 2, Timestamp: base.Add(40 * time.Second)},
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 1, Timestamp: base.Add(50 * time.Second)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 100, Timestamp: base},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 105, Volume: 103, Timestamp: base.Add(20 * time.Second)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 95, Volume: 105, Timestamp: base.Add(40 * time.Second)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 106, Timestamp: base.Add(50 * time.Second)},
 	)
 
 	c := h.p.cache.Candle("RELIANCE")
@@ -317,7 +319,7 @@ func TestFoldBuildsCandle(t *testing.T) {
 	}
 	want := fluxkv.Candle{
 		Symbol: "RELIANCE", Timestamp: base,
-		Open: 100, High: 105, Low: 95, Close: 101, Volume: 11,
+		Open: 100, High: 105, Low: 95, Close: 101, Volume: 6,
 	}
 	if *c != want {
 		t.Fatalf("candle = %+v, want %+v", *c, want)
@@ -327,6 +329,156 @@ func TestFoldBuildsCandle(t *testing.T) {
 	}
 	if got := h.p.ticks.Pending(); got != 4 {
 		t.Fatalf("tick rows buffered = %d, want 4", got)
+	}
+}
+
+func TestVolumeDeltaHandlesCumulativeReplayAndSessionReset(t *testing.T) {
+	p := &Pipeline{}
+	var st symbolState
+	open := time.Date(2026, 8, 3, 9, 15, 0, 0, indiaLocation)
+	feed := func(at time.Time, volume int64) int64 {
+		return p.volumeDelta(&st, broker.Tick{Timestamp: at, Volume: volume})
+	}
+	if got := feed(open, 100); got != 100 {
+		t.Fatalf("opening volume delta = %d, want 100", got)
+	}
+	if got := feed(open.Add(30*time.Second), 110); got != 10 {
+		t.Fatalf("volume delta = %d, want 10", got)
+	}
+	if got := feed(open.Add(30*time.Second), 112); got != 2 {
+		t.Fatalf("same-second volume delta = %d, want 2", got)
+	}
+	if got := feed(open.Add(30*time.Second), 112); got != 0 {
+		t.Fatalf("exact replay volume delta = %d, want 0", got)
+	}
+	if got := feed(open.Add(30*time.Second), 110); got != 0 {
+		t.Fatalf("same-second replay regression delta = %d, want 0", got)
+	}
+	if got := feed(open.Add(20*time.Second), 105); got != 0 {
+		t.Fatalf("replayed volume delta = %d, want 0", got)
+	}
+	if got := feed(open.Add(time.Minute), 120); got != 8 {
+		t.Fatalf("post-replay volume delta = %d, want 8", got)
+	}
+	if got := feed(open.Add(2*time.Minute), 40); got != 0 {
+		t.Fatalf("volume reset delta = %d, want 0", got)
+	}
+	if got := feed(open.Add(3*time.Minute), 48); got != 8 {
+		t.Fatalf("post-reset volume delta = %d, want 8", got)
+	}
+	nextDay := open.AddDate(0, 0, 1)
+	if got := feed(nextDay, 7); got != 7 {
+		t.Fatalf("new-session opening delta = %d, want 7", got)
+	}
+}
+
+func TestFoldRejectsMinuteRegressionAndSameMinuteTimestampRegression(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	start := base.Add(9*time.Hour + 15*time.Minute)
+	h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 100, Timestamp: start})
+	h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 102, Volume: 120, Timestamp: start.Add(2 * time.Minute)})
+	if st := h.p.state["RELIANCE"]; !st.open.Timestamp.Equal(start.Add(2 * time.Minute)) {
+		t.Fatalf("open minute regressed to %s", st.open.Timestamp)
+	}
+	before := h.p.state["RELIANCE"].open
+	h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 90, Volume: 110, Timestamp: start.Add(time.Minute)})
+	if got := h.p.state["RELIANCE"].open; got != before {
+		t.Fatalf("older-minute tick changed open candle: got %+v want %+v", got, before)
+	}
+	h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 104, Volume: 121, Timestamp: start.Add(2*time.Minute + 20*time.Second)})
+	h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 80, Volume: 119, Timestamp: start.Add(2*time.Minute + 10*time.Second)})
+	if got := h.p.state["RELIANCE"].open.Close; got != 104 {
+		t.Fatalf("same-minute reordered tick regressed close to %v", got)
+	}
+}
+
+func TestRolloverBackpressuresThroughMoreThanQueueCapacity(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	store := h.p.candles
+	remaining := tickBufferSize + 3
+	rejected := make(chan struct{})
+	resume := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(resume)
+		}
+	}()
+	store.appendWithStatus = func(row storage.Candle) (bool, error) {
+		if remaining > 0 {
+			if remaining == tickBufferSize+2 {
+				close(rejected)
+				<-resume
+			}
+			remaining--
+			return false, storage.ErrClosed
+		}
+		return store.writer.AppendWithStatus(row)
+	}
+	h.p.candles = store
+	open := base.Add(9*time.Hour + 15*time.Minute)
+	done := make(chan struct{})
+	go func() {
+		h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 100, Timestamp: open})
+		h.p.fold(broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 110, Timestamp: open.Add(time.Minute)})
+		close(done)
+	}()
+	<-rejected
+	if err := h.p.Check(context.Background()); !errors.Is(err, storage.ErrClosed) {
+		t.Fatalf("readiness during writer rejection = %v, want storage.ErrClosed", err)
+	}
+	close(resume)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("rollover did not recover after transient writer rejection")
+	}
+	if remaining != 0 {
+		t.Fatalf("writer rejection attempts remaining = %d", remaining)
+	}
+	if err := h.p.Check(context.Background()); err != nil {
+		t.Fatalf("readiness after successful recovery = %v, want nil", err)
+	}
+	if got := h.p.state["RELIANCE"].open; !got.Timestamp.Equal(open.Add(time.Minute)) {
+		t.Fatalf("rollover tick was not folded after recovery: %+v", got)
+	}
+	if err := h.p.candles.Flush(context.Background()); err != nil {
+		t.Fatalf("flush recovered candle: %v", err)
+	}
+	got := h.candles("RELIANCE")
+	if len(got) != 1 || got[0].Timestamp != open {
+		t.Fatalf("persisted candles after recovery = %+v, want first bar at %s", got, open)
+	}
+}
+
+func TestBrokerTicksReachParquetWithSessionVolume(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	open := time.Date(2026, 8, 3, 9, 15, 0, 0, indiaLocation)
+	h.runProcessor(
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 100, Timestamp: open},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 110, Timestamp: open.Add(30 * time.Second)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 102, Volume: 120, Timestamp: open.Add(time.Minute)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 103, Volume: 130, Timestamp: open.Add(90 * time.Second)},
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 104, Volume: 140, Timestamp: open.Add(2 * time.Minute)},
+	)
+	if err := h.p.ticks.Flush(context.Background()); err != nil {
+		t.Fatalf("flush ticks: %v", err)
+	}
+	got := h.candles("RELIANCE")
+	if len(got) != 2 || got[0].Volume != 110 || got[1].Volume != 20 {
+		t.Fatalf("persisted candles = %+v, want session deltas [110,20]", got)
+	}
+	files, err := filepath.Glob(filepath.Join(h.dir, "ticks", "symbol=RELIANCE", "date=2026-08-03", "part-*.parquet"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("tick parquet files = %v, %v", files, err)
+	}
+	rows, err := parquet.ReadFile[storage.Tick](files[0])
+	if err != nil {
+		t.Fatalf("read raw tick parquet: %v", err)
+	}
+	if len(rows) != 5 || rows[1].Volume != 110 {
+		t.Fatalf("raw tick rows = %+v, want original cumulative volumes", rows)
 	}
 }
 
@@ -352,10 +504,191 @@ func TestAppendErrorIsSurfaced(t *testing.T) {
 	if got := h.metric("mft_ingestion_storage_append_errors_total"); got != 1 {
 		t.Fatalf("append errors = %d, want 1", got)
 	}
-	// The candle is still folded: a storage failure on the tick row must not
-	// cost the aggregation, which lives in fluxKV and is the hot path.
-	if h.p.cache.Candle("RELIANCE") == nil {
-		t.Fatal("expected the candle to be folded despite the append failure")
+	if h.p.cache.Candle("RELIANCE") != nil {
+		t.Fatal("rejected raw tick must not advance the candle or its volume watermark")
+	}
+}
+
+func TestRawTickCapacityBackpressuresUntilRecovery(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	var refusals atomic.Int64
+	refused := make(chan struct{})
+	recover := make(chan struct{})
+	h.p.appendTick = func(row storage.Tick) (bool, error) {
+		attempt := refusals.Add(1)
+		if attempt == 1 {
+			return h.p.ticks.AppendWithStatus(row)
+		}
+		if attempt <= 3 {
+			if attempt == 3 {
+				close(refused)
+				<-recover
+			}
+			return false, fmt.Errorf("injected capacity refusal: %w", storage.ErrCapacity)
+		}
+		return h.p.ticks.AppendWithStatus(row)
+	}
+	first := broker.Tick{Symbol: "RELIANCE", Token: token, Price: 100, Volume: 100, Timestamp: base}
+	if !h.p.handle(first) {
+		t.Fatal("first tick was rejected")
+	}
+	before := h.p.state["RELIANCE"]
+	second := broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 115, Timestamp: base.Add(time.Second)}
+	done := make(chan bool, 1)
+	go func() { done <- h.p.handle(second) }()
+	select {
+	case <-refused:
+	case <-time.After(time.Second):
+		t.Fatal("raw tick did not reach capacity refusal")
+	}
+	if err := h.p.Check(context.Background()); !errors.Is(err, storage.ErrCapacity) {
+		t.Fatalf("readiness during raw capacity refusal = %v, want storage.ErrCapacity", err)
+	}
+	if got := h.p.state["RELIANCE"]; got != before {
+		t.Fatalf("state advanced while raw row was rejected: got %+v want %+v", got, before)
+	}
+	candleErr := errors.New("unresolved candle write")
+	h.p.setStorageError(candleErr)
+	pendingCandle := contracts.Candle{Symbol: "RELIANCE", Timestamp: base, Open: 100, High: 100, Low: 100, Close: 100}
+	if err := h.p.candles.Append(storage.NewCandle(pendingCandle)); err != nil {
+		t.Fatalf("append pending candle: %v", err)
+	}
+	close(recover)
+	select {
+	case accepted := <-done:
+		if !accepted {
+			t.Fatal("raw tick remained rejected after flush recovery")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("raw tick did not resume after flush recovery")
+	}
+	if got := h.p.state["RELIANCE"]; got.lastVolume != 115 || !got.lastVolumeAt.Equal(second.Timestamp) || got.open.Volume != 15 {
+		t.Fatalf("recovered tick state = %+v, want volume 115 / delta 15", got)
+	}
+	h.p.errMu.Lock()
+	tickErr := h.p.tickStorageErr
+	h.p.errMu.Unlock()
+	if tickErr != nil {
+		t.Fatalf("raw storage error after recovery = %v, want nil", tickErr)
+	}
+	if err := h.p.Check(context.Background()); !errors.Is(err, candleErr) {
+		t.Fatalf("readiness after raw recovery = %v, want unresolved candle error", err)
+	}
+	if err := h.p.ticks.Flush(context.Background()); err != nil {
+		t.Fatalf("flush recovered ticks: %v", err)
+	}
+	files, err := filepath.Glob(filepath.Join(h.dir, "ticks", "symbol=RELIANCE", "date=2026-08-03", "part-*.parquet"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []storage.Tick
+	for _, file := range files {
+		part, err := parquet.ReadFile[storage.Tick](file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, part...)
+	}
+	if len(rows) != 2 || rows[0].Volume != 100 || rows[1].Volume != 115 {
+		t.Fatalf("raw rows = %+v, want original ticks exactly once", rows)
+	}
+}
+
+func TestAcceptedRawFlushErrorDegradesReadinessUntilRecovery(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	root := filepath.Join(h.dir, "raw-ticks")
+	h.p.ticks = storage.NewWriter(root, 1)
+	h.p.appendTick = h.p.ticks.AppendWithStatus
+	blocker := filepath.Join(root, "symbol=RELIANCE")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blocker, []byte("blocked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tick := tickAt(10, base)
+	if !h.p.handle(tick) {
+		t.Fatal("accepted raw tick was rejected")
+	}
+	if err := h.p.Check(context.Background()); err == nil {
+		t.Fatalf("readiness after accepted flush error = %v, want flush error", err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if !h.p.handle(tickAt(11, base.Add(time.Second))) {
+		t.Fatal("raw tick did not recover")
+	}
+	if err := h.p.Check(context.Background()); err != nil {
+		t.Fatalf("readiness after raw recovery = %v, want nil", err)
+	}
+}
+
+func TestCheckSurfacesUnlatchedTickWriterFailure(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	root := filepath.Join(h.dir, "unlatched-ticks")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(root, "symbol=RELIANCE")
+	if err := os.WriteFile(blocker, []byte("blocked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.p.ticks = storage.NewWriter(root, 1)
+	accepted, appendErr := h.p.ticks.AppendWithStatus(storage.NewTick(tickAt(10, base)))
+	if !accepted || appendErr == nil {
+		t.Fatalf("direct writer append = %v, %v; want accepted with unlatched flush error", accepted, appendErr)
+	}
+	h.p.errMu.Lock()
+	tickStorageErr := h.p.tickStorageErr
+	h.p.errMu.Unlock()
+	if tickStorageErr != nil {
+		t.Fatal("direct writer failure unexpectedly populated the pipeline latch")
+	}
+	if err := h.p.Check(context.Background()); err == nil {
+		t.Fatal("Check ignored an unlatched tick writer error")
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.p.ticks.Flush(context.Background()); err != nil {
+		t.Fatalf("flush after recovery: %v", err)
+	}
+	if err := h.p.Check(context.Background()); err != nil {
+		t.Fatalf("Check after writer recovery = %v, want nil", err)
+	}
+}
+
+func TestRawTickCapacityCancellationCountsPendingTick(t *testing.T) {
+	h := newHarness(t, idleStreamer{})
+	var refusals atomic.Int64
+	h.p.appendTick = func(storage.Tick) (bool, error) {
+		refusals.Add(1)
+		return false, fmt.Errorf("injected capacity refusal: %w", storage.ErrCapacity)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.p.runCtx = ctx
+	second := broker.Tick{Symbol: "RELIANCE", Token: token, Price: 101, Volume: 115, Timestamp: base.Add(time.Second)}
+	queue := make(chan broker.Tick, 1)
+	queue <- second
+	close(queue)
+	done := make(chan struct{})
+	go func() { h.p.process(queue); close(done) }()
+	waitFor(t, "capacity retry", func() bool { return refusals.Load() > 1 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("processor did not stop after capacity retry cancellation")
+	}
+	if h.p.shutdownPendingTicks != 1 {
+		t.Fatalf("shutdown pending ticks = %d, want exactly the rejected current tick", h.p.shutdownPendingTicks)
+	}
+	if got := h.metric("mft_ingestion_ticks_dropped_total"); got != 1 {
+		t.Fatalf("dropped ticks = %d, want 1", got)
+	}
+	if got := h.p.state["RELIANCE"]; got.open.Symbol != "" || got.lastVolume != 0 {
+		t.Fatalf("state advanced on cancelled raw tick: %+v", got)
 	}
 }
 
@@ -367,20 +700,39 @@ func TestCandleAppendErrorIsSurfaced(t *testing.T) {
 		t.Fatalf("close candle writer: %v", err)
 	}
 
-	h.runProcessor(
-		tickAt(100, base),
-		tickAt(101, base.Add(time.Minute)),
-		tickAt(102, base.Add(2*time.Minute)),
-	)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.p.runCtx = ctx
+	h.p.fold(tickAt(100, base))
+	done := make(chan struct{})
+	go func() {
+		h.p.fold(tickAt(101, base.Add(time.Minute)))
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("rollover did not stop on cancellation")
+	}
 
-	if err := h.p.Err(); !errors.Is(err, storage.ErrClosed) {
-		t.Fatalf("Err = %v, want it to wrap storage.ErrClosed", err)
+	if err := h.p.Check(context.Background()); !errors.Is(err, storage.ErrClosed) {
+		t.Fatalf("readiness = %v, want storage.ErrClosed", err)
+	}
+	if err := h.p.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Err = %v, want stopped rollover context", err)
 	}
 	if got := h.metric("mft_ingestion_candles_completed_total"); got != 0 {
 		t.Fatalf("candles completed = %d, want 0 when the append failed", got)
 	}
-	if got := h.metric("mft_ingestion_storage_append_errors_total"); got != 2 {
-		t.Fatalf("append errors = %d, want 2", got)
+	if got := h.metric("mft_ingestion_storage_append_errors_total"); got == 0 {
+		t.Fatal("append errors = 0, want rejected candle attempts")
+	}
+	if got := h.p.unpersistedCompletedBars(base.Add(2 * time.Minute)); got != 1 {
+		t.Fatalf("unpersisted completed bars = %d, want 1 retained bar", got)
+	}
+	if h.p.pendingRolloverTick == nil || h.p.pendingRolloverTick.Timestamp != base.Add(time.Minute) {
+		t.Fatalf("pending rollover tick = %+v, want timestamp %s", h.p.pendingRolloverTick, base.Add(time.Minute))
 	}
 }
 
@@ -396,7 +748,7 @@ func TestRolloverWritesCandleExactlyOnce(t *testing.T) {
 			ticks = append(ticks, broker.Tick{
 				Symbol: "RELIANCE", Token: token,
 				Price:     float64(100 + minute),
-				Volume:    2,
+				Volume:    int64(100 + minute*8 + 2*int(offset/(15*time.Second))),
 				Timestamp: base.Add(time.Duration(minute)*time.Minute + offset),
 			})
 		}
@@ -405,7 +757,6 @@ func TestRolloverWritesCandleExactlyOnce(t *testing.T) {
 	ticks = append(ticks, tickAt(105, base.Add(time.Duration(minutes)*time.Minute)))
 
 	h.runProcessor(ticks...)
-	h.flushCandles()
 
 	got := h.candles("RELIANCE")
 	if len(got) != minutes {
@@ -424,8 +775,12 @@ func TestRolloverWritesCandleExactlyOnce(t *testing.T) {
 			t.Fatalf("candle %d high/low = %.0f/%.0f, want %.0f/%.0f",
 				i, candle.High, candle.Low, float64(100+i), float64(100+i))
 		}
-		if candle.Volume != 8 {
-			t.Fatalf("candle %d volume = %d, want 8", i, candle.Volume)
+		wantVolume := int64(6)
+		if i > 0 {
+			wantVolume = 8
+		}
+		if candle.Volume != wantVolume {
+			t.Fatalf("candle %d volume = %d, want %d", i, candle.Volume, wantVolume)
 		}
 	}
 	if got := h.metric("mft_ingestion_candles_completed_total"); got != minutes {
@@ -442,9 +797,9 @@ func TestBoundaryTickLandsInTheRightBar(t *testing.T) {
 	h.runProcessor(
 		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 10, Volume: 1,
 			Timestamp: base.Add(59*time.Second + 999*time.Millisecond)},
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 20, Volume: 4,
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 20, Volume: 5,
 			Timestamp: base.Add(time.Minute)},
-		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 30, Volume: 1,
+		broker.Tick{Symbol: "RELIANCE", Token: token, Price: 30, Volume: 6,
 			Timestamp: base.Add(2 * time.Minute)},
 	)
 	h.flushCandles()
@@ -454,8 +809,8 @@ func TestBoundaryTickLandsInTheRightBar(t *testing.T) {
 		t.Fatalf("persisted %d candles, want 2: %+v", len(got), got)
 	}
 	first, second := got[0], got[1]
-	if !first.Timestamp.Equal(base) || first.Open != 10 || first.Close != 10 || first.Volume != 1 {
-		t.Fatalf("first bar = %+v, want {O10 C10 V1} at %s", first, base)
+	if !first.Timestamp.Equal(base) || first.Open != 10 || first.Close != 10 || first.Volume != 0 {
+		t.Fatalf("first bar = %+v, want {O10 C10 V0} at %s", first, base)
 	}
 	if !second.Timestamp.Equal(base.Add(time.Minute)) || second.Open != 20 || second.Volume != 4 {
 		t.Fatalf("second bar = %+v, want {O20 V4} at %s", second, base.Add(time.Minute))
@@ -481,7 +836,7 @@ func TestLateTickDoesNotRewriteAClosedBar(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("persisted %d candles, want 2: %+v", len(got), got)
 	}
-	if got[0].Volume != 1 || got[0].Close != 10 {
+	if got[0].Volume != 0 || got[0].Close != 10 {
 		t.Fatalf("first bar = %+v, want it untouched by the late tick", got[0])
 	}
 	if n := h.metric("mft_ingestion_ticks_late_total"); n != 1 {
@@ -572,7 +927,7 @@ func TestProcessorDrainsOnShutdown(t *testing.T) {
 			ticks = append(ticks, broker.Tick{
 				Symbol: symbol, Token: token,
 				Price:     float64(100 + minute + i%3),
-				Volume:    1,
+				Volume:    int64(100 + minute*perMin + i),
 				Timestamp: base.Add(time.Duration(minute)*time.Minute + time.Duration(i)*time.Second),
 			})
 		}
@@ -598,8 +953,12 @@ func TestProcessorDrainsOnShutdown(t *testing.T) {
 		if !candle.Timestamp.Equal(ts) {
 			t.Fatalf("candle %d at %s, want %s", i, candle.Timestamp, ts)
 		}
-		if candle.Volume != int64(perMin) {
-			t.Fatalf("candle %d volume = %d, want %d", i, candle.Volume, perMin)
+		wantVolume := int64(perMin)
+		if i == 0 {
+			wantVolume--
+		}
+		if candle.Volume != wantVolume {
+			t.Fatalf("candle %d volume = %d, want %d", i, candle.Volume, wantVolume)
 		}
 	}
 	if n := h.metric("mft_ingestion_candles_completed_total"); n != want {
@@ -649,10 +1008,8 @@ func TestTickRowCarriesInstrumentToken(t *testing.T) {
 	}
 }
 
-// TestBackpressureDropsOldest is the overload policy test. The reader is
-// stalled, so the queue fills; the newest tick must survive, the oldest must be
-// evicted, and the drop must be counted.
-func TestBackpressureDropsOldest(t *testing.T) {
+// TestBackpressurePreservesTicks is the overload policy test.
+func TestBackpressurePreservesTicks(t *testing.T) {
 	h := newHarness(t, idleStreamer{})
 
 	const size = 4
@@ -665,16 +1022,30 @@ func TestBackpressureDropsOldest(t *testing.T) {
 		t.Fatalf("drops = %d before overload, want 0", n)
 	}
 
-	// Two more arrive with the reader still stalled. Drop-oldest evicts ticks
-	// 0 and 1 and keeps 2, 3, 4, 5.
-	h.p.deliver(tickAt(4, base), queue)
-	h.p.deliver(tickAt(5, base), queue)
+	done := make(chan struct{})
+	go func() {
+		h.p.deliver(tickAt(4, base), queue)
+		h.p.deliver(tickAt(5, base), queue)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("deliver passed a full bounded queue")
+	case <-time.After(10 * time.Millisecond):
+	}
+	<-queue
+	<-queue
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deliver did not resume after queue capacity returned")
+	}
 
 	if got := len(queue); got != size {
 		t.Fatalf("queue depth = %d, want %d", got, size)
 	}
-	if n := h.metric("mft_ingestion_ticks_dropped_total"); n != 2 {
-		t.Fatalf("drops = %d, want 2", n)
+	if n := h.metric("mft_ingestion_ticks_dropped_total"); n != 0 {
+		t.Fatalf("drops = %d, want 0", n)
 	}
 	if n := h.metric("mft_ingestion_tick_queue_depth"); n != size {
 		t.Fatalf("queue depth gauge = %d, want %d", n, size)
@@ -695,10 +1066,8 @@ func TestBackpressureDropsOldest(t *testing.T) {
 	}
 }
 
-// TestBackpressureNeverBlocksTheReader is the property that motivated the
-// policy: deliver must return promptly even when nothing is draining, because
-// a blocked sender stalls the broker's socket reader.
-func TestBackpressureNeverBlocksTheReader(t *testing.T) {
+// TestBackpressureUsesBoundedCapacity checks blocking and recovery.
+func TestBackpressureUsesBoundedCapacity(t *testing.T) {
 	h := newHarness(t, idleStreamer{})
 	queue := make(chan broker.Tick, 2)
 
@@ -710,13 +1079,22 @@ func TestBackpressureNeverBlocksTheReader(t *testing.T) {
 		}
 	}()
 
+	time.Sleep(10 * time.Millisecond)
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("deliver blocked with a full queue and no reader")
+		t.Fatal("deliver bypassed bounded queue capacity")
+	default:
 	}
-	if n := h.metric("mft_ingestion_ticks_dropped_total"); n != 998 {
-		t.Fatalf("drops = %d, want 998", n)
+	for range 1000 {
+		<-queue
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not resume after draining")
+	}
+	if n := h.metric("mft_ingestion_ticks_dropped_total"); n != 0 {
+		t.Fatalf("drops = %d, want 0", n)
 	}
 }
 
@@ -964,8 +1342,9 @@ func TestCandleStoreRejectsNil(t *testing.T) {
 // entire point of the local CandleStore type.
 func TestModuleProvidesBothWriters(t *testing.T) {
 	cfg := &config.Config{
-		Broker:  config.BrokerConfig{Instruments: []string{"RELIANCE"}},
-		Storage: config.StorageConfig{DataDir: t.TempDir(), FlushIntervalSecs: 1, FlushMaxRows: 100},
+		Broker:    config.BrokerConfig{Instruments: []string{"RELIANCE"}},
+		Storage:   config.StorageConfig{DataDir: t.TempDir(), FlushIntervalSecs: 1, FlushMaxRows: 100},
+		Execution: config.ExecutionConfig{PaperTrading: true},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)

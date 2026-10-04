@@ -1,10 +1,4 @@
 // Command server runs the MFT background jobs service.
-//
-// With no flags it starts the go-cron scheduler and waits. With -run-now it
-// runs exactly one backfill pass in the foreground and exits, which is what
-// makes backfill on-demand rather than weekly-only: an operator does not have
-// to wait for Saturday 02:00 to come round, and a CI job does not need a
-// timetable attached to get a fresh historical tree.
 package main
 
 import (
@@ -44,10 +38,7 @@ func main() {
 	).Run()
 }
 
-// runOnce builds the same graph the scheduler uses, runs a single backfill,
-// and exits. It is built by hand rather than through fx so that the one-shot
-// path does not bind the metrics port: an operator backfilling on a laptop
-// should not fail because a second copy of the service is already running.
+// runOnce builds the same graph the scheduler uses, runs a single backfill, and exits.
 func runOnce() error {
 	cfg, err := config.Load(core.ConfigPath())
 	if err != nil {
@@ -59,9 +50,6 @@ func runOnce() error {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	// The connector is used only for instrument resolution: which exchange a
-	// symbol trades on, and its instrument token. It is not the order path,
-	// and this service never places an order.
 	kite, err := broker.NewKiteFromConfig(cfg.Broker)
 	if err != nil {
 		return fmt.Errorf("build broker connector: %w", err)

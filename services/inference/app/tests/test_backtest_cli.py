@@ -98,6 +98,20 @@ def run_cli(*args: str) -> int:
     return main(list(args))
 
 
+def test_parquet_cli_sets_reader_budget_from_explicit_replay_limit(config_file, monkeypatch) -> None:
+    import app.backtest_cli as cli
+
+    budgets = []
+
+    def refuse_store(root, *, max_rows):
+        budgets.append(max_rows)
+        raise cli.BacktestError("fixture stopped before reading assets")
+
+    monkeypatch.setattr(cli, "DuckDBCandleStore", refuse_store)
+    assert run_cli("--config", str(config_file), "--max-bars", "100123") == 2
+    assert budgets == [100124]
+
+
 def flat(messages: Any) -> str:
     """Collapse a report to one whitespace-normalised line.
 

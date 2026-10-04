@@ -1,36 +1,4 @@
-"""`contracts.Signal` and the idempotency key that makes a retry safe.
-
-`docs/contracts.md` §1 defines the Go struct; this is the same wire shape in
-Python. The field names, the JSON keys and the timestamp format are the
-contract — C7 decodes this body with `encoding/json` into `contracts.Signal`
-and rejects a missing or empty `idempotency_key` with a 400 before the risk
-gate ever runs.
-
-# The idempotency key
-
-**Format: `<SYMBOL>:<SIDE>:<YYYYMMDDTHHMM>`**, all three fields in uppercase
-and the minute rendered from the *UTC* `as_of`, zero-padded, with no
-separators inside the timestamp. It is the example key in `docs/contracts.md`
-§7 — `RELIANCE:BUY:20260929T1031` — so the format is the documented one rather
-than a private invention.
-
-It is derived from exactly the three fields the contract names: symbol, side,
-and the minute close being predicted from. That is a deliberate, narrow choice:
-
-* **Same inputs, same key.** Inference retries. A timeout, a 502, or a
-  process restart mid-minute must produce the *same* key, or the retry is a
-  second order and the position doubles. Nothing time-varying, nothing
-  random, nothing per-attempt goes into it.
-* **Different minute, different key.** Otherwise C7's 409 would swallow every
-  signal after the first and the strategy would place exactly one order.
-* **The side is in the key.** A model that flips from BUY to SELL at the same
-  minute close is a different decision, and a 409 on it would suppress a
-  genuine reversal.
-
-The minute is rendered from UTC because that is what `as_of` is on the wire
-and because it is the only rendering that cannot be shifted by a local
-timezone. Two processes with different `TZ` settings would still agree.
-"""
+"""`contracts.Signal` and the idempotency key that makes a retry safe."""
 
 from __future__ import annotations
 
@@ -46,23 +14,14 @@ logger = logging.getLogger("mft.inference.signals")
 SIDE_BUY: Final[str] = "BUY"
 SIDE_SELL: Final[str] = "SELL"
 
-#: `strftime` pattern for the minute component of an idempotency key.
+
 KEY_MINUTE_FORMAT: Final[str] = "%Y%m%dT%H%M"
 
 Side = Literal["BUY", "SELL"]
 
 
 def side_for_score(score: float) -> Side:
-    """Derive the trade direction from the sign of the conviction score.
-
-    A score of exactly zero has no direction. It is a legitimate model output
-    — `scale_to_unit` maps a non-finite prediction to 0.0 rather than to
-    maximum conviction — so it is refused here instead of being coerced into a
-    buy, where it would trade the neutral answer.
-
-    Raises:
-        ValueError: If `score` is zero, non-finite, or outside [-1, 1].
-    """
+    """Derive the trade direction from the sign of the conviction score."""
     if not math.isfinite(score):
         raise ValueError(f"score {score!r} is not finite")
     if not -1.0 <= score <= 1.0:
@@ -73,11 +32,7 @@ def side_for_score(score: float) -> Side:
 
 
 def idempotency_key(symbol: str, side: str, as_of: datetime) -> str:
-    """Build the key for one (symbol, side, minute close) decision.
-
-    Deterministic in all three arguments and in nothing else. See the module
-    docstring for why those three and not others.
-    """
+    """Build the key for one (symbol, side, minute close) decision."""
     minute = as_of.astimezone(timezone.utc).strftime(KEY_MINUTE_FORMAT)
     return f"{symbol.strip().upper()}:{side.strip().upper()}:{minute}"
 
@@ -88,11 +43,7 @@ def rfc3339(stamp: datetime) -> str:
 
 
 class Signal(BaseModel):
-    """A model conviction for one symbol at one minute close.
-
-    Mirrors `contracts.Signal` (`docs/contracts.md` §1). Field names are the
-    JSON keys, so `model_dump()` is already the request body C7 expects.
-    """
+    """A model conviction for one symbol at one minute close."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -124,9 +75,8 @@ class Signal(BaseModel):
     @field_validator("price")
     @classmethod
     def _positive_price(cls, value: float) -> float:
-        # The risk gate sizes a position as quantity*price, so a zero price is
-        # not a small order, it is an unmeasurable one. C7 rejects it with a
-        # 400; refusing it here means the loop never builds such a signal.
+
+
         if not value > 0.0:
             raise ValueError(f"price {value} must be positive")
         return value
@@ -148,8 +98,8 @@ class Signal(BaseModel):
     @field_validator("as_of")
     @classmethod
     def _require_zone(cls, value: datetime) -> datetime:
-        # A naive timestamp has no single meaning and would be serialised with
-        # an invented offset. Every timestamp in the platform is UTC.
+
+
         if value.tzinfo is None:
             raise ValueError("as_of must carry a timezone offset")
         return value.astimezone(timezone.utc)
@@ -169,13 +119,7 @@ class Signal(BaseModel):
         model: str,
         as_of: datetime,
     ) -> Signal:
-        """Derive a complete signal from a model score.
-
-        `price` is the close of the last candle in the context, not the
-        predicted value: it is the *reference* price the risk gate sizes
-        against and the execution service reports, and a model output in
-        [-1, 1] is not a price at all.
-        """
+        """Derive a complete signal from a model score."""
         side = side_for_score(score)
         return cls(
             symbol=symbol,
