@@ -1,6 +1,5 @@
-// Package fluxkv implements an in-memory cache with TTL-based eviction and
-// 1-minute candle aggregation. It is the hot-path state store for the MFT
-// platform.
+// Package fluxkv implements an in-memory cache with TTL-based eviction and 1-minute
+// candle aggregation.
 package fluxkv
 
 import (
@@ -9,8 +8,8 @@ import (
 )
 
 type entry struct {
-	value      any
-	expiresAt  time.Time
+	value     any
+	expiresAt time.Time
 }
 
 // Candle is an aggregated one-minute OHLCV candle.
@@ -24,10 +23,19 @@ type Candle struct {
 	Volume    int64
 }
 
+// clone returns a detached copy of the candle.
+func (c *Candle) clone() *Candle {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	return &cp
+}
+
 // KV is a concurrency-safe in-memory key-value store with TTL support.
 type KV struct {
-	mu     sync.RWMutex
-	items  map[string]entry
+	mu      sync.RWMutex
+	items   map[string]entry
 	candles map[string]*Candle
 }
 
@@ -60,15 +68,38 @@ func (k *KV) Get(key string) (any, bool) {
 	return e.value, true
 }
 
-// Delete removes key from the store.
+// Delete removes key from both the TTL map and the candle map.
 func (k *KV) Delete(key string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	delete(k.items, key)
+	delete(k.candles, key)
 }
 
-// UpdateCandle folds a tick price/volume into the current 1-minute candle
-// for symbol, creating a new candle when the minute rolls over.
+// Sweep drops every expired TTL entry and returns how many were removed.
+func (k *KV) Sweep(now time.Time) int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	removed := 0
+	for key, e := range k.items {
+		if now.After(e.expiresAt) {
+			delete(k.items, key)
+			removed++
+		}
+	}
+	return removed
+}
+
+// Len returns the number of TTL entries currently held, including any that have expired
+// but not yet been swept.
+func (k *KV) Len() int {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return len(k.items)
+}
+
+// UpdateCandle folds a tick price/volume into the current 1-minute candle for symbol,
+// creating a new candle when the minute rolls over.
 func (k *KV) UpdateCandle(symbol string, ts time.Time, price float64, volume int64) *Candle {
 	minute := ts.Truncate(time.Minute)
 
@@ -87,7 +118,7 @@ func (k *KV) UpdateCandle(symbol string, ts time.Time, price float64, volume int
 			Volume:    volume,
 		}
 		k.candles[symbol] = cur
-		return cur
+		return cur.clone()
 	}
 
 	if price > cur.High {
@@ -98,23 +129,24 @@ func (k *KV) UpdateCandle(symbol string, ts time.Time, price float64, volume int
 	}
 	cur.Close = price
 	cur.Volume += volume
-	return cur
+	return cur.clone()
 }
 
-// Candle returns the current candle for symbol, or nil.
+// Candle returns a snapshot of the current candle for symbol, or nil if the symbol has
+// not traded since the store was created.
 func (k *KV) Candle(symbol string) *Candle {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
-	return k.candles[symbol]
+	return k.candles[symbol].clone()
 }
 
-// Candles returns a snapshot of all current candles.
+// Candles returns a snapshot of every current candle, in unspecified order.
 func (k *KV) Candles() []*Candle {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 	out := make([]*Candle, 0, len(k.candles))
 	for _, c := range k.candles {
-		out = append(out, c)
+		out = append(out, c.clone())
 	}
 	return out
 }
