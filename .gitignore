@@ -49,7 +49,19 @@ docs/diagrams/mermaid/*.png
 .mmdcfg.json
 
 # Local documentation and visual artifacts
-/docs/
+/docs/*
+!/docs/implementation/
+/docs/implementation/*
+!/docs/implementation/guide.html
+!/docs/implementation/map-template.html
+!/docs/implementation/map-content.json
+!/docs/implementation/map-data.json
+!/docs/implementation/build_map.py
+!/docs/implementation/README.md
+!/docs/LOCAL_RUN.md
+!/docs/local/
+/docs/local/*
+!/docs/local/prepare_candles.py
 /Plan.md
 /opencode.json
 /photos/
