@@ -1,10 +1,4 @@
-# MFT platform configuration.
-#
-# This file is the FROZEN schema — every key is documented in
-# docs/contracts.md §8. Copy to configs/config.yaml and fill in credentials.
-#
-# The schema is complete and intentionally stable: components add features
-# without editing it, so ten parallel branches never conflict here.
+# Shared local configuration. Paths resolve from the project root.
 
 app:
   name: mft
@@ -20,6 +14,7 @@ broker:
   api_key: ""              # KITE_API_KEY
   api_secret: ""           # KITE_API_SECRET
   access_token: ""         # KITE_ACCESS_TOKEN
+  product: MIS             # MIS (intraday) | NRML | CNC
   instruments:
     - RELIANCE
     - TCS
@@ -29,7 +24,7 @@ broker:
 
 storage:
   data_dir: data
-  flush_interval_seconds: 300
+  flush_interval_seconds: 60
   flush_max_rows: 10000
   partition_by: date
 
@@ -38,18 +33,30 @@ analytics:
   read_only: true
 
 execution:
-  addr: ":8080"
+  paper_trading: true
+  journal_path: data/execution/state.json
+  api_token: ""
+  reconcile_interval_seconds: 5
+  max_pending_orders: 64
+  max_signal_age_seconds: 120
+  addr: "127.0.0.1:8080"
   capital: 1000000
   debounce_ttl_seconds: 300
+  idempotency_ttl_seconds: 86400
   max_position_pct: 10.0
   max_open_positions: 10
   max_drawdown_pct: 5.0
   daily_loss_limit: 25000
   max_order_quantity: 500
+  # NSE trading holidays as YYYY-MM-DD. Empty means every weekday trades.
+  market_holidays: []
 
 inference:
+  max_concurrency: 4
+  max_context_age_seconds: 120
+  cursor_path: data/inference/cursors.json
   addr: ":8000"
-  model: tabfm             # tabfm | heuristic
+  model: heuristic
   execution_url: "http://localhost:8080"
   context_rows: 100
   horizon_bars: 1

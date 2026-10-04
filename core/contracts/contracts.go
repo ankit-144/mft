@@ -1,11 +1,4 @@
-// Package contracts holds the frozen domain types and cross-component
-// interfaces shared by every MFT service.
-//
-// This package is owned by the foundation layer. Components import from it;
-// they must not redefine these types. Changing anything here is a foundation
-// change against master, not a component change.
-//
-// See docs/contracts.md for the full specification and rationale.
+// Package contracts defines shared market, signal, order and portfolio boundaries.
 package contracts
 
 import "time"
@@ -22,6 +15,18 @@ const (
 	OrderTypeLimit  = "LIMIT"
 )
 
+// Execution order states exposed by the execution API.
+const (
+	OrderStatusSubmitting  = "SUBMITTING"
+	OrderStatusPaperFilled = "PAPER_FILLED"
+	OrderStatusUnknown     = "UNKNOWN"
+	OrderStatusOpen        = "OPEN"
+	OrderStatusPartial     = "PARTIAL"
+	OrderStatusFilled      = "FILLED"
+	OrderStatusCancelled   = "CANCELLED"
+	OrderStatusRejected    = "REJECTED"
+)
+
 // Tick is a raw market data tick from the broker.
 type Tick struct {
 	Symbol    string    `json:"symbol"`
@@ -31,8 +36,7 @@ type Tick struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Candle is an aggregated one-minute OHLCV bar. Timestamp is truncated to the
-// minute, in UTC.
+// Candle is an aggregated one-minute OHLCV bar.
 type Candle struct {
 	Symbol    string    `json:"symbol"`
 	Timestamp time.Time `json:"timestamp"`
@@ -57,11 +61,20 @@ type Signal struct {
 
 // OrderRequest describes an order to place at the broker.
 type OrderRequest struct {
-	Symbol   string  `json:"symbol"`
-	Side     string  `json:"side"`
-	Quantity int     `json:"quantity"`
-	Price    float64 `json:"price"`
-	Type     string  `json:"type"`
+	Symbol         string  `json:"symbol"`
+	Side           string  `json:"side"`
+	Quantity       int     `json:"quantity"`
+	Price          float64 `json:"price"`
+	Type           string  `json:"type"`
+	IdempotencyKey string  `json:"idempotency_key,omitempty"`
+}
+
+// OrderResult is the latest known broker state for an execution request.
+type OrderResult struct {
+	OrderID        string  `json:"order_id,omitempty"`
+	Status         string  `json:"status"`
+	FilledQuantity int     `json:"filled_quantity"`
+	AveragePrice   float64 `json:"average_price,omitempty"`
 }
 
 // Position is an open holding in one symbol.
@@ -81,10 +94,17 @@ type Instrument struct {
 
 // Portfolio is the risk engine's view of current exposure.
 type Portfolio struct {
-	Cash          float64        `json:"cash"`
-	RealisedPnL   float64        `json:"realised_pnl"`
-	PeakEquity    float64        `json:"peak_equity"`
-	OpenPositions map[string]int `json:"open_positions"`
+	Cash              float64            `json:"cash"`
+	Equity            float64            `json:"equity"`
+	RealisedPnL       float64            `json:"realised_pnl"`
+	RealisedPnLToday  float64            `json:"realised_pnl_today"`
+	PeakEquity        float64            `json:"peak_equity"`
+	OpenPositions     map[string]int     `json:"open_positions"`
+	PositionValues    map[string]float64 `json:"position_values"`
+	ReservedCash      float64            `json:"reserved_cash"`
+	ReservedPositions map[string]int     `json:"reserved_positions,omitempty"`
+	ReservedSells     map[string]int     `json:"reserved_sells,omitempty"`
+	ReservedValues    map[string]float64 `json:"reserved_values,omitempty"`
 }
 
 // Risk rejection reason codes.
@@ -97,10 +117,10 @@ const (
 	ReasonBadQuantity  = "RISK_BAD_QUANTITY"
 	ReasonMarketClosed = "RISK_MARKET_CLOSED"
 	ReasonDuplicate    = "RISK_DUPLICATE"
+	ReasonStaleSignal  = "RISK_STALE_SIGNAL"
 )
 
-// Rejection is a typed risk-gate failure. Code is one of the Reason*
-// constants and is safe to switch on by callers and metrics.
+// Rejection is a typed risk-gate failure.
 type Rejection struct {
 	Code    string
 	Message string
